@@ -1,0 +1,505 @@
+/*
+===========================================================================
+
+resourceBuildFingerprint.mjs - skip a no-op resource build
+
+A stat-level fingerprint over everything the SRO resource build reads and
+writes, so a no-op rebuild can be skipped outright instead of re-verifying
+~100k files through the full pipeline (~100s even when nothing changed).
+
+The fingerprint is (path, size, mtimeMs) over:
+- <game root>/extracted            every Media_extracted input the build parses
+- <rebuild>/.generated/intermediate's image conversion (images/ and its
+  manifest, discovery and failure files) feeding the copy steps
+- <rebuild>/scripts/build (+entry) the pipeline code itself, plus every file
+  outside it the entries can run (codeStamp.mjs codeClosure: the converter,
+  sro_paths.py, scripts/lib), which a change there once skipped past
+- SRO_ASSET_PACK_BASELINE's file  the layout baseline a release builds against
+- <rebuild>/.generated/client-public       the published browser projection
+- external source/codegen files read or written by character asset builders
+plus the env knobs that change what the build produces. It is recorded only
+AFTER a successful build, so it always describes real on-disk state; any
+external touch (content, timestamp, add, delete) misses and forces a full
+build. Per-root hashes are persisted with the aggregate so an unexpected
+miss identifies the mutated ownership boundary instead of leaving one opaque
+~120k-file digest. False rebuilds are therefore possible (a pure touch),
+silent stale skips are not - short of an actor rewriting bytes while faking
+the old mtime, which no build tool here does.
+
+A root marked source (the checkout's own files: scripts, server sources,
+survival art) is hashed by content, (path, size, sha256), not by mtime:
+a checkout's mtimes say when it was checked out, so every fresh release
+worktree moved them and reran every memoized lane on content that had not
+changed (release 67b727e6c: all seven, "data survival-art changed"). The
+hashes come from a file hash cache of their own, so a stat sweep vouches
+for an unchanged file.
+
+===========================================================================
+*/
+import { createHash } from "node:crypto";
+import { readdir, stat } from "node:fs/promises";
+import path from "node:path";
+import { buildStatePath } from "../../lib/generatedRoot.mjs";
+import { codeClosure } from "./codeStamp.mjs";
+import { openFileHashCache } from "./fileHashCache.mjs";
+import { janganTombTeleportEnabled } from "./janganTombTeleport.mjs";
+import { muhanEnabled } from "./muhan.mjs";
+import { qinshiTombEnabled } from "./qinshiTomb.mjs";
+import { readJsonOrUndefined } from "./jsonOut.mjs";
+import { writeStateFile } from "./stateFile.mjs";
+import { extractedRoot, gameRoot, generatedRoot, publicRoot, rebuildRoot } from "../world/paths.mjs";
+
+const serverSourceRoot = path.resolve(
+	process.env.SRO_SERVER_SOURCE_ROOT ??
+		path.join( rebuildRoot, "apps", "server" )
+);
+// Beside the generated tree it describes, so a fresh worktree that reads the
+// shared tree finds the last build's fingerprint (generatedRoot.mjs).
+const statePath = buildStatePath( "resource-build-fingerprint.json" );
+
+// v11: source roots hash by content; rebuild-assets is the image conversion only.
+// v10: the effective tomb posture joined the knobs (#2024 follow-up).
+// v9: the pet design joined; it moved from scripts/build into the server (#1631).
+// v8: the Qin-Shi tomb overlay knob and the enterworld roots joined.
+// v7: the code closure and the pack-layout baseline joined the roots.
+const FINGERPRINT_VERSION = 11;
+const DIRECTORY_CONCURRENCY = 32;
+// The content hashes of the source roots: their own cache, so the lanes
+// keying themselves at once never race the pack builder's.
+const SOURCE_HASH_CACHE_PATH = buildStatePath( "source-hash-cache.json" );
+// What the lanes read from .generated/intermediate: the image conversion
+// (convert_images.py's OUTPUT_ROOT, MANIFEST_PATH, DISCOVERY_CACHE_PATH and
+// failure list). The texture-variant, block-texture and terrain-tile
+// caches there belong to steps no lane memo covers, and each keys itself
+// by its own digests; counting them made a build that refilled one miss
+// every lane on the next.
+const IMAGE_CONVERSION_PARTS = [
+	"images",
+	"image-manifest.csv",
+	"image-discovery.json",
+	"image-conversion-failures.txt"
+];
+
+/** Env vars that alter the build's outputs; a change must invalidate the skip. */
+export const ENV_KNOBS = [
+	"SRO_SERVER_SOURCE_ROOT",
+	// Port-only, not native: the server's Qin-Shi tomb overlays join the
+	// client bake (shared/qinshiTomb.mjs).
+	"SRO_QINSHI_TOMB",
+	// Port-only, not native: the server's Muhan teleport overlays join
+	// the teleport bake (shared/muhan.mjs, #3314).
+	"SRO_MUHAN",
+	// Port-only, not native: the Jangan gate's tomb floor links join the
+	// teleport bake (shared/janganTombTeleport.mjs).
+	"SRO_JANGAN_TOMB_TELEPORT",
+	"SRO_SOOK_SURVIVAL_ARENA",
+	"SRO_ALLOW_DEV_OUTDOOR_ROUTING",
+	"SRO_SKIP_TEXTURE_CONVERT",
+	"SRO_ASSET_PACKS_NO_CACHE",
+	"SRO_BUILD_HASH_CACHE",
+	// The release builds against the live layout (docs/operations/RELEASE.md); an up-to-date
+	// local tree must not skip that and keep its own layout.
+	"SRO_ASSET_PACK_BASELINE",
+	// The later client's dungeon floor pages join the build from the pinned
+	// archive this names (#2956); setting or moving it must not skip.
+	"SRO_VSRO_ROOT"
+];
+
+/*
+================
+buildKnobLines
+
+The knob lines both the whole-build fingerprint and every lane memo
+hash: each raw ENV_KNOBS value, then the postures the bake derives
+from more than its env. The tomb bake follows the shard's deployed
+posture when SRO_QINSHI_TOMB is unset (shared/qinshiTomb.mjs), read
+from the release profile and the shard registry, neither of which is a
+fingerprint root; hashing only the raw env would let a profile or
+registry flip skip the bake and ship the other posture's assets, the
+#2024 split in reverse.
+================
+*/
+export function buildKnobLines() {
+	const lines = ENV_KNOBS.map( ( name ) => `env ${name}=${process.env[name] ?? ""}` );
+	lines.push( `posture SRO_QINSHI_TOMB=${qinshiTombEnabled()}` );
+	lines.push( `posture SRO_MUHAN=${muhanEnabled()}` );
+	lines.push( `posture SRO_JANGAN_TOMB_TELEPORT=${janganTombTeleportEnabled()}` );
+	return lines;
+}
+
+// The entries whose source closure the fingerprint covers beyond scripts/build.
+const CODE_ENTRIES = [
+	path.join( rebuildRoot, "scripts", "build_sro_resources.mjs" ),
+	path.join( rebuildRoot, "scripts", "build_outdoor_world_resources.mjs" ),
+	path.join( rebuildRoot, "scripts", "convert_images.py" )
+];
+
+const FINGERPRINT_ROOTS = [
+	{
+		label: "survival-art",
+		absolutePath: path.join( rebuildRoot, "docs", "features", "assets", "survival" ),
+		source: true
+	},
+	{ label: "extracted", absolutePath: extractedRoot },
+	{ label: "client-executable", absolutePath: path.join( gameRoot, "SRO_Client.exe" ) },
+	// The effects builder checks the archive itself against its evidence.
+	{ label: "particle-archive", absolutePath: path.join( gameRoot, "Particles.pk2" ) },
+	{ label: "server-go-mod", absolutePath: path.join( serverSourceRoot, "go.mod" ), source: true },
+	{ label: "server-go-sum", absolutePath: path.join( serverSourceRoot, "go.sum" ), source: true },
+	{
+		label: "server-roster-exporter",
+		absolutePath: path.join( serverSourceRoot, "cmd", "tools", "sro-evidence" ),
+		source: true
+	},
+	{
+		label: "server-roster-policy",
+		absolutePath: path.join( serverSourceRoot, "internal", "game", "world" ),
+		source: true
+	},
+	{
+		// The skill overlay TSV the skill bake reads with SRO_QINSHI_TOMB on.
+		label: "server-enterworld",
+		absolutePath: path.join( serverSourceRoot, "internal", "game", "enterworld" ),
+		source: true
+	},
+	{
+		// The teleportlink overlay TSV the teleport bake reads with SRO_QINSHI_TOMB on.
+		label: "server-action-data",
+		absolutePath: path.join( serverSourceRoot, "internal", "game", "action", "data" ),
+		source: true
+	},
+	{
+		// The pet design the pet gear rows read (portItemRows.mjs).
+		label: "server-pet-design",
+		absolutePath: path.join( serverSourceRoot, "internal", "game", "companion", "petdesign.json" ),
+		source: true
+	},
+	{
+		label: "rebuild-assets",
+		absolutePath: path.join( generatedRoot, "intermediate" ),
+		parts: IMAGE_CONVERSION_PARTS
+	},
+	{ label: "build-scripts", absolutePath: path.join( rebuildRoot, "scripts", "build" ), source: true },
+	{
+		label: "build-entry",
+		absolutePath: path.join( rebuildRoot, "scripts", "build_sro_resources.mjs" ),
+		source: true
+	},
+	{
+		label: "outdoor-entry",
+		absolutePath: path.join( rebuildRoot, "scripts", "build_outdoor_world_resources.mjs" ),
+		source: true
+	},
+	{ label: "lock-helper", absolutePath: path.join( rebuildRoot, "scripts", "rebuildLock.mjs" ), source: true },
+	{ label: "public", absolutePath: publicRoot }
+];
+
+// The retail and converted inputs every lane may read (laneMemo.mjs): not
+// the code, not the public tree, and not the server sources, which only
+// the NPC lane's roster export runs (serverRosterRoots).
+const DATA_ROOT_LABELS = new Set( [
+	"extracted",
+	"client-executable",
+	"particle-archive",
+	"rebuild-assets",
+	"survival-art"
+] );
+
+/*
+================
+hashRoots
+
+The hash over the given roots, absent ones included: (path, size, mtime)
+per file, or (path, size, sha256) for a source root. hashes is the
+source hash cache (tests pass their own); by default the build state's.
+================
+*/
+export async function hashRoots( roots, hashes = undefined ) {
+	const hash = createHash( "sha256" );
+	hashes ??= await sourceHashes();
+	for ( const root of roots ) {
+		const rootLines = [];
+		await collectRoot( root, rootLines, hashes );
+		rootLines.sort();
+		hash.update( `${root.label}\n${hashFingerprintLines( rootLines )}\n` );
+	}
+	await hashes.save();
+	return hash.digest( "hex" );
+}
+
+/*
+================
+dataRootsHash
+
+The stat hash of each data root, by label, so a lane that runs can say
+which root moved.
+================
+*/
+export async function dataRootsHash() {
+	const hashes = {};
+	for ( const root of FINGERPRINT_ROOTS.filter( root => DATA_ROOT_LABELS.has( root.label ) ) ) {
+		hashes[root.label] = await hashRoots( [ root ] );
+	}
+	return hashes;
+}
+
+/*
+================
+serverRosterRoots
+
+The server sources the roster exporter (sro-evidence) compiles from: the
+whole internal tree, since the roster joins enterworld, monster and more.
+================
+*/
+export function serverRosterRoots() {
+	return [
+		{ label: "server-go-mod", absolutePath: path.join( serverSourceRoot, "go.mod" ), source: true },
+		{ label: "server-go-sum", absolutePath: path.join( serverSourceRoot, "go.sum" ), source: true },
+		{ label: "server-cmd", absolutePath: path.join( serverSourceRoot, "cmd" ), source: true },
+		{ label: "server-internal", absolutePath: path.join( serverSourceRoot, "internal" ), source: true }
+	];
+}
+
+/*
+================
+computeResourceBuildFingerprint
+================
+*/
+export async function computeResourceBuildFingerprint() {
+	const startedAt = performance.now();
+	const lines = [];
+	const roots = [];
+	const hashes = await sourceHashes();
+
+	for ( const root of [ ...FINGERPRINT_ROOTS, ...(await dynamicRoots()) ] ) {
+		const rootLines = [];
+		await collectRoot( root, rootLines, hashes );
+		rootLines.sort();
+		lines.push( ...rootLines );
+		roots.push( {
+			label: root.label,
+			hash: hashFingerprintLines( rootLines ),
+			fileCount: rootLines.length
+		} );
+	}
+
+	await hashes.save();
+	lines.sort();
+
+	const hash = createHash( "sha256" );
+	hash.update( `v${FINGERPRINT_VERSION}\n` );
+	for ( const line of buildKnobLines() ) {
+		hash.update( `${line}\n` );
+	}
+	for ( const line of lines ) {
+		hash.update( line );
+		hash.update( "\n" );
+	}
+
+	return {
+		hash: hash.digest( "hex" ),
+		fileCount: lines.length,
+		roots,
+		elapsedMs: Math.round( performance.now() - startedAt )
+	};
+}
+
+/*
+================
+dynamicRoots
+
+The code closure of the build entries (each file its own root, so a miss
+names it) and the pack-layout baseline when one is set.
+================
+*/
+async function dynamicRoots() {
+	const files = new Set();
+	for ( const entry of CODE_ENTRIES ) {
+		for ( const file of await codeClosure( entry ) ) files.add( file );
+	}
+	const roots = [ ...files ].sort().map( ( absolutePath ) => ({
+		label: `code:${path.relative( rebuildRoot, absolutePath ).split( path.sep ).join( "/" )}`,
+		absolutePath,
+		source: true
+	}) );
+	const baseline = process.env.SRO_ASSET_PACK_BASELINE?.trim();
+	if ( baseline ) roots.push( { label: "pack-baseline", absolutePath: path.resolve( baseline ) } );
+	return roots;
+}
+
+/*
+================
+readRecordedFingerprint
+================
+*/
+export async function readRecordedFingerprint() {
+	const recorded = await readJsonOrUndefined( statePath );
+	if ( recorded?.version === FINGERPRINT_VERSION && typeof recorded.hash === "string" ) {
+		return recorded;
+	}
+	return null;
+}
+
+/*
+================
+writeRecordedFingerprint
+================
+*/
+export async function writeRecordedFingerprint( fingerprint ) {
+	const payload = `${
+		JSON.stringify(
+			{
+				comment: "Stat fingerprint of the SRO resource build's inputs and outputs, written after a " +
+					"successful build by scripts/build_sro_resources.mjs. When the current tree matches, " +
+					"the build is skipped; delete this file or set SRO_FORCE_RESOURCE_BUILD=1 to force.",
+				version: FINGERPRINT_VERSION,
+				hash: fingerprint.hash,
+				fileCount: fingerprint.fileCount,
+				roots: fingerprint.roots,
+				recordedAt: new Date().toISOString()
+			},
+			null,
+			2
+		)
+	}\n`;
+	await writeStateFile( statePath, payload );
+}
+
+/*
+================
+hashFingerprintLines
+================
+*/
+function hashFingerprintLines( lines ) {
+	const hash = createHash( "sha256" );
+	for ( const line of lines ) {
+		hash.update( line );
+		hash.update( "\n" );
+	}
+	return hash.digest( "hex" );
+}
+
+/*
+================
+sourceHashes
+
+The source roots' hash cache, opened once per process and shared by every
+caller (the lanes key themselves concurrently; each save writes the whole
+in-memory set atomically).
+================
+*/
+let sourceHashCache;
+function sourceHashes() {
+	sourceHashCache ??= openFileHashCache( SOURCE_HASH_CACHE_PATH );
+	return sourceHashCache;
+}
+
+/*
+================
+fileLine
+
+One file's line: its size and mtime, or its size and content hash for a
+source root.
+================
+*/
+async function fileLine( name, filePath, fileStat, source, hashes ) {
+	const stamp = source ? await hashes.hashFile( filePath, fileStat ) : fileStat.mtimeMs;
+	return `${name}|${fileStat.size}|${stamp}`;
+}
+
+/*
+================
+collectRoot
+
+A root's lines; a root with parts collects only those entries below it,
+each named under the root's label.
+================
+*/
+async function collectRoot( root, lines, hashes ) {
+	if ( root.parts ) {
+		for ( const part of root.parts ) {
+			const entry = { label: `${root.label}/${part}`, absolutePath: path.join( root.absolutePath, part ) };
+			await collectRoot( { ...entry, source: root.source }, lines, hashes );
+		}
+		return;
+	}
+	let rootStat;
+	try {
+		rootStat = await stat( root.absolutePath );
+	} catch {
+		// An absent root is itself part of the state (e.g. no Media_extracted
+		// checkout): record the absence so its appearance invalidates the skip.
+		lines.push( `${root.label}|<absent>` );
+		return;
+	}
+
+	if ( rootStat.isFile() ) {
+		lines.push( await fileLine( root.label, root.absolutePath, rootStat, root.source, hashes ) );
+		return;
+	}
+
+	await walkDirectory( root, lines, hashes );
+}
+
+/*
+================
+walkDirectory
+
+Parallel breadth-first walk: directories are read DIRECTORY_CONCURRENCY at a
+time and every file is stat()ed. On Windows each stat is a slow syscall, so the
+fan-out is what keeps ~120k files in the low seconds instead of half a minute.
+================
+*/
+async function walkDirectory( root, lines, hashes ) {
+	const rootPath = root.absolutePath;
+	const pending = [ rootPath ];
+
+	while ( pending.length > 0 ) {
+		const batch = pending.splice( 0, DIRECTORY_CONCURRENCY );
+		const results = await Promise.all(
+			batch.map( async ( directory ) => {
+				const entries = await readdir( directory, { withFileTypes: true } ).catch( () => [] );
+				const subdirectories = [];
+				const files = [];
+				for ( const entry of entries ) {
+					if ( entry.isSymbolicLink() ) {
+						continue;
+					}
+					const absolutePath = path.join( directory, entry.name );
+					if ( entry.isDirectory() ) {
+						subdirectories.push( absolutePath );
+					} else if ( entry.isFile() ) {
+						files.push( absolutePath );
+					}
+				}
+				const statted = await Promise.all(
+					files.map( async ( filePath ) => {
+						try {
+							const fileStat = await stat( filePath );
+							const relativePath = path.relative( rootPath, filePath ).split( path.sep ).join( "/" );
+							return await fileLine(
+								`${root.label}/${relativePath}`,
+								filePath,
+								fileStat,
+								root.source,
+								hashes
+							);
+						} catch {
+							return null;
+						}
+					} )
+				);
+				return { subdirectories, statted };
+			} )
+		);
+
+		for ( const result of results ) {
+			pending.push( ...result.subdirectories );
+			for ( const line of result.statted ) {
+				if ( line !== null ) {
+					lines.push( line );
+				}
+			}
+		}
+	}
+}

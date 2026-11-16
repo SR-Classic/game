@@ -1,0 +1,260 @@
+/*
+===========================================================================
+
+npc.ts - ordered NPC conversations and service-window receipts
+
+Only one untagged dialog request may be outstanding. A timeout preserves the
+uncertain request until a reply or explicit close; it never permits a retry.
+The resuscitation receipt has its own revision so presentation opens once.
+
+===========================================================================
+*/
+import {
+	decodeEventExchangeResult,
+	decodeNpcDialogue,
+	npcGid,
+	npcConversationTransition,
+	npcInteractionMask,
+	type NpcConversation
+} from "@/engine/foundation/gameplay/npc-dialogue";
+import type { WireFrame } from "@/engine/contracts/network";
+
+const RESUSCITATION_OPEN = 0x3230;
+const NPC_DIALOG = 0x3773;
+const NPC_ACTION = 0x7338;
+// Row 0x15's send (7026B0) and its answer (75D030): the Christmas
+// event item exchange. The send carries no body and no precondition -
+// whether the bag holds the socks is the server's check, answered 2/3.
+const EVENT_EXCHANGE = 0x747c;
+const EVENT_EXCHANGE_RESULT = 0xb47c;
+const TALK_MASK = 2;
+// Row 0x16's click (5DA1B0 case 0x16): the withdrawal capability bit
+// sent back as the 0x7338 mask.
+const WITHDRAW_MASK = 0x200;
+
+/*
+================
+createNpcConversation
+================
+*/
+export function createNpcConversation( send: ( frame: WireFrame ) => void ) {
+	let state: NpcConversation = { phase: "closed" };
+	let interactionMask = 0, restorationRevision = 0;
+	// 75D030: a firing exchange answer replaces the talk greeting with
+	// its symbol and clears the capabilities; the HUD reads the symbol
+	// through eventGreeting() and shows no service rows beside it.
+	let eventGreeting: string | null = null;
+	let window = { hidden: false, revision: 0 };
+	return {
+		/*
+		================
+		select
+		================
+		*/
+		select( gid: number ) {
+			state = npcConversationTransition( state, { type: "select", gid: npcGid( gid ) } );
+			eventGreeting = null;
+			window = { hidden: false, revision: window.revision + 1 };
+		},
+		/*
+		================
+		hideWindow
+
+		5DA7D6 (personal storage) and 5DAFA9 (guild storage) hide the parent
+		window before sending, without clearing its conversation or NPC lock.
+		================
+		*/
+		hideWindow() {
+			window = { hidden: true, revision: window.revision + 1 };
+		},
+		/*
+		================
+		showWindow
+
+		The restorative receipt for a refused storage command: the HUD hid
+		on the click, but this owner never hid, so only a newer receipt
+		marked shown lets its observe() lift that local hide. The
+		conversation, its target and its interaction lock are untouched.
+		================
+		*/
+		showWindow() {
+			window = { hidden: false, revision: window.revision + 1 };
+		},
+		/*
+		================
+		window
+		================
+		*/
+		window() {
+			return window;
+		},
+		/*
+		================
+		talk
+		================
+		*/
+		talk( now: number ) {
+			const next = npcConversationTransition( state, { type: "request", now } );
+			if ( next.phase !== "waiting" ) throw Error( "NPC transition" );
+			const payload = new Uint8Array( 8 ), view = new DataView( payload.buffer );
+			view.setUint32( 0, next.gid, true );
+			view.setUint32( 4, TALK_MASK, true );
+			send( { opcode: NPC_ACTION, payload } );
+			state = next;
+		},
+		/*
+		================
+		withdraw
+
+		Row 0x16 asks the bound herbalist for the withdrawal service; the
+		answer is the 0x3230 receipt receive() opens from, or the owner's
+		line in the dialog.
+		================
+		*/
+		withdraw( now: number ) {
+			const next = npcConversationTransition( state, { type: "request", now } );
+			if ( next.phase !== "waiting" ) throw Error( "NPC transition" );
+			const payload = new Uint8Array( 8 ), view = new DataView( payload.buffer );
+			view.setUint32( 0, next.gid, true );
+			view.setUint32( 4, WITHDRAW_MASK, true );
+			send( { opcode: NPC_ACTION, payload } );
+			state = next;
+		},
+		/*
+		================
+		exchange
+
+		Row 0x15 (capability EVENT_EXCHANGE_FUNCTION): 7026B0 sends the
+		exchange opcode with no body and no bag precondition; the
+		answer is the 0xB47C arm in receive().
+
+		The native send has no answer state - 7026B0 fires and forgets.
+		The port runs the conversation's ordinary request transition, so
+		an exchange the server never answers sits in waiting until the
+		generic deadline marks it uncertain; that wait is the port's,
+		not the native client's. Clicks landing inside it are refused
+		silently by the gameplay guard, never by a throw from here.
+		================
+		*/
+		exchange( now: number ) {
+			const next = npcConversationTransition( state, { type: "request", now } );
+			if ( next.phase !== "waiting" ) throw Error( "NPC transition" );
+			send( { opcode: EVENT_EXCHANGE, payload: new Uint8Array( 0 ) } );
+			state = next;
+		},
+		/*
+		================
+		choose
+		================
+		*/
+		choose( choice: number, now: number ) {
+			if ( state.phase !== "ready" || !state.dialogue.options.some( row => row.choice === choice ) ) {
+				throw Error( "NPC choice unavailable" );
+			}
+			const next = npcConversationTransition( state, { type: "request", now } );
+			send( { opcode: NPC_DIALOG, payload: Uint8Array.of( choice ) } );
+			state = next;
+		},
+		/*
+		================
+		receive
+
+		75AC60 closes the conversation and opens the native mode-2 skill pane.
+		An unsolicited or duplicate receipt cannot reopen a dismissed window.
+		================
+		*/
+		receive( frame: WireFrame ) {
+			if ( frame.opcode === RESUSCITATION_OPEN ) {
+				if ( frame.payload.length !== 0 ) throw Error( "Invalid resuscitation window receipt" );
+				if ( state.phase === "waiting" || state.phase === "uncertain" ) {
+					state = npcConversationTransition( state, { type: "close" } );
+					restorationRevision++;
+				}
+				return true;
+			}
+			if ( frame.opcode === EVENT_EXCHANGE_RESULT ) {
+				// 75D030: a firing byte sets the greeting and clears the
+				// capabilities; any other byte is silent. The packet is
+				// this conversation's business even when it fails to fire.
+				const symbol = decodeEventExchangeResult( frame.payload );
+				if ( symbol !== null && state.phase !== "closed" ) {
+					eventGreeting = symbol;
+					state = npcConversationTransition( state, { type: "event-result" } );
+				}
+				return true;
+			}
+			if ( frame.opcode !== NPC_DIALOG ) return false;
+			const dialogue = decodeNpcDialogue( frame.payload );
+			state = npcConversationTransition( state, { type: "reply", dialogue } );
+			return true;
+		},
+		/*
+		================
+		step
+		================
+		*/
+		step( now: number ) {
+			const next = npcConversationTransition( state, { type: "tick", now } );
+			if ( next === state ) return false;
+			state = next;
+			return true;
+		},
+		/*
+		================
+		state
+		================
+		*/
+		state() {
+			return state;
+		},
+		/*
+		================
+		restorationRevision
+		================
+		*/
+		restorationRevision() {
+			return restorationRevision;
+		},
+		/*
+		================
+		eventGreeting
+
+		The 75D030 greeting symbol a firing exchange answer left on the
+		talk window, or null. While it stands, the HUD shows it as the
+		prompt with the capabilities cleared, as native does.
+		================
+		*/
+		eventGreeting() {
+			return eventGreeting;
+		},
+		/*
+		================
+		interaction
+		================
+		*/
+		interaction( payload: Uint8Array, capabilities: number ) {
+			const next = npcInteractionMask( payload, capabilities );
+			if ( next !== null ) interactionMask = next;
+		},
+		/*
+		================
+		interactionLocked
+		================
+		*/
+		interactionLocked() {
+			return interactionMask !== 0;
+		},
+		/*
+		================
+		clear
+		================
+		*/
+		clear() {
+			state = npcConversationTransition( state, { type: "close" } );
+			eventGreeting = null;
+			interactionMask = 0;
+			window = { hidden: false, revision: window.revision + 1 };
+			restorationRevision = 0;
+		}
+	};
+}

@@ -1,0 +1,215 @@
+/*
+===========================================================================
+
+register.go - bind native chat requests to the shard's delivery owners
+
+Routing produces acknowledgements and public or private delivery. The beta
+runtime orders public history with live messages; presence owns private peers.
+
+===========================================================================
+*/
+package chat
+
+import (
+	"strings"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/restriction"
+	"opensro.online/server/internal/game/social/chatlog"
+	"opensro.online/server/internal/game/social/chatreport"
+	"opensro.online/server/internal/transport"
+)
+
+/*
+================
+DeliveryPresence
+
+Private delivery resolves live recipients through the shared presence owner.
+================
+*/
+type DeliveryPresence interface {
+	PresenceView
+	SessionByName(divisionID, name string) (*transport.Session, bool)
+}
+
+/*
+================
+Register
+================
+*/
+func Register(hub *transport.Hub, deps Dependencies, presence DeliveryPresence, parties PartyView) *Runtime {
+	rt := &Runtime{history: make(map[string][]publicLine), members: make(map[uint64]publicMember), now: time.Now}
+	hub.Handle(OpChatRequest, rt.chatHubHandler(hub, deps, presence, parties))
+	hub.OnSessionClose(rt.sessionClosed)
+	return rt
+}
+
+/*
+================
+chatHubHandler
+
+Resolve the bound character through session identity, then route the request.
+Beta public delivery precedes the native receipt so its channel owns sender
+presentation. Private recipients resolve through presence at delivery time.
+Decode refusals without an acknowledgement remain silent.
+================
+*/
+func (rt *Runtime) chatHubHandler(hub *transport.Hub, deps Dependencies, presence DeliveryPresence, parties PartyView) transport.HandlerFunc {
+	return func(s *transport.Session, opcode uint16, payload []byte) {
+		character, divisionID, bound := enterworld.SessionCharacter(deps, s)
+		if !bound {
+			log.Debugf("chat: 0x%04X from unbound session %d discarded", opcode, s.ID)
+			return
+		}
+		// Native admission precedes decoding and all publication/mutation.
+		if restriction.Report(s, transport.CommandRestrictionChat) {
+			return
+		}
+		// Port-only, not native (#3358): a /contributor line sets the
+		// speaker's own title and is consumed the same way as /report.
+		if rt.Contributor != nil {
+			if request, err := DecodeChatRequestWithLinks(payload); err == nil {
+				if answer, handled := rt.Contributor(character.AccountID, request.Message); handled {
+					_ = s.Send(OpChatAck, EncodeChatAckSuccess(request.ChatType, request.Second))
+					_ = s.Send(OpChatBroadcast, EncodeChatNotice(answer))
+					return
+				}
+			}
+		}
+		// Port-only, not native (#2959): a /report line is consumed
+		// whole - the reporter gets the ack and one notice line, and
+		// nothing reaches the room, the transcript or the feed. With
+		// no intake wired the line falls through as ordinary chat.
+		if rt.Reports != nil {
+			if request, err := DecodeChatRequestWithLinks(payload); err == nil {
+				reporter := chatreport.Reporter{AccountID: character.AccountID, Character: character.Name, Division: divisionID}
+				if answer, handled := rt.Reports.File(reporter, request.Message); handled {
+					_ = s.Send(OpChatAck, EncodeChatAckSuccess(request.ChatType, request.Second))
+					_ = s.Send(OpChatBroadcast, EncodeChatNotice(answer))
+					return
+				}
+			}
+		}
+		outcome := HandleChat(deps, Views{Presence: presence, Parties: parties, Unions: rt.Unions, Stalls: rt.Stalls, Links: rt.ItemLinks}, divisionID, character, payload)
+		// Port-only, not native: a shadow-muted author's lines reach only
+		// the author, who sees the same echo and acknowledgement as ever.
+		muted := rt.ShadowMuted != nil && rt.ShadowMuted(character.AccountID)
+		rt.recordModerationLine(outcome, muted, character, payload)
+		if outcome.Refusal == "" && outcome.Broadcast != nil && ClosedBetaGlobalChat {
+			// The author's echo precedes the keyed receipt on the same reliable
+			// stream, so presentation uses the server's channel exactly once.
+			if muted {
+				sendPrelude(s, outcome.Prelude)
+				_ = s.Send(OpChatBroadcast, outcome.Broadcast)
+			} else {
+				rt.publish(divisionID, character.Name, outcome.PlainText, publicLine{payload: outcome.Broadcast, prelude: outcome.Prelude})
+			}
+		}
+		if outcome.Ack != nil {
+			_ = s.Send(OpChatAck, outcome.Ack)
+		}
+		if outcome.Refusal != "" {
+			log.Debugf("chat: 0x7367 refused for %s: %s", character.Name, outcome.Refusal)
+			return
+		}
+		if outcome.Broadcast != nil && !ClosedBetaGlobalChat && !muted {
+			frames := make([]transport.Frame, 0, len(outcome.Prelude)+1)
+			for _, frame := range outcome.Prelude {
+				frames = append(frames, transport.Frame{Opcode: frame.Opcode, Payload: frame.Payload})
+			}
+			frames = append(frames, transport.Frame{Opcode: OpChatBroadcast, Payload: outcome.Broadcast})
+			hub.BroadcastObserved(divisionID, s.ID, enterworld.ObjectIDForCharacter(character), frames)
+		}
+		if presence == nil {
+			return
+		}
+		for _, delivery := range outcome.Deliveries {
+			if muted && !strings.EqualFold(delivery.TargetName, character.Name) {
+				continue
+			}
+			if peer, online := presence.SessionByName(divisionID, delivery.TargetName); online {
+				sendPrelude(peer, outcome.Prelude)
+				_ = peer.Send(OpChatBroadcast, delivery.Payload)
+			}
+		}
+	}
+}
+
+/*
+================
+sendPrelude
+
+A linked line's reference frames, ahead of the line (itemlinks.go).
+================
+*/
+func sendPrelude(session *transport.Session, prelude []wire.Frame) {
+	for _, frame := range prelude {
+		_ = session.Send(frame.Opcode, frame.Payload)
+	}
+}
+
+/*
+================
+recordModerationLine
+
+Port-only, not native: keep one accepted line for the staff (chatlog).
+A line counts as said when routing accepted it and it reached at least
+the author's own echo - a public broadcast or one targeted delivery -
+so refused lines (offline whisper target, wrong party, ...) are not
+logged, and a muted author's lines are logged, marked. Record only
+queues the line; the writer owns the disk (chatlog), so this never
+stalls the handler. The channel and text come from re-decoding the
+request, which HandleChat has already accepted at this point; the text is
+Outcome.PlainText, the labels in place of item-link markers.
+================
+*/
+func (rt *Runtime) recordModerationLine(outcome Outcome, muted bool, character *enterworld.Character, payload []byte) {
+	if rt.ModerationLog == nil || outcome.Refusal != "" || (outcome.Broadcast == nil && len(outcome.Deliveries) == 0) {
+		return
+	}
+	// The lenient decoder reads a native frame and a linked one alike;
+	// HandleChat already chose which the switch allows.
+	request, err := DecodeChatRequestWithLinks(payload)
+	if err != nil {
+		return
+	}
+	rt.ModerationLog.Record(chatlog.Entry{
+		At:        rt.now().UTC(),
+		AccountID: character.AccountID,
+		Character: character.Name,
+		Channel:   moderationChannel(request.ChatType),
+		Target:    request.TargetName,
+		Muted:     muted,
+		Text:      outcome.PlainText,
+	})
+}
+
+/*
+================
+moderationChannel
+
+The staff-facing name of a requested chat lane.
+================
+*/
+func moderationChannel(chatType uint8) string {
+	switch chatType {
+	case ChatTypeAll:
+		return "all"
+	case ChatTypeWhisper:
+		return "whisper"
+	case ChatTypeGM:
+		return "gm"
+	case ChatTypeParty:
+		return "party"
+	case ChatTypeGuild:
+		return "guild"
+	case ChatTypeUnion:
+		return "union"
+	case ChatTypeStall:
+		return "stall"
+	}
+	return "unknown"
+}

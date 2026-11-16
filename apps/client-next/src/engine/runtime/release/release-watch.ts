@@ -1,0 +1,95 @@
+/*
+===========================================================================
+
+release-watch.ts - notice when a newer client release is live
+
+A running tab keeps its release until reloaded. After a publish it would
+keep talking to an updated server with outdated code, so this owner asks
+the asset worker for the entry bundle the live page names (fetched
+no-cache) and compares it with the one this page loaded. A different entry
+means a newer release is live; the platform then offers a refresh. Nothing
+reloads on its own: that would drop a player mid-session. The check also
+compares the live packs manifest with this page's: a data publish keeps
+the entry bundle, so only the manifest shows it moved (#3104).
+
+It checks when a trigger arrives (the title screen opens, the connection
+drops, the tab becomes visible again), no more than once per
+RELEASE_TRIGGER_GAP_MS, and otherwise every RELEASE_CHECK_INTERVAL_MS. A
+file the page's manifest lists coming back 404 (the asset owner's
+takeReleaseStale) is the publish itself showing: that checks at once, with
+a single free slot, no more than once per RELEASE_STALE_GAP_MS. The check
+consumes it, so a 404 that is not a release (a lost file) costs one check. The
+frame clock drives it; it owns no timer. A page without a hashed entry (a
+development server) never checks.
+
+===========================================================================
+*/
+
+import type { AssetOwner } from "@/engine/contracts/assets";
+
+export const RELEASE_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+export const RELEASE_TRIGGER_GAP_MS = 30 * 1000;
+export const RELEASE_STALE_GAP_MS = 5 * 1000;
+const RELEASE_PAGE_BYTES = 256 * 1024;
+// Leave foreground loads a slot; the check is never urgent.
+const RELEASE_MIN_FREE_SLOTS = 2;
+
+/*
+================
+createReleaseWatch
+
+`runningEntry` is the entry bundle this page loaded (null disables the
+watch); `pageUrl` is the live page to compare with.
+================
+*/
+export function createReleaseWatch( assets: AssetOwner, pageUrl: string, runningEntry: string | null ) {
+	let job: number | null = null, lastCheckMs = -Infinity, newer = false, stalePending = false;
+
+	return {
+		/*
+		================
+		step
+
+		Called once per frame with the frame time and whether a trigger fired.
+		================
+		*/
+		step( nowMs: number, triggered: boolean ) {
+			if ( runningEntry === null || newer ) return;
+			if ( assets.takeReleaseStale?.() ) stalePending = true;
+			if ( job !== null ) {
+				const result = assets.take( job );
+				if ( !result ) return;
+				job = null;
+				// An error (offline, a 5xx) is simply retried at the next check.
+				if (
+					result.kind === "release" &&
+					(result.entry !== null && result.entry !== runningEntry || result.packsChanged === true)
+				) newer = true;
+				return;
+			}
+			// A stale file means the scene in hand cannot finish: check now.
+			const stale = stalePending && nowMs - lastCheckMs >= RELEASE_STALE_GAP_MS;
+			const due = nowMs - lastCheckMs >= RELEASE_CHECK_INTERVAL_MS ||
+				triggered && nowMs - lastCheckMs >= RELEASE_TRIGGER_GAP_MS;
+			if ( stale ? assets.available() < 1 : !due || assets.available() < RELEASE_MIN_FREE_SLOTS ) return;
+			lastCheckMs = nowMs;
+			stalePending = false;
+			job = assets.request( pageUrl, RELEASE_PAGE_BYTES, "release" );
+		},
+		/*
+		================
+		newerAvailable
+		================
+		*/
+		newerAvailable: () => newer,
+		/*
+		================
+		dispose
+		================
+		*/
+		dispose() {
+			if ( job !== null ) assets.cancel( job );
+			job = null;
+		}
+	};
+}

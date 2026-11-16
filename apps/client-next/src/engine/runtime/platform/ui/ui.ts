@@ -1,0 +1,1114 @@
+/*
+===========================================================================
+
+ui.ts - the DOM mirror of the GPU-drawn interface
+
+The game draws every window on the canvas. This bridge keeps one real DOM
+element per interactive control (a button, a text edit, a range, a hit
+region) positioned over its drawn rect, so the browser supplies hit testing,
+keyboard focus, text entry, IME and accessibility. It reports what the user
+does as UiEvents and applies the focus requests the UI publishes.
+
+A locked text edit is read-only rather than disabled: the browser drops
+focus from a disabled element and never returns it.
+
+===========================================================================
+*/
+import type { UiBridge, UiControl, UiEvent, UiSemantics } from "@/engine/contracts/ui";
+import { createLayoutKeys } from "@/engine/foundation/ui/layout-keys";
+import { configureCredentialHints } from "./credential-hints";
+import { createDragShield } from "./drag-shield";
+import { createTouchInspection } from "./touch-inspect";
+const INPUT_FONT_PIXELS = 12;
+const TOUCH_HOLD_MS = 500;
+const TOUCH_HOLD_SLOP_PIXELS = 8;
+const TOUCH_CLICK_HISTORY = 32;
+// A browser that sends both the Mac Ctrl+click contextmenu and a click sends
+// them together; a later Ctrl+click on the slot is a new gesture.
+const MAC_CTRL_CLICK_WINDOW_MS = 1000;
+/*
+================
+createUiBridge
+
+One keyed semantic tree. It mirrors interactive controls, never NPC markers.
+================
+*/
+export function createUiBridge(
+	canvas: HTMLCanvasElement,
+	emit: ( event: UiEvent ) => void,
+	release: () => void,
+	heldKey: ( code: string, down: boolean ) => void = () => {},
+	displayScale: () => number = () => 1
+): UiBridge {
+	const lifetime = new AbortController(),
+		root = document.createElement( "section" ),
+		message = document.createElement( "p" );
+	root.setAttribute( "aria-label", "Game interface" );
+	root.dataset.gpuUi = "semantics";
+	root.style.cssText = "position:fixed;inset:0;pointer-events:none;overflow:hidden";
+	message.setAttribute( "role", "status" );
+	message.style.cssText = "position:absolute;width:1px;height:1px;clip-path:inset(50%);overflow:hidden";
+	root.append( message );
+	document.body.append( root );
+	const dragShield = createDragShield( lifetime.signal ); // GH #1242 drag-lifetime gesture shield
+	// Each control element and the layout this bridge last wrote to it: the
+	// bridge is the only writer, so it compares numbers instead of reading the
+	// element's style back (a CSSOM read and string per control per present).
+	const controls = new Map<
+		string,
+		{
+			element: HTMLInputElement | HTMLTextAreaElement | HTMLButtonElement | HTMLDivElement;
+			value: UiControl;
+			order: number;
+			clipPath: string;
+			box: [number, number, number, number];
+		}
+	>();
+	let composing = false;
+	// An Enter whose keydown reported a composition (Firefox on Linux reports
+	// keyCode 229 / isComposing for plain typing under IBus or Fcitx, and a
+	// lost compositionend can leave `composing` set). Its keyup submits unless
+	// a compositionend in between shows the Enter only committed IME text.
+	let imeEnter: EventTarget | null = null;
+	let drag: { id: string; pointer: number; x: number; y: number; moved?: boolean; } | null = null, focusRevision = -1;
+	let suppressClick: string | null = null;
+	// Abandoning a drag or a carry is reported as drag-cancel, never as
+	// press null: press null is the visual release that every key-up and
+	// control boundary crossing also sends, and a carried item must survive
+	// those.
+	// Click-carry: a click on a carry control lifts its item onto the cursor;
+	// pointer moves report as that control's drag, and the next left press
+	// reports its drag-end at the press point and is consumed whole, so it
+	// neither re-presses a control nor reaches the world. A press back on the
+	// source puts the item down and passes through (its double-click still
+	// fires); right press or Escape cancels. swallowClick eats the consumed
+	// press's click; suppressCarry stops a put-back click lifting it again.
+	let carry: { id: string; x: number; y: number; } | null = null,
+		swallowClick = false,
+		suppressCarry: string | null = null;
+	/*
+	================
+	uiPoint
+
+	A pointer position in UI pixels. Drag deltas and drop points are UI
+	coordinates: CSS client pixels relative to the canvas, divided by the
+	chosen screen size's display scale (the inverse of the control layout).
+	================
+	*/
+	function uiPoint( event: { clientX: number; clientY: number; } ): [number, number] {
+		const box = canvas.getBoundingClientRect(), scale = displayScale();
+		return [ (event.clientX - box.left) / scale, (event.clientY - box.top) / scale ];
+	}
+	let rightPressed: { element: Element; pointer: number; } | null = null;
+	// Owner-authorized port-only mobile input. This state owns only admission;
+	// published rightActivate metadata and the native secondary path own use.
+	const touchHold: {
+		pointers: Set<number>;
+		press: { element: Element; event: PointerEvent; secondary: boolean; } | null;
+		clicks: Map<number, Element>;
+		timer: number | null;
+	} = { pointers: new Set(), press: null, clicks: new Map(), timer: null };
+	/*
+	================
+	cancelTouchHold
+	================
+	*/
+	function cancelTouchHold() {
+		if ( touchHold.timer !== null ) window.clearTimeout( touchHold.timer );
+		touchHold.timer = null;
+		touchHold.press = null;
+	}
+	/*
+	================
+	syncDragShield
+
+	The shield follows the drag's lifetime: every change of the drag or of
+	the touch pointers calls this. Semantics are presented only when they
+	change, so a drag that ended between presentations must not leave the
+	shield up until the next one.
+	================
+	*/
+	function syncDragShield() {
+		dragShield.set( drag !== null && touchHold.pointers.has( drag.pointer ) );
+	}
+	window.addEventListener( "pointerdown", event => {
+		if ( event.pointerType !== "touch" ) return;
+		touchHold.clicks.delete( event.pointerId );
+		const slot = current( event.target );
+		if ( slot?.value.kind === "button" ) {
+			touchHold.clicks.set( event.pointerId, slot.element );
+			while ( touchHold.clicks.size > TOUCH_CLICK_HISTORY ) {
+				touchHold.clicks.delete( touchHold.clicks.keys().next().value! );
+			}
+		}
+		touchHold.pointers.add( event.pointerId );
+		if ( touchHold.pointers.size > 1 ) cancelTouchHold();
+	}, { capture: true, signal: lifetime.signal } );
+	window.addEventListener( "pointermove", event => {
+		const press = touchHold.press;
+		if (
+			press && press.event.pointerId === event.pointerId &&
+			(Math.hypot( event.clientX - press.event.clientX, event.clientY - press.event.clientY ) >
+					TOUCH_HOLD_SLOP_PIXELS || drag?.pointer !== event.pointerId && // Captured: shield owns geometry.
+					current( document.elementFromPoint( event.clientX, event.clientY ) )?.element !== press.element)
+		) cancelTouchHold();
+	}, { capture: true, signal: lifetime.signal } );
+	for ( const name of [ "pointerup", "pointercancel" ] as const ) {
+		window.addEventListener( name, event => {
+			touchHold.pointers.delete( event.pointerId );
+			syncDragShield();
+			if ( name === "pointercancel" && touchHold.press?.event.pointerId === event.pointerId ) cancelTouchHold();
+		}, { capture: true, signal: lifetime.signal } );
+	}
+	window.addEventListener( "blur", () => {
+		cancelTouchHold();
+		touchHold.pointers.clear();
+		syncDragShield();
+	}, { signal: lifetime.signal } );
+	window.addEventListener( "pointermove", event => {
+		if ( !drag || event.pointerId !== drag.pointer ) return;
+		// Touch jitter belongs to the pending hold. Once its CSS-pixel slop is
+		// crossed, the capture listener cancels it before this drag can publish.
+		if ( touchHold.press?.event.pointerId === event.pointerId ) return;
+		const current = controls.get( drag.id )?.value;
+		if ( !current?.draggable || current.disabled ) {
+			emit( { kind: "drag-cancel", id: drag.id } );
+			drag = null;
+			syncDragShield();
+			emit( { kind: "press", id: null } );
+			return;
+		}
+		const [x, y] = uiPoint( event ), dx = x - drag.x, dy = y - drag.y;
+		drag = { ...drag, x, y, moved: drag.moved || dx !== 0 || dy !== 0 };
+		emit( { kind: "drag", id: drag.id, dx, dy } );
+	}, { signal: lifetime.signal } );
+	window.addEventListener( "pointerup", event => {
+		if ( event.button !== 0 ) return;
+		if ( drag && event.pointerId !== drag.pointer ) return;
+		const completed = drag;
+		drag = null;
+		dragShield.set( false );
+		if ( completed?.moved ) {
+			suppressClick = completed.id;
+			const [x, y] = uiPoint( event );
+			emit( { kind: "drag-end", id: completed.id, x, y } );
+		}
+	}, { signal: lifetime.signal } );
+	window.addEventListener( "pointercancel", () => {
+		if ( drag ) emit( { kind: "drag-cancel", id: drag.id } );
+		drag = null;
+		syncDragShield();
+		suppressClick = null;
+		emit( { kind: "press", id: null } );
+	}, { signal: lifetime.signal } );
+	window.addEventListener( "blur", () => {
+		if ( drag ) emit( { kind: "drag-cancel", id: drag.id } );
+		drag = null;
+		syncDragShield();
+		cancelCarry();
+	}, { signal: lifetime.signal } );
+	/*
+	================
+	edit
+
+	Publish browser-owned text and selection together, including IME state.
+	================
+	*/
+	function edit( element: HTMLInputElement | HTMLTextAreaElement, id: string ) {
+		emit( {
+			kind: "edit",
+			id,
+			value: element.value,
+			start: element.selectionStart ?? 0,
+			end: element.selectionEnd ?? 0,
+			direction: element.selectionDirection ?? "none",
+			composing
+		} );
+	}
+	root.addEventListener( "focusin", event => {
+		release();
+		const el = event.target as HTMLElement;
+		emit( { kind: "focus", id: el.dataset.uiId ?? null } );
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "focusout", event => {
+		// present leaves an editor's value alone while composing. A composition
+		// that ends with the focus (its compositionend lost) takes the published
+		// value here: semantics are presented again only when they change.
+		const slot = composing ? current( event.target ) : undefined;
+		composing = false;
+		if (
+			slot && slot.value.kind !== "button" &&
+			(slot.element instanceof HTMLInputElement || slot.element instanceof HTMLTextAreaElement) &&
+			slot.element.value !== slot.value.value
+		) slot.element.value = slot.value.value ?? "";
+		emit( { kind: "focus", id: null } );
+	}, { signal: lifetime.signal } );
+	const layoutKeys = createLayoutKeys();
+	root.addEventListener( "keydown", event => {
+		event.stopPropagation();
+		if ( !event.code ) return;
+		if ( event.isComposing || composing || event.keyCode === 229 ) {
+			if ( event.key === "Enter" && !event.repeat && event.target instanceof HTMLInputElement ) {
+				imeEnter = event.target;
+			}
+			return;
+		}
+		imeEnter = null;
+		// A letter is the one the layout prints on the key (layout-keys.ts).
+		const code = layoutKeys.down( event.code, event.key );
+		if (
+			/^F([1-9]|1[0-2])$/.test( code ) && code !== "F5" && code !== "F11" &&
+			code !== "F12"
+		) event.preventDefault();
+		if ( code === "Backquote" && event.shiftKey ) {
+			event.preventDefault();
+			if ( !event.repeat ) emit( { kind: "key", code, shift: true, ctrl: event.ctrlKey } );
+			return;
+		}
+		if (
+			current( event.target )?.value.id === "gm-input" &&
+			(code === "ArrowLeft" || code === "ArrowRight") &&
+			event.target instanceof HTMLInputElement && event.target.value === ""
+		) {
+			// An empty GM prompt has no caret to move: the arrows switch the
+			// catalogue tab. Once the GM types a filter they edit text again.
+			event.preventDefault();
+			if ( !event.repeat ) emit( { kind: "key", code, shift: event.shiftKey, ctrl: event.ctrlKey } );
+			return;
+		}
+		if (
+			current( event.target )?.value.id === "gm-input" &&
+			(code === "ArrowUp" || code === "ArrowDown" || code === "PageUp" || code === "PageDown" ||
+				code === "Tab" || code === "F3")
+		) {
+			// The GM console's catalogue list owns these keys while it is open;
+			// the console's history still takes the arrows when no list shows.
+			// Tab must not move DOM focus out of the prompt; F3 toggles the
+			// item browser without leaving the prompt. Held arrows and page
+			// keys repeat so a long catalogue can be surfed quickly.
+			event.preventDefault();
+			const repeatable = code === "ArrowUp" || code === "ArrowDown" || code === "PageUp" ||
+				code === "PageDown";
+			if ( !event.repeat || repeatable ) {
+				emit( { kind: "key", code, shift: event.shiftKey, ctrl: event.ctrlKey } );
+			}
+			return;
+		}
+		if ( current( event.target )?.value.captureKeys ) {
+			event.preventDefault();
+			if ( !event.repeat ) emit( { kind: "key", code, shift: event.shiftKey, ctrl: event.ctrlKey } );
+			return;
+		}
+		const editing = event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement;
+		if ( !editing && !event.repeat ) heldKey( code, true );
+		if (
+			code !== "Escape" && code !== "Space" && event.key !== "Enter" &&
+			!editing && !event.repeat
+		) emit( { kind: "key", code, shift: event.shiftKey, ctrl: event.ctrlKey, space: layoutKeys.held( "Space" ) } );
+		if ( code === "Escape" && !event.repeat ) {
+			emit( { kind: "key", code, shift: event.shiftKey, ctrl: event.ctrlKey } );
+			// The GM prompt owns Escape: it dismisses the catalogue and keeps
+			// the caret, or closes the console through its own focus request.
+			// Blurring here wiped the focus the UI had just restored.
+			if ( current( event.target )?.value.id !== "gm-input" ) (event.target as HTMLElement).blur();
+		}
+		if ( event.key === "Enter" && !event.repeat && event.target instanceof HTMLInputElement ) {
+			event.preventDefault();
+			emit( { kind: "activate", id: "submit" } );
+		}
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "keyup", event => {
+		event.stopPropagation();
+		if ( !event.code ) return;
+		heldKey( layoutKeys.up( event.code, event.key ), false );
+		if (
+			event.key === "Enter" && imeEnter !== null && event.target === imeEnter && !event.isComposing &&
+			event.keyCode !== 229
+		) {
+			imeEnter = null;
+			composing = false;
+			emit( { kind: "activate", id: "submit" } );
+		}
+	}, { signal: lifetime.signal } );
+	window.addEventListener( "pointerup", event => {
+		if ( event.button === 0 && (!drag || event.pointerId === drag.pointer) ) emit( { kind: "press", id: null } );
+	}, { signal: lifetime.signal } );
+	window.addEventListener( "blur", () => {
+		layoutKeys.clear();
+		emit( { kind: "press", id: null } );
+		emit( { kind: "hover", id: null } );
+	}, { signal: lifetime.signal } );
+	// Retail editors own selection, not Chromium's native text drag/drop loop.
+	// Dragging selected transparent text otherwise steals pointer delivery and
+	// replaces the game cursor with the browser/OS drag image.
+	root.addEventListener( "dragstart", event => event.preventDefault(), { signal: lifetime.signal } );
+	// The semantic controls overlay the canvas, so canvas context-menu handling
+	// cannot see their RMB gestures. Cover editors, disabled controls, regions
+	// and future controls here without consuming the game's pointer events.
+	root.addEventListener( "contextmenu", event => event.preventDefault(), { signal: lifetime.signal, capture: true } );
+	root.addEventListener( "compositionstart", () => {
+		composing = true;
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "compositionend", event => {
+		composing = false;
+		imeEnter = null;
+		if ( event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement ) {
+			edit( event.target, event.target.dataset.uiId! );
+		}
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "input", event => {
+		// A committed (non-composing) edit proves no composition is open, so a
+		// compositionstart whose end was lost cannot block Enter for good.
+		if ( event instanceof InputEvent && !event.isComposing ) composing = false;
+		if ( event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement ) {
+			edit( event.target, event.target.dataset.uiId! );
+		}
+	}, { signal: lifetime.signal } );
+	document.addEventListener( "selectionchange", () => {
+		const el = document.activeElement;
+		if ( (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && root.contains( el ) ) {
+			edit( el, el.dataset.uiId! );
+		}
+	}, { signal: lifetime.signal } );
+	/*
+	================
+	current
+
+	Delegated events resolve current state, never a descriptor from creation.
+	================
+	*/
+	function current( target: EventTarget | null ) {
+		if ( !(target instanceof Element) ) return;
+		const el = target.closest<HTMLElement>( "[data-ui-id]" );
+		if ( !el || !root.contains( el ) ) return;
+		const slot = controls.get( el.dataset.uiId! );
+		return slot?.element === el ? slot : undefined;
+	}
+	// Drag regions prevent the browser's default pointer-down focus transfer.
+	// Retire the previous control's focus first, including a press on the world,
+	// so a button cannot remain highlighted after the player starts a new action.
+	window.addEventListener( "pointerdown", event => {
+		if ( event.button !== 0 ) return;
+		const active = document.activeElement;
+		if ( !(active instanceof HTMLElement) || !root.contains( active ) ) return;
+		const target = current( event.target );
+		if ( target?.element === active ) return;
+		if ( keepsFocus( event, active ) ) return;
+		active.blur();
+		if ( event.target === canvas || target?.value.kind === "region" ) canvas.focus( { preventScroll: true } );
+	}, { capture: true, signal: lifetime.signal } );
+	// Port-only (SRO_CHAT_ITEM_LINKS): the browser moves focus to the pressed
+	// control on mousedown; an editor that keeps its focus on Alt presses
+	// refuses that move, and the click still activates the control.
+	window.addEventListener( "mousedown", event => {
+		const active = document.activeElement;
+		if ( event.button !== 0 || !(active instanceof HTMLElement) || !root.contains( active ) ) return;
+		if ( current( event.target )?.element !== active && keepsFocus( event, active ) ) event.preventDefault();
+	}, { capture: true, signal: lifetime.signal } );
+	/*
+	================
+	keepsFocus
+
+	An Alt press while the focused control is an editor that keeps its
+	focus on Alt presses (keepFocusOnAltPress).
+	================
+	*/
+	function keepsFocus( event: MouseEvent, active: HTMLElement ) {
+		return event.altKey && current( active )?.value.keepFocusOnAltPress === true;
+	}
+	root.addEventListener( "pointerdown", event => {
+		if ( event.button !== 2 ) return;
+		const slot = current( event.target );
+		rightPressed = slot?.value.rightActivate && !slot.value.disabled ?
+			{ element: slot.element, pointer: event.pointerId } :
+			null;
+	}, { signal: lifetime.signal } );
+	// Browsers omit pointerdown/up for intermediate buttons in a mouse chord.
+	// Keep that native cancel gesture reachable while a left drag owns capture.
+	root.addEventListener( "mousedown", event => {
+		if ( event.button !== 2 || !drag || rightPressed ) return;
+		const slot = current( event.target );
+		if ( slot?.value.rightActivate && !slot.value.disabled ) {
+			rightPressed = { element: slot.element, pointer: drag.pointer };
+		}
+	}, { signal: lifetime.signal } );
+	/*
+	================
+	finishRightPress
+
+	Release must hit the same live control even while another button captures
+	the pointer. Mouseup is the chord fallback; clearing the press deduplicates it.
+	================
+	*/
+	function finishRightPress( event: MouseEvent ) {
+		if ( event.button !== 2 || !rightPressed ) return;
+		if ( event instanceof PointerEvent && event.pointerId !== rightPressed.pointer ) return;
+		const armed = rightPressed;
+		rightPressed = null;
+		activateSecondary( armed.element, event );
+	}
+	/*
+	================
+	activateSecondary
+
+	Mouse release and an admitted touch hold use the same live control contract.
+	================
+	*/
+	function activateSecondary( element: Element, event: MouseEvent ) {
+		const slot = current( document.elementFromPoint( event.clientX, event.clientY ) );
+		// 5650A0 uses the pressed control and admits release only inside it.
+		if ( slot?.element === element && slot.value.rightActivate && !slot.value.disabled ) {
+			emit( {
+				kind: "right-activate",
+				id: slot.value.id,
+				shift: event.shiftKey,
+				ctrl: event.ctrlKey,
+				alt: event.altKey
+			} );
+			if ( drag ) {
+				const element = controls.get( drag.id )?.element;
+				if ( element?.hasPointerCapture( drag.pointer ) ) element.releasePointerCapture( drag.pointer );
+				suppressClick = drag.id;
+				emit( { kind: "drag-cancel", id: drag.id } );
+				drag = null;
+				syncDragShield();
+				emit( { kind: "press", id: null } );
+			}
+		}
+	}
+	window.addEventListener( "pointerup", finishRightPress, { signal: lifetime.signal } );
+	window.addEventListener( "mouseup", finishRightPress, { signal: lifetime.signal } );
+	root.addEventListener( "pointermove", event => {
+		// A captured left press suppresses compatibility mouse events. Pointer
+		// events encode subsequent button changes as moves with button == 2.
+		if ( event.button !== 2 || !drag ) return;
+		if ( event.buttons & 2 ) {
+			const slot = current( event.target );
+			if ( slot?.value.rightActivate && !slot.value.disabled ) {
+				rightPressed = { element: slot.element, pointer: event.pointerId };
+			}
+		} else finishRightPress( event );
+	}, { signal: lifetime.signal } );
+	window.addEventListener( "pointercancel", () => {
+		rightPressed = null;
+	}, { signal: lifetime.signal } );
+	window.addEventListener( "blur", () => {
+		rightPressed = null;
+	}, { signal: lifetime.signal } );
+	/*
+	================
+	activatePrimary
+
+	Mouse/keyboard clicks and admitted touch taps share activation and carry.
+	================
+	*/
+	function activatePrimary( target: EventTarget | null, event: MouseEvent, pointerActivation: boolean ) {
+		const slot = current( target ), suppressed = suppressClick, putBack = suppressCarry;
+		suppressClick = null;
+		suppressCarry = null;
+		if ( slot?.value.kind === "button" && !slot.value.disabled && slot.value.id !== suppressed ) {
+			emit( {
+				kind: "activate",
+				id: slot.value.id,
+				shift: event.shiftKey,
+				ctrl: event.ctrlKey,
+				alt: event.altKey
+			} );
+			// Keyboard activation (detail 0) never lifts an item. Nor does a
+			// modifier click: CIFItemSlot_DispatchActivation (567290) turns CTRL,
+			// SHIFT and ALT clicks into the quick sale/buy, the stack split and
+			// the COS transfer, exclusive of the plain click. Lifting here too
+			// threw the icon onto the cursor until the sale disabled its slot.
+			const modified = event.ctrlKey || event.shiftKey || event.altKey;
+			if (
+				slot.value.carry && slot.value.draggable && !carry && pointerActivation && !modified &&
+				putBack !== slot.value.id
+			) {
+				const [x, y] = uiPoint( event ), rect = slot.value.rect;
+				carry = { id: slot.value.id, x, y };
+				// The lifted icon starts on the cursor, not on the slot's centre.
+				emit( {
+					kind: "drag",
+					id: carry.id,
+					dx: x - (rect[0] + rect[2] / 2),
+					dy: y - (rect[1] + rect[3] / 2)
+				} );
+			}
+		}
+	}
+	// Port-only (macOS input, no native counterpart): a Mac turns Ctrl+click
+	// into the system's secondary click. The browser presses the primary
+	// button with ctrlKey, sends contextmenu and no click, so the CTRL item
+	// actions (quick sale, storage moves) would never reach activatePrimary.
+	// A primary Ctrl press followed by contextmenu on the same control is that
+	// gesture; a true right press is button 2 and never arms it.
+	let macCtrlPress: Element | null = null;
+	let macCtrlActivation: { element: Element; at: number; } | null = null;
+	root.addEventListener( "pointerdown", event => {
+		macCtrlPress = event.button === 0 && event.ctrlKey ? current( event.target )?.element ?? null : null;
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "contextmenu", event => {
+		const pressed = macCtrlPress;
+		macCtrlPress = null;
+		const slot = current( event.target );
+		if ( !pressed || !event.ctrlKey || slot?.element !== pressed ) return;
+		macCtrlActivation = { element: slot.element, at: event.timeStamp };
+		activatePrimary( event.target, event, true );
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "click", event => {
+		// A browser that also sends the click must not run the action twice.
+		const repeat = macCtrlActivation;
+		macCtrlActivation = null;
+		if (
+			repeat && event.ctrlKey && current( event.target )?.element === repeat.element &&
+			event.timeStamp - repeat.at < MAC_CTRL_CLICK_WINDOW_MS
+		) return;
+		activatePrimary( event.target, event, event.detail > 0 );
+	}, {
+		signal: lifetime.signal
+	} );
+	// Owner-authorized port-only mobile taps do not depend on Chrome emitting
+	// a compatibility click after a camera gesture. Consume that click if it
+	// does arrive, including after cancellation, retirement or a fired hold.
+	window.addEventListener( "click", event => {
+		const pointer = event instanceof PointerEvent ? event.pointerId : undefined;
+		const touch = (event as MouseEvent & { sourceCapabilities?: { firesTouchEvents: boolean; }; })
+			.sourceCapabilities?.firesTouchEvents;
+		if (
+			!(pointer !== undefined && touchHold.clicks.has( pointer )) &&
+			!(touch && [ ...touchHold.clicks.values() ].includes( current( event.target )?.element! ))
+		) return;
+		event.preventDefault();
+		event.stopPropagation();
+	}, { capture: true, signal: lifetime.signal } );
+	window.addEventListener( "pointerup", event => {
+		const press = touchHold.press;
+		if ( !press || press.event.pointerId !== event.pointerId ) return;
+		cancelTouchHold();
+		if (
+			event.button !== 0 || swallowClick ||
+			Math.hypot( event.clientX - press.event.clientX, event.clientY - press.event.clientY ) >
+				TOUCH_HOLD_SLOP_PIXELS ||
+			current( document.elementFromPoint( event.clientX, event.clientY ) )?.element !== press.element
+		) return;
+		activatePrimary( press.element, event, true );
+		// Port-only (#1243): the tap also inspects; its action above is unchanged.
+		const tapped = current( press.element );
+		if ( tapped?.value.inspect && !tapped.value.disabled ) touchInspection.inspect( tapped.value.id );
+	}, { signal: lifetime.signal } );
+	/*
+	================
+	carrying
+
+	The live carry, dropped silently once its control no longer carries.
+	================
+	*/
+	function carrying() {
+		const value = carry ? controls.get( carry.id )?.value : undefined;
+		if ( carry && (!value?.carry || value.disabled) ) {
+			emit( { kind: "drag-cancel", id: carry.id } );
+			carry = null;
+		}
+		return carry;
+	}
+	/*
+	================
+	cancelCarry
+	================
+	*/
+	function cancelCarry() {
+		if ( !carry ) return;
+		emit( { kind: "drag-cancel", id: carry.id } );
+		carry = null;
+	}
+	window.addEventListener( "pointermove", event => {
+		const live = drag ? null : carrying();
+		if ( !live ) return;
+		const [x, y] = uiPoint( event ), dx = x - live.x, dy = y - live.y;
+		carry = { ...live, x, y };
+		if ( dx !== 0 || dy !== 0 ) emit( { kind: "drag", id: live.id, dx, dy } );
+	}, { signal: lifetime.signal } );
+	window.addEventListener( "pointerdown", event => {
+		swallowClick = false;
+		const live = carrying();
+		if ( !live ) return;
+		if ( event.button === 0 && current( event.target )?.value.id === live.id ) {
+			suppressCarry = live.id;
+			cancelCarry();
+			return;
+		}
+		event.preventDefault();
+		event.stopPropagation();
+		carry = null;
+		swallowClick = true;
+		if ( event.button !== 0 ) {
+			emit( { kind: "drag-cancel", id: live.id } );
+			return;
+		}
+		const [x, y] = uiPoint( event );
+		emit( { kind: "drag-end", id: live.id, x, y } );
+	}, { capture: true, signal: lifetime.signal } );
+	for ( const name of [ "mousedown", "click", "dblclick", "contextmenu" ] as const ) {
+		window.addEventListener( name, event => {
+			if ( !swallowClick ) return;
+			event.preventDefault();
+			event.stopPropagation();
+		}, { capture: true, signal: lifetime.signal } );
+	}
+	window.addEventListener( "keydown", event => {
+		if ( event.code !== "Escape" || !carry ) return;
+		event.preventDefault();
+		event.stopPropagation();
+		cancelCarry();
+	}, { capture: true, signal: lifetime.signal } );
+	root.addEventListener( "dblclick", event => {
+		const slot = current( event.target );
+		if ( slot?.value.kind === "region" ) {
+			// Regions report where, in UI pixels.
+			const [x, y] = uiPoint( event );
+			emit( { kind: "region-double", id: slot.value.id, x, y } );
+			return;
+		}
+		if ( slot?.value.kind === "button" && !slot.value.disabled ) {
+			emit( {
+				kind: "double-activate",
+				id: slot.value.id,
+				shift: event.shiftKey,
+				ctrl: event.ctrlKey,
+				alt: event.altKey
+			} );
+		}
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "keydown", event => {
+		const slot = current( event.target );
+		if (
+			slot?.value.kind === "button" && !slot.value.captureKeys && !slot.value.disabled && !event.repeat &&
+			(event.code === "Space" || event.key === "Enter")
+		) emit( { kind: "press", id: slot.value.id } );
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "keyup", () => emit( { kind: "press", id: null } ), { signal: lifetime.signal } );
+	// The last pointer position and the hover last reported. Browsers send
+	// boundary events only when the pointer moves, so a control that is
+	// re-enabled (an inventory slot after a pending sale), appears (a window
+	// opening) or disappears under a still pointer would keep a stale hover.
+	// Each publication re-tests the element under the pointer (syncHover).
+	let pointerAt: [number, number] | null = null, reportedHover: string | null = null;
+	/*
+	================
+	reportHover
+	================
+	*/
+	function reportHover( id: string | null ) {
+		reportedHover = id;
+		emit( { kind: "hover", id } );
+	}
+	// Port-only (#1243): a touch tap's held hover. Registered here so its
+	// capture pointerdown runs after the carry and touch-hold ones above.
+	const touchInspection = createTouchInspection( {
+		signal: lifetime.signal,
+		hoverAt: target => hoverId( current( target ) ),
+		inspectable: id => !!controls.get( id )?.value.inspect && !controls.get( id )?.value.disabled,
+		report: id => {
+			if ( id !== reportedHover ) reportHover( id );
+		}
+	} );
+	window.addEventListener( "pointermove", event => {
+		pointerAt = [ event.clientX, event.clientY ];
+	}, { signal: lifetime.signal, passive: true } );
+	/*
+	================
+	syncHover
+
+	The hover a still pointer should report after this publication.
+	================
+	*/
+	function syncHover() {
+		if ( touchInspection.sync() || !pointerAt || drag ) return;
+		const id = hoverId( current( document.elementFromPoint( pointerAt[0], pointerAt[1] ) ) );
+		if ( id !== reportedHover ) reportHover( id );
+	}
+	/*
+	================
+	hoverId
+
+	The hover a pointer on this control reports: a disabled control still
+	reports one when it has help text to show.
+	================
+	*/
+	function hoverId( slot: ReturnType<typeof current> ) {
+		return slot && (!slot.value.disabled || slot.value.helpText) ? slot.value.id : null;
+	}
+	root.addEventListener( "pointerover", event => {
+		if ( touchInspection.holds( event ) ) return;
+		const slot = current( event.target );
+		if ( slot !== current( event.relatedTarget ) ) reportHover( hoverId( slot ) );
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "pointerout", event => {
+		const next = current( event.relatedTarget );
+		if ( current( event.target ) !== next ) {
+			if ( !touchInspection.holds( event ) ) reportHover( hoverId( next ) );
+			emit( { kind: "press", id: null } );
+		}
+	}, { signal: lifetime.signal } );
+	root.addEventListener( "pointerdown", event => {
+		suppressClick = null;
+		const slot = current( event.target );
+		if (
+			event.button !== 0 || !slot || slot.value.disabled || slot.value.kind === "region" && !slot.value.draggable
+		) return;
+		emit( { kind: "press", id: slot.value.id } );
+		if ( slot.value.draggable ) {
+			event.preventDefault();
+			release();
+			slot.element.setPointerCapture( event.pointerId );
+			const [x, y] = uiPoint( event );
+			drag = { id: slot.value.id, pointer: event.pointerId, x, y };
+			syncDragShield();
+		}
+		if ( event.pointerType === "touch" && touchHold.pointers.size === 1 && slot.value.kind === "button" ) {
+			cancelTouchHold();
+			touchHold.press = { element: slot.element, event, secondary: !!slot.value.rightActivate };
+			if ( !slot.value.rightActivate ) return;
+			touchHold.timer = window.setTimeout( () => {
+				const press = touchHold.press;
+				cancelTouchHold();
+				if ( !press ) return;
+				// A committed secondary action consumes the gesture, including later
+				// movement before release. It cannot also become an inventory drag.
+				if ( drag?.pointer === press.event.pointerId ) drag = null;
+				syncDragShield();
+				// Consume the eventual primary click even on a non-draggable icon.
+				suppressClick = slot.value.id;
+				activateSecondary( press.element, press.event );
+			}, TOUCH_HOLD_MS );
+		}
+	}, { signal: lifetime.signal } );
+	/*
+	================
+	retire
+
+	Release capture and focus before removing an obsolete semantic control.
+	================
+	*/
+	function retire( id: string ) {
+		const slot = controls.get( id );
+		if ( !slot ) return;
+		if ( rightPressed?.element === slot.element ) rightPressed = null;
+		if ( touchHold.press?.element === slot.element ) cancelTouchHold();
+		touchInspection.retire( id );
+		if ( carry?.id === id ) cancelCarry();
+		if ( drag?.id === id ) {
+			if ( slot.element.hasPointerCapture( drag.pointer ) ) slot.element.releasePointerCapture( drag.pointer );
+			emit( { kind: "drag-cancel", id } );
+			drag = null;
+			syncDragShield();
+			emit( { kind: "press", id: null } );
+		}
+		if ( document.activeElement === slot.element ) slot.element.blur();
+		slot.element.remove();
+		controls.delete( id );
+	}
+	return {
+		/*
+		================
+		present
+
+		Validate identities before reconciling the keyed DOM tree. Stable nodes
+		preserve browser selection and accessibility state between GPU frames.
+		================
+		*/
+		present( state: UiSemantics ) {
+			if ( lifetime.signal.aborted ) return;
+			// Identity belongs to the control instance, not its action. Two native
+			// controls may invoke the same close handler but must keep separate hits.
+			// Validate the whole publication before touching the previous semantic tree.
+			const identities = new Set<string>();
+			for ( const control of state.controls ) {
+				if ( identities.has( control.id ) ) throw Error( "Duplicate UI control identity: " + control.id );
+				identities.add( control.id );
+			}
+			// Read geometry once before DOM writes. A changing status label must
+			// not force layout before every publication's control reconciliation.
+			const box = canvas.getBoundingClientRect(), scale = displayScale();
+			if ( root.getAttribute( "aria-label" ) !== state.title ) root.setAttribute( "aria-label", state.title );
+			if ( message.textContent !== state.message ) message.textContent = state.message;
+			// Hit geometry this publication changes. Pointer motion over unchanged
+			// controls reports hover through native pointerover/pointerout; only a
+			// changed layout under a still pointer needs the hit test (which forces a
+			// synchronous layout, so it no longer runs on every frame).
+			let hitLayoutChanged = false;
+			for ( const id of controls.keys() ) {
+				if ( !identities.has( id ) ) {
+					retire( id );
+					hitLayoutChanged = true;
+				}
+			}
+			for ( const [order, control] of state.controls.entries() ) {
+				let slot = controls.get( control.id );
+				if ( slot && (slot.value.kind !== control.kind || !!slot.value.multiline !== !!control.multiline) ) {
+					retire( control.id );
+					slot = undefined;
+				}
+				if ( !slot ) {
+					hitLayoutChanged = true;
+					const element = control.kind === "region" ?
+						document.createElement( "div" ) :
+						control.kind === "button" ?
+						document.createElement( "button" ) :
+						control.multiline ?
+						document.createElement( "textarea" ) :
+						document.createElement( "input" );
+					element.dataset.uiId = control.id;
+					// Transparent browser editors preserve native IME candidate positioning and selection.
+					// Forced-colors users receive visible native controls; GPU focus remains the normal visual.
+					element.className = "gpu-ui-control";
+					element.style.cssText =
+						"position:absolute;pointer-events:auto;box-sizing:border-box;overflow:hidden;white-space:nowrap;min-width:0;min-height:0;margin:0;padding:0;border:0;opacity:0;color:transparent;background:transparent;font:12px Arial;text-align:center;cursor:inherit;";
+					if ( element instanceof HTMLInputElement ) {
+						element.type = control.kind === "password" ?
+							"password" :
+							control.kind === "range" ?
+							"range" :
+							"text";
+						element.maxLength = control.maxLength ?? (control.kind === "password" ? 1024 : 256);
+						configureCredentialHints( element, control.id );
+						element.spellcheck = false;
+						element.setAttribute( "autocapitalize", "off" );
+						element.setAttribute( "autocorrect", "off" );
+					}
+					if ( element instanceof HTMLTextAreaElement ) {
+						element.style.whiteSpace = "pre-wrap";
+						element.style.resize = "none";
+						element.style.lineHeight = "16px";
+						element.spellcheck = false;
+					}
+					root.append( element );
+					slot = { element, value: control, order: NaN, clipPath: "", box: [ NaN, NaN, NaN, NaN ] };
+					controls.set( control.id, slot );
+				}
+				const el = slot.element;
+				// Published drags own their touch stream even without secondary use
+				// (skill/action bindings and window handles must not become page pans).
+				// Every other control is "manipulation": a double tap on it (using an
+				// item, a double-click target) must not zoom the page and leave it
+				// stranded scrolled; pinch-zoom stays available (GH #1242).
+				const touchAction = control.rightActivate || control.draggable ? "none" : "manipulation";
+				if ( el.style.touchAction !== touchAction ) el.style.touchAction = touchAction;
+				if (
+					touchHold.press?.element === el &&
+					(control.disabled || touchHold.press.secondary && !control.rightActivate)
+				) {
+					cancelTouchHold();
+				}
+				if ( slot.order !== order ) {
+					slot.order = order;
+					el.style.zIndex = String( order );
+					hitLayoutChanged = true;
+				}
+				if ( el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ) {
+					const limit = control.maxLength ?? (control.kind === "password" ? 1024 : 256);
+					if ( el.maxLength !== limit ) el.maxLength = limit;
+				}
+				// Match authored edit hit bounds while retaining its text client insets.
+				if ( el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ) {
+					const align = control.textAlign ?? "center", insets = control.textInsets ?? [ 0, 0, 0, 0 ];
+					if ( el.style.textAlign !== align ) el.style.textAlign = align;
+					for (
+						const [key, n] of [ [ "paddingLeft", insets[0] ], [ "paddingTop", insets[1] ], [
+							"paddingRight",
+							insets[2]
+						], [ "paddingBottom", insets[3] ] ] as const
+					) {
+						const value = n * scale + "px";
+						if ( el.style[key] !== value ) el.style[key] = value;
+					}
+				}
+				if ( el instanceof HTMLInputElement && control.kind === "range" ) {
+					const min = String( control.min ?? 0 ), max = String( control.max ?? 0 );
+					if ( el.min !== min ) el.min = min;
+					if ( el.max !== max ) el.max = max;
+					if ( el.step !== "1" ) el.step = "1";
+				}
+				if ( el.getAttribute( "aria-label" ) !== control.label ) el.setAttribute( "aria-label", control.label );
+				if ( control.valueText !== undefined ) {
+					if ( el.getAttribute( "aria-valuetext" ) !== control.valueText ) {
+						el.setAttribute( "aria-valuetext", control.valueText );
+					}
+				} else if ( el.hasAttribute( "aria-valuetext" ) ) el.removeAttribute( "aria-valuetext" );
+				// A locked text edit is read-only, never disabled: the browser takes
+				// focus away from a disabled element and does not give it back, so a
+				// lock that lasted one network round trip left the edit unfocused.
+				const textEdit = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) &&
+					(control.kind === "text" || control.kind === "password");
+				if ( textEdit ) {
+					if ( el.readOnly !== !!control.disabled ) el.readOnly = !!control.disabled;
+					if ( el.disabled ) el.disabled = false;
+					if ( (el.getAttribute( "aria-disabled" ) === "true") !== !!control.disabled ) {
+						el.setAttribute( "aria-disabled", String( !!control.disabled ) );
+					}
+				} else if (
+					(el instanceof HTMLInputElement || el instanceof HTMLButtonElement) &&
+					el.disabled !== !!control.disabled
+				) el.disabled = !!control.disabled;
+				if ( control.kind === "button" ) {
+					if ( el.textContent !== control.label ) el.textContent = control.label;
+					if ( control.selected !== undefined ) {
+						const selected = String( control.selected );
+						if ( el.getAttribute( "aria-pressed" ) !== selected ) {
+							el.setAttribute( "aria-pressed", selected );
+						}
+					} else if ( el.hasAttribute( "aria-pressed" ) ) el.removeAttribute( "aria-pressed" );
+				} else if (
+					(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) &&
+					el.value !== control.value && !composing
+				) {
+					el.value = control.value ?? "";
+				}
+				// The transparent editor's glyph metrics and hit box use the same
+				// physical-to-CSS conversion as the visible bitmap UI.
+				const fontSize = INPUT_FONT_PIXELS * scale + "px";
+				if ( el.style.fontSize !== fontSize ) el.style.fontSize = fontSize;
+				if ( el instanceof HTMLTextAreaElement ) el.style.lineHeight = 16 * scale + "px";
+				const [x, y, w, h] = control.rect,
+					left = box.left + x * scale,
+					top = box.top + y * scale,
+					width = w * scale,
+					height = h * scale,
+					applied = slot.box;
+				if ( applied[0] !== left || applied[1] !== top || applied[2] !== width || applied[3] !== height ) {
+					applied[0] = left;
+					applied[1] = top;
+					applied[2] = width;
+					applied[3] = height;
+					el.style.left = left + "px";
+					el.style.top = top + "px";
+					el.style.width = width + "px";
+					el.style.height = height + "px";
+					hitLayoutChanged = true;
+				}
+				const hitPolygon = control.hitPolygon ?
+					"polygon(" + control.hitPolygon.map( ( [px, py] ) =>
+						((px - x) * scale) + "px " + ((py - y) * scale) + "px"
+					).join( "," ) + ")" :
+					"";
+				if ( slot.clipPath !== hitPolygon ) {
+					slot.clipPath = hitPolygon;
+					el.style.clipPath = hitPolygon;
+					hitLayoutChanged = true;
+				}
+				if ( !!slot.value.disabled !== !!control.disabled ) {
+					hitLayoutChanged = true;
+				}
+				slot.value = control;
+			}
+			// A held inspection ends when its control loses the flag, which moves no hit box.
+			if ( hitLayoutChanged || touchInspection.active ) syncHover();
+			const request = state.focusRequest;
+			if ( request && request.revision !== focusRevision ) {
+				if ( request.id === null ) {
+					focusRevision = request.revision;
+					const active = document.activeElement;
+					if ( active instanceof HTMLElement && root.contains( active ) ) active.blur();
+					canvas.focus( { preventScroll: true } );
+					return;
+				}
+				const slot = controls.get( request.id );
+				if (
+					slot && !slot.value.disabled &&
+					(slot.element instanceof HTMLInputElement || slot.element instanceof HTMLTextAreaElement)
+				) {
+					focusRevision = request.revision;
+					slot.element.focus( { preventScroll: true } );
+					slot.element.setSelectionRange( request.anchor ?? request.caret, request.caret );
+					edit( slot.element, request.id );
+				}
+			}
+		},
+		/*
+		================
+		saveCameraWaypoints
+
+		690C40 case 134 (/cwsave) writes the waypoint store to c:\cw.txt;
+		the browser form of the same absolute-path write is a download
+		named cw.txt (#1716). The click queues the download, so the
+		object URL is released on the next task.
+		================
+		*/
+		saveCameraWaypoints( text: string ) {
+			if ( lifetime.signal.aborted ) return;
+			const url = URL.createObjectURL( new Blob( [ text ], { type: "text/plain" } ) );
+			const link = document.createElement( "a" );
+			link.href = url;
+			link.download = "cw.txt";
+			link.click();
+			setTimeout( () => URL.revokeObjectURL( url ), 0 );
+		},
+		/*
+		================
+		pickCrestImage
+
+		The crest register's image source (owner's 2026-11-07 contract,
+		#2282): a hidden file input offers the native formats; the chosen
+		file's bytes resolve, a cancel resolves null. Nothing is read
+		server-side from these bytes - the server re-judges and
+		re-encodes them - so no client-side format check lives here.
+		================
+		*/
+		pickCrestImage(): Promise<Uint8Array | null> {
+			if ( lifetime.signal.aborted ) return Promise.resolve( null );
+			return new Promise( resolve => {
+				const input = document.createElement( "input" );
+				input.type = "file";
+				input.accept = ".bmp,.png,.jpg,.jpeg,image/bmp,image/png,image/jpeg";
+				// A detached input's click is ignored by some engines;
+				// attach it hidden so the picker actually opens, and drop
+				// it again the moment the pick settles either way.
+				input.style.display = "none";
+				document.body.appendChild( input );
+				let settled = false;
+				const settle = ( value: Uint8Array | null ) => {
+					if ( settled ) return;
+					settled = true;
+					input.remove();
+					resolve( value );
+				};
+				input.addEventListener( "change", () => {
+					const file = input.files?.[0];
+					if ( !file ) {
+						settle( null );
+						return;
+					}
+					void file.arrayBuffer().then(
+						buffer => settle( new Uint8Array( buffer ) ),
+						() => settle( null )
+					);
+				} );
+				input.addEventListener( "cancel", () => settle( null ) );
+				lifetime.signal.addEventListener( "abort", () => settle( null ), { once: true } );
+				input.click();
+			} );
+		},
+		/*
+		================
+		dispose
+
+		Abort delegated listeners before discarding controls and their state.
+		================
+		*/
+		dispose() {
+			if ( lifetime.signal.aborted ) return;
+			cancelTouchHold();
+			touchHold.pointers.clear();
+			touchHold.clicks.clear();
+			drag = null;
+			carry = null;
+			rightPressed = null;
+			composing = false;
+			imeEnter = null;
+			lifetime.abort();
+			root.remove();
+			dragShield.dispose();
+			controls.clear();
+		}
+	};
+}

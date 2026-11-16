@@ -1,0 +1,560 @@
+/*
+===========================================================================
+
+actor-snapshots.ts - the renderer's own copies of published character actors
+
+Producers may reuse and mutate their actor records after publishing them, so
+the renderer admits each frame into snapshots it owns: one row per gid,
+updated in place, holding the model references that drive residency. Every
+optional field is copied explicitly, so a field a producer drops is dropped
+here too instead of surviving from an older frame.
+
+A producer that freezes its actor promises more: neither it nor anything it
+references changes after publication (the character presentation's actors,
+actor-advance.ts). When a frozen actor follows a frozen one for the same gid
+and differs from it only in its clocks (time, layers, model animation),
+only the clocks are validated and copied: every other field is the same
+value the row already holds.
+
+===========================================================================
+*/
+import type { CharacterActor, CharacterLayer } from "@/engine/contracts/character";
+import type { Degradation } from "@/engine/contracts/network";
+import { CHARACTER_ACTORS } from "@/engine/foundation/animation/character-budget";
+type Mutable<T> = { -readonly [K in keyof T]: T[K]; };
+type Actor = Mutable<CharacterActor>;
+// The held-clock report queue's bound, the world owner's degradation
+// bound (entities.ts MAX_PENDING_DEGRADATIONS): an undrained owner
+// cannot grow it, and the session reporter caps codes per session.
+const MAX_HELD_TIME_REPORTS = 64;
+/*
+================
+copyVector
+
+Copy a three-vector into an owned target, allocating only when there is none.
+================
+*/
+function copyVector(
+	target: readonly [number, number, number] | undefined,
+	source: readonly [number, number, number] | undefined
+): readonly [number, number, number] | undefined {
+	if ( !source ) return undefined;
+	if ( !target ) return [ source[0], source[1], source[2] ];
+	const owned = target as [number, number, number];
+	owned[0] = source[0];
+	owned[1] = source[1];
+	owned[2] = source[2];
+	return target;
+}
+/*
+================
+createActorSnapshots
+
+Renderer-owned snapshots. Producers may reuse/mutate their records after admission.
+================
+*/
+export function createActorSnapshots( reuse = true ) {
+	const index = new Map<number, Actor>(), rows: Actor[] = [];
+	// The gids of the publication being read. A new set for each pass, never
+	// one cleared and refilled: V8 keeps a long-lived set's next table in
+	// the old generation, so every frame's table became garbage only a full
+	// collection frees (the largest single source of it in a crowded town).
+	let seen = new Set<number>();
+	// The source each row was last brought up to, by gid: a frozen one is
+	// what the row still holds (reuse is a test seam: false copies every
+	// actor in full).
+	const sources = new Map<number, CharacterActor>();
+	let copies = 0, clockCopies = 0;
+	// Snapshot admission owns model references. Pose/order updates cannot change
+	// residency; only first/last references advance its invalidation revision.
+	const modelReferences = new Map<string, number>();
+	let created = 0, modelRevision = 0;
+	// Clocks a publication asked this owner to hold (#2407): the pending
+	// first-substitution reports (takeDegradations), the fields already
+	// reported per gid, and the substitution count stats() exposes.
+	let degradations: Degradation[] = [], heldSubstitutions = 0;
+	const reportedHolds = new Map<number, Set<string>>();
+	/*
+	================
+	reference
+
+	Count one model reference up or down; first and last references bump
+	the revision.
+	================
+	*/
+	function reference( model: string, delta: number ) {
+		const count = (modelReferences.get( model ) ?? 0) + delta;
+		if ( count === 0 ) {
+			modelReferences.delete( model );
+			modelRevision++;
+		} else {
+			modelReferences.set( model, count );
+			if ( count === 1 && delta === 1 ) modelRevision++;
+		}
+	}
+	/*
+	================
+	validClock
+
+	Whether a published clock may reach pose evaluation: finite and not
+	negative. Pose evaluation and the particle graph reject both fatally,
+	and a session must not end on one stale publication (#2407).
+	================
+	*/
+	function validClock( value: number ) {
+		return Number.isFinite( value ) && value >= 0;
+	}
+	/*
+	================
+	validWeight
+
+	Whether a published layer weight may reach pose evaluation: the
+	0..1 range pose evaluation enforces.
+	================
+	*/
+	function validWeight( value: number ) {
+		return Number.isFinite( value ) && value >= 0 && value <= 1;
+	}
+	/*
+	================
+	noteHeldTime
+
+	Record one held clock. The count always advances (stats), the report
+	only on a gid's first substitution for that field, so one stale
+	producer cannot report per frame. The message names the actor and
+	the bad value, so the producer is findable from the report alone.
+	================
+	*/
+	function noteHeldTime( source: CharacterActor, key: string, field: string, bad: number, held: number ) {
+		heldSubstitutions++;
+		let reported = reportedHolds.get( source.gid );
+		if ( !reported ) {
+			reported = new Set();
+			reportedHolds.set( source.gid, reported );
+		}
+		if ( reported.has( key ) ) return;
+		reported.add( key );
+		if ( degradations.length >= MAX_HELD_TIME_REPORTS ) return;
+		degradations.push( {
+			code: "character-time-held",
+			message: `gid=${source.gid} model=${source.model} clip=${source.clip} ${field}=${
+				String( bad )
+			} held=${held}`
+		} );
+	}
+	/*
+	================
+	copyModelAnimation
+
+	The row's own copy of the source's model animation frame.
+	================
+	*/
+	function copyModelAnimation( target: Actor, source: CharacterActor ) {
+		target.modelAnimation = source.modelAnimation ?
+			{
+				...source.modelAnimation,
+				restarted: source.modelAnimation.restarted.map( s => ({ ...s }) ),
+				selected: source.modelAnimation.selected ? { ...source.modelAnimation.selected } : null,
+				dispatch: source.modelAnimation.dispatch.map( row => ({
+					selector: { ...row.selector },
+					ranges: row.ranges.map( range => [ range[0], range[1] ] as const )
+				}) )
+			} :
+			undefined;
+	}
+	/*
+	================
+	copyTime
+
+	An invalid clock holds the row's last valid value (#2407): the row is
+	the only clock poses, picking and particles ever read.
+	================
+	*/
+	function copyTime( target: Actor, source: CharacterActor ) {
+		if ( validClock( source.time ) ) target.time = source.time;
+		else noteHeldTime( source, "time", "time", source.time, target.time );
+	}
+	/*
+	================
+	copyLayers
+
+	The row's own layers, each slot updated in place; an invalid clock or
+	weight holds as copyTime does.
+	================
+	*/
+	function copyLayers( target: Actor, source: CharacterActor ) {
+		if ( source.layers ) {
+			const layers = (target.layers ?? []) as Mutable<CharacterLayer>[];
+			for ( let i = 0; i < source.layers.length; i++ ) {
+				const layer = source.layers[i]!;
+				const owned = layers[i];
+				if ( owned ) {
+					owned.clip = layer.clip;
+					if ( validClock( layer.time ) ) owned.time = layer.time;
+					else noteHeldTime( source, `layer${i}time`, `layers[${i}].time`, layer.time, owned.time );
+					owned.loop = layer.loop;
+					if ( validWeight( layer.weight ) ) owned.weight = layer.weight;
+					else noteHeldTime( source, `layer${i}weight`, `layers[${i}].weight`, layer.weight, owned.weight );
+					owned.lane = layer.lane;
+					owned.activation = layer.activation;
+					owned.rate = layer.rate;
+				} else {
+					// A slot first admitted with an invalid clock holds at
+					// rest (full weight), the values a layer starts from.
+					const fresh = { ...layer };
+					if ( !validClock( fresh.time ) ) {
+						noteHeldTime( source, `layer${i}time`, `layers[${i}].time`, fresh.time, 0 );
+						fresh.time = 0;
+					}
+					if ( !validWeight( fresh.weight ) ) {
+						noteHeldTime( source, `layer${i}weight`, `layers[${i}].weight`, fresh.weight, 1 );
+						fresh.weight = 1;
+					}
+					layers[i] = fresh;
+				}
+			}
+			layers.length = source.layers.length;
+			target.layers = layers;
+		} else target.layers = undefined;
+	}
+	/*
+	================
+	clocksOnly
+
+	Whether a frozen source differs from the frozen one its row was last
+	brought up to only in what copyModelAnimation, copyTime and copyLayers
+	copy: every other field copy reads is the same value or the same
+	(frozen, never changed) object.
+	================
+	*/
+	function clocksOnly( source: CharacterActor, previous: CharacterActor | undefined ) {
+		return previous !== undefined && Object.isFrozen( source ) && Object.isFrozen( previous ) &&
+			source.animationLod === previous.animationLod && source.deferredParticle === previous.deferredParticle &&
+			source.holderVisible === previous.holderVisible && source.modifierId === previous.modifierId &&
+			source.groundItem === previous.groundItem && source.dungeonBlock === previous.dungeonBlock &&
+			source.previewClip === previous.previewClip && source.gid === previous.gid &&
+			source.model === previous.model && source.clip === previous.clip && source.loop === previous.loop &&
+			source.scale === previous.scale && source.shadowSize === previous.shadowSize &&
+			source.shadowAttachment === previous.shadowAttachment && source.blindable === previous.blindable &&
+			source.blindableCompanion === previous.blindableCompanion &&
+			source.drawGeometry === previous.drawGeometry && source.height === previous.height &&
+			source.pickable === previous.pickable && source.pickWhenFiltered === previous.pickWhenFiltered &&
+			source.pickOwner === previous.pickOwner && source.bodyVolume === previous.bodyVolume &&
+			source.opacity === previous.opacity && source.effectEntity === previous.effectEntity &&
+			source.mountedOn === previous.mountedOn && source.emissionEnd === previous.emissionEnd &&
+			source.pose === previous.pose && source.attachment === previous.attachment &&
+			source.effectBasis === previous.effectBasis && source.effectRotation === previous.effectRotation &&
+			source.pointLight === previous.pointLight && source.bloodEffects === previous.bloodEffects &&
+			source.materialTint === previous.materialTint && source.heightFactor === previous.heightFactor &&
+			source.effectBaseScale === previous.effectBaseScale &&
+			source.absoluteEffectScale === previous.absoluteEffectScale &&
+			source.effectAnchor === previous.effectAnchor;
+	}
+	/*
+	================
+	copy
+
+	Bring one owned snapshot up to its source actor, reusing nested storage.
+	================
+	*/
+	function copy( target: Actor, source: CharacterActor ) {
+		copyModelAnimation( target, source );
+		target.animationLod = source.animationLod ? { ...source.animationLod } : undefined;
+		target.deferredParticle = source.deferredParticle ? { ...source.deferredParticle } : undefined;
+		target.holderVisible = source.holderVisible;
+		target.modifierId = source.modifierId;
+		target.groundItem = source.groundItem;
+		target.dungeonBlock = source.dungeonBlock;
+		target.previewClip = source.previewClip;
+		target.gid = source.gid;
+		target.model = source.model;
+		target.clip = source.clip;
+		copyTime( target, source );
+		target.loop = source.loop;
+		target.scale = source.scale;
+		target.shadowSize = source.shadowSize;
+		target.shadowAttachment = source.shadowAttachment;
+		target.blindable = source.blindable;
+		target.blindableCompanion = source.blindableCompanion;
+		target.drawGeometry = source.drawGeometry;
+		target.height = source.height;
+		target.pickable = source.pickable;
+		target.pickWhenFiltered = source.pickWhenFiltered;
+		target.pickOwner = source.pickOwner;
+		target.bodyVolume = source.bodyVolume ? { ...source.bodyVolume } : undefined;
+		target.opacity = source.opacity;
+		target.effectEntity = source.effectEntity;
+		target.mountedOn = source.mountedOn;
+		target.emissionEnd = source.emissionEnd;
+		const pose = target.pose as Mutable<CharacterActor["pose"]>;
+		pose.regionId = source.pose.regionId;
+		pose.x = source.pose.x;
+		pose.y = source.pose.y;
+		pose.z = source.pose.z;
+		pose.yaw = source.pose.yaw;
+		copyLayers( target, source );
+		if ( source.attachment ) {
+			const old = target.attachment,
+				rotation = source.attachment.rotation ? (old?.rotation ?? new Float32Array( 16 )) : undefined,
+				offset = old?.offset as [number, number, number] | undefined;
+			if ( rotation ) rotation.set( source.attachment.rotation! );
+			if ( old && offset ) {
+				for ( let i = 0; i < 3; i++ ) offset[i] = source.attachment.offset[i]!;
+				const owned = old as Mutable<NonNullable<CharacterActor["attachment"]>>;
+				owned.gid = source.attachment.gid;
+				owned.bone = source.attachment.bone;
+				owned.basis = source.attachment.basis;
+				owned.modelScale = source.attachment.modelScale;
+				owned.root = source.attachment.root;
+				owned.rootIfMissing = source.attachment.rootIfMissing;
+				owned.keepRotation = source.attachment.keepRotation;
+				owned.ground = source.attachment.ground;
+				owned.facing = source.attachment.facing;
+				owned.rotation = rotation;
+			} else target.attachment = { ...source.attachment, rotation, offset: [ ...source.attachment.offset ] };
+		} else target.attachment = undefined;
+		if ( source.effectBasis ) {
+			if ( target.effectBasis ) {
+				const basis = target.effectBasis as Mutable<NonNullable<CharacterActor["effectBasis"]>>;
+				for ( let i = 0; i < 9; i++ ) basis[i] = source.effectBasis[i]!;
+			} else target.effectBasis = [ ...source.effectBasis ];
+		} else target.effectBasis = undefined;
+		if ( source.effectRotation ) {
+			if ( target.effectRotation ) Object.assign( target.effectRotation, source.effectRotation );
+			else target.effectRotation = { ...source.effectRotation };
+		} else target.effectRotation = undefined;
+		if ( source.pointLight ) {
+			const value = source.pointLight,
+				old = target.pointLight as Mutable<NonNullable<CharacterActor["pointLight"]>> | undefined;
+			if ( old ) {
+				Object.assign( old.pose, value.pose );
+				copyVector( old.ambient, value.ambient );
+				copyVector( old.diffuse, value.diffuse );
+				old.attenuation = value.attenuation;
+				old.attenuationConstant = value.attenuationConstant;
+				old.range = value.range;
+			} else {
+				target.pointLight = {
+					...value,
+					pose: { ...value.pose },
+					ambient: [ ...value.ambient ],
+					diffuse: [ ...value.diffuse ]
+				};
+			}
+		} else target.pointLight = undefined;
+		if ( source.bloodEffects ) {
+			if ( target.bloodEffects ) {
+				const blood = target.bloodEffects as [string | null, string | null];
+				blood[0] = source.bloodEffects[0];
+				blood[1] = source.bloodEffects[1];
+			} else target.bloodEffects = [ ...source.bloodEffects ];
+		} else target.bloodEffects = undefined;
+		target.materialTint = copyVector( target.materialTint, source.materialTint );
+		target.heightFactor = source.heightFactor;
+		target.effectBaseScale = source.effectBaseScale;
+		target.absoluteEffectScale = source.absoluteEffectScale;
+		if ( source.effectAnchor ) {
+			const old = target.effectAnchor as Mutable<NonNullable<CharacterActor["effectAnchor"]>> | undefined;
+			if ( old ) {
+				old.bone = source.effectAnchor.bone;
+				copyVector( old.offset, source.effectAnchor.offset );
+			} else target.effectAnchor = { ...source.effectAnchor, offset: [ ...source.effectAnchor.offset ] };
+		} else target.effectAnchor = undefined;
+		// A spine aim (spine-aims.ts) arms, turns and releases long after the
+		// row's first publication; poseFor reads only this copy.
+		if ( source.boneRotation ) {
+			const value = source.boneRotation.rotation,
+				old = target.boneRotation as Mutable<NonNullable<CharacterActor["boneRotation"]>> | undefined;
+			if ( old ) {
+				const rotation = old.rotation as [number, number, number, number];
+				old.bone = source.boneRotation.bone;
+				for ( let i = 0; i < 4; i++ ) rotation[i] = value[i]!;
+			} else {
+				target.boneRotation = {
+					bone: source.boneRotation.bone,
+					rotation: [ value[0], value[1], value[2], value[3] ]
+				};
+			}
+		} else target.boneRotation = undefined;
+	}
+	/*
+	================
+	finitePointLight
+
+	The same finiteness test as spreading every value into one array, without
+	building that array for each lit actor on every publication.
+	================
+	*/
+	function finitePointLight( light: NonNullable<CharacterActor["pointLight"]> ) {
+		if ( !Number.isFinite( light.attenuation ) || !Number.isFinite( light.range ) ) return false;
+		if ( light.attenuationConstant !== undefined && !Number.isFinite( light.attenuationConstant ) ) {
+			return false;
+		}
+		for ( const value of light.ambient ) if ( !Number.isFinite( value ) ) return false;
+		for ( const value of light.diffuse ) if ( !Number.isFinite( value ) ) return false;
+		// Own properties only, as Object.values read them.
+		for ( const key in light.pose ) {
+			if ( !Object.hasOwn( light.pose, key ) ) continue;
+			if ( !Number.isFinite( light.pose[key as keyof typeof light.pose] ) ) return false;
+		}
+		return true;
+	}
+	return {
+		index,
+		/*
+		================
+		update
+
+		Validate a whole publication, then admit it in order up to the budget.
+		================
+		*/
+		update( value: readonly CharacterActor[] ) {
+			seen = new Set();
+			// Validate the entire publication before changing any admitted snapshot.
+			// Which actors differ from their row's frozen source only in
+			// their clocks: the fields they share were validated with it.
+			const clocks: boolean[] = [];
+			for ( const actor of value ) clocks.push( reuse && clocksOnly( actor, sources.get( actor.gid ) ) );
+			for ( let i = 0; i < value.length; i++ ) {
+				const actor = value[i]!;
+				if ( clocks[i] ) continue;
+				if (
+					actor.deferredParticle &&
+					(!Number.isInteger( actor.deferredParticle.offset ) || actor.deferredParticle.offset < 0 ||
+						actor.deferredParticle.offset > 255 ||
+						actor.deferredParticle.nightOnly !== undefined &&
+							typeof actor.deferredParticle.nightOnly !== "boolean" ||
+						actor.deferredParticle.lodHidden !== undefined &&
+							typeof actor.deferredParticle.lodHidden !== "boolean")
+				) throw Error( "Invalid deferred particle descriptor" );
+			}
+			for ( let i = 0; i < value.length; i++ ) {
+				const actor = value[i]!;
+				if ( clocks[i] ) {
+					if ( seen.has( actor.gid ) ) throw Error( "Character identity violation" );
+					seen.add( actor.gid );
+					continue;
+				}
+				if (
+					actor.animationLod &&
+					(!Number.isFinite( actor.animationLod.fraction ) || actor.animationLod.fraction < 0 ||
+						actor.animationLod.fraction > 1 || typeof actor.animationLod.crowded !== "boolean")
+				) throw Error( "Invalid animation LOD" );
+				if ( actor.modifierId !== undefined && !Number.isSafeInteger( actor.modifierId ) ) {
+					throw Error( "Invalid modifier owner" );
+				}
+				const rotation = actor.attachment?.rotation;
+				if (
+					rotation &&
+					(!(rotation instanceof Float32Array) || rotation.length !== 16 ||
+						!rotation.every( Number.isFinite ))
+				) throw Error( "Invalid particle attachment rotation" );
+				if ( actor.pointLight && !finitePointLight( actor.pointLight ) ) {
+					throw Error( "Invalid character point light" );
+				}
+				if (
+					actor.materialTint &&
+					(actor.materialTint.length !== 3 ||
+						actor.materialTint.some( v => !Number.isFinite( v ) || v < 0 || v > 1 ))
+				) throw Error( "Invalid character material tint" );
+				if (
+					actor.emissionEnd !== undefined && (!Number.isFinite( actor.emissionEnd ) || actor.emissionEnd < 0)
+				) throw Error( "Invalid effect emission end" );
+				if (
+					actor.bodyVolume &&
+					(!Number.isFinite( actor.bodyVolume.index ) || actor.bodyVolume.index < 0 ||
+						actor.bodyVolume.index > 4 || typeof actor.bodyVolume.female !== "boolean")
+				) throw Error( "Invalid character volume" );
+				if (
+					actor.opacity !== undefined &&
+					(!Number.isFinite( actor.opacity ) || actor.opacity < 0 || actor.opacity > 1)
+				) throw Error( "Invalid character opacity" );
+				if ( seen.has( actor.gid ) ) throw Error( "Character identity violation" );
+				seen.add( actor.gid );
+			}
+			const count = Math.min( value.length, CHARACTER_ACTORS );
+			seen = new Set();
+			for ( let i = 0; i < count; i++ ) {
+				const source = value[i]!;
+				let row = index.get( source.gid );
+				if ( !row ) {
+					row = {
+						...source,
+						pose: { ...source.pose },
+						layers: undefined,
+						attachment: undefined,
+						effectBasis: undefined,
+						effectRotation: undefined,
+						pointLight: undefined,
+						bloodEffects: undefined,
+						materialTint: undefined,
+						effectAnchor: undefined,
+						boneRotation: undefined
+					};
+					// A first clock that is already invalid holds at rest:
+					// copy keeps the row's value, so it must start valid.
+					if ( !validClock( row.time ) ) row.time = 0;
+					index.set( source.gid, row );
+					created++;
+					reference( source.model, 1 );
+				} else if ( row.model !== source.model ) {
+					reference( row.model, -1 );
+					reference( source.model, 1 );
+				}
+				if ( clocks[i] ) {
+					copyModelAnimation( row, source );
+					copyTime( row, source );
+					copyLayers( row, source );
+					clockCopies++;
+				} else {
+					copy( row, source );
+					copies++;
+				}
+				sources.set( source.gid, source );
+				rows[i] = row;
+				seen.add( source.gid );
+			}
+			rows.length = count;
+			for ( const gid of index.keys() ) {
+				if ( !seen.has( gid ) ) {
+					reference( index.get( gid )!.model, -1 );
+					index.delete( gid );
+					sources.delete( gid );
+					reportedHolds.delete( gid );
+				}
+			}
+			return rows;
+		},
+		modelRevision: () => modelRevision,
+		// copies: actors copied in full; clockCopies: only their clocks.
+		stats: () => ({ created, heldTimes: heldSubstitutions, copies, clockCopies }),
+		/*
+		================
+		takeDegradations
+
+		The held-clock reports since the last take (contracts/network
+		Degradation), drained by the renderer owner's reporter in the
+		shape the world and asset owners hand theirs over.
+		================
+		*/
+		takeDegradations(): Degradation[] {
+			const taken = degradations;
+			degradations = [];
+			return taken;
+		},
+		/*
+		================
+		reset
+		================
+		*/
+		reset() {
+			modelReferences.clear();
+			modelRevision++;
+			index.clear();
+			sources.clear();
+			seen.clear();
+			reportedHolds.clear();
+			rows.length = 0;
+		}
+	};
+}

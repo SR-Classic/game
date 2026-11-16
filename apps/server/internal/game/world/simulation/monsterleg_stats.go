@@ -1,0 +1,475 @@
+/*
+===========================================================================
+
+monsterleg_stats.go - slow-leg attribution for the monster leg (#1820 C)
+
+Metrics only: no behaviour reads these numbers. RunMonsterLeg fills one
+record per leg (phase walls - the batch phase split into its queue-build
+wall, the action lane's wall outside the step, and the step wall itself -
+woken/resumed counts, route plans, memo hits, wander clips, the movement
+layer's cold-cache delta and the GC pause/assist delta) and, when the leg
+reaches SlowHookThreshold, emits
+one structured line through the package log. The next optimization step
+(the dense lookup index, a shared navigation field, memoizing the
+return path) is chosen from which phase dominates those lines.
+
+GC is sampled once per leg at its start and end, never per actor.
+
+===========================================================================
+*/
+
+package simulation
+
+import (
+	"fmt"
+	"math"
+	"runtime/metrics"
+	"strings"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+	"opensro.online/server/internal/game/world/monster"
+)
+
+// The runtime metric names sampled around each leg.
+const (
+	gcPausesMetric = "/gc/pauses:seconds"
+	gcAssistMetric = "/cpu/classes/gc/mark/assist:cpu-seconds"
+)
+
+/*
+================
+gcSample
+
+Cumulative GC pause and mark-assist CPU since boot, in seconds. The
+pause total is the midpoint estimate over the runtime histogram (the
+top bucket prices at its lower edge), so it attributes a leg, it does
+not audit the collector.
+================
+*/
+type gcSample struct {
+	pause, assist float64
+}
+
+/*
+================
+readGCSample
+================
+*/
+func readGCSample() gcSample {
+	samples := []metrics.Sample{{Name: gcPausesMetric}, {Name: gcAssistMetric}}
+	metrics.Read(samples)
+	var out gcSample
+	if samples[0].Value.Kind() == metrics.KindFloat64Histogram {
+		h := samples[0].Value.Float64Histogram()
+		for i, count := range h.Counts {
+			if count == 0 {
+				continue
+			}
+			mid := h.Buckets[i]
+			if hi := h.Buckets[i+1]; !math.IsInf(hi, 1) {
+				mid = (mid + hi) / 2
+			}
+			out.pause += float64(count) * mid
+		}
+	}
+	if samples[1].Value.Kind() == metrics.KindFloat64 {
+		out.assist = samples[1].Value.Float64()
+	}
+	return out
+}
+
+/*
+================
+legStats
+
+One RunMonsterLeg's attribution. advance is nested inside batch (both
+advance paths accumulate into it). Written only by the shard goroutine
+running the leg, through the ops copy it owns.
+================
+*/
+type legStats struct {
+	total                time.Duration
+	dormancy, visibility time.Duration
+	batch, advance       time.Duration
+	// queue is the batch phase's queue-build wall (behaviorBatchesForDivision:
+	// due pops, reschedules, batch sort); lane is the RunAction wall outside
+	// the step (per-actor division-lock entry plus the in-lock actor
+	// resolution). batch - advance - queue - lane is the unmeasured residue
+	// (player-pose building, liveness probes) the next timer round splits
+	// if a slow leg ever hides there.
+	queue, lane    time.Duration
+	actors         int
+	woken, resumed int
+	// The rest census (#3027 stage 1): steps counts
+	// advanceInstanceStep invocations; restGuards partitions the
+	// rest verdicts by failing guard; restSettled counts the
+	// cadence candidates whose step emitted and committed nothing
+	// (the settled lane's population), restSettledDrained the
+	// share whose step drained tactics events on the way;
+	// cadenceArms the gate's cadence-only commits and
+	// gateSuspended its suspensions. Metrics only, like the rest
+	// of this record: no behaviour reads these numbers.
+	steps, restSettled, restSettledDrained, cadenceArms, gateSuspended int
+	restGuards                                                         [restGuardCount]int
+	plans                                                              [navCallerCount][navOutcomeCount]int
+	planProbes                                                         [navCallerCount]int
+	planTime                                                           [navCallerCount]time.Duration
+	memo                                                               [navCallerCount]int
+	clips                                                              [navCallerCount]int
+	maxPlanTime                                                        time.Duration
+	maxPlanProbes                                                      int
+	gcPause, gcAssist                                                  time.Duration
+	navMisses                                                          uint64
+	gcStart                                                            gcSample
+	navStart                                                           uint64
+
+	// rechecked counts the due suspended actors the pending re-check
+	// lane settled without a step (monsterpending_recheck.go): they
+	// are in neither actors nor steps.
+	rechecked int
+
+	// modeSteps partitions steps by the mover mode the step read
+	// (#3119), so a capture can say how many wandering monsters are
+	// stepped every tick. It sums to steps: every invocation counts
+	// exactly one bucket, the presentation holds that read no
+	// behaviour mode (a corpse, a motion hold) under other.
+	modeSteps [stepModeCount]int
+}
+
+// stepMode is the census bucket of a mover mode (monster.MoverMode).
+type stepMode uint8
+
+const (
+	stepModeIdle stepMode = iota
+	stepModeWandering
+	stepModeChasing
+	stepModeAttacking
+	stepModeReturning
+	stepModePending
+	stepModeOther
+
+	stepModeCount
+)
+
+// stepModeNames names each bucket for the monster_leg metrics block.
+var stepModeNames = [stepModeCount]string{
+	stepModeIdle:      "idle",
+	stepModeWandering: "wandering",
+	stepModeChasing:   "chasing",
+	stepModeAttacking: "attacking",
+	stepModeReturning: "returning",
+	stepModePending:   "pending",
+	stepModeOther:     "other",
+}
+
+/*
+================
+stepModeFor
+
+The census bucket of the mode a step read. Modes with no bucket of
+their own (spawning, recovering, following) count as other.
+================
+*/
+func stepModeFor(mode monster.MoverMode) stepMode {
+	switch mode {
+	case monster.MoverIdle:
+		return stepModeIdle
+	case monster.MoverWandering:
+		return stepModeWandering
+	case monster.MoverChasing:
+		return stepModeChasing
+	case monster.MoverAttacking:
+		return stepModeAttacking
+	case monster.MoverReturning:
+		return stepModeReturning
+	case monster.MoverPending:
+		return stepModePending
+	}
+	return stepModeOther
+}
+
+/*
+================
+legStats.notePlan
+
+One PlanRoute call: its caller, outcome, probe count and wall time.
+================
+*/
+func (s *legStats) notePlan(caller navCaller, route *monster.NavigationRoute, elapsed time.Duration) {
+	if s == nil {
+		return
+	}
+	outcome, probes := navOutcomeProbes(route)
+	s.plans[caller][outcome]++
+	s.planProbes[caller] += probes
+	s.planTime[caller] += elapsed
+	if elapsed > s.maxPlanTime {
+		s.maxPlanTime = elapsed
+	}
+	if probes > s.maxPlanProbes {
+		s.maxPlanProbes = probes
+	}
+}
+
+/*
+================
+legStats.noteMemo
+
+One failed-route memo hit (part B): a retry answered without a search.
+================
+*/
+func (s *legStats) noteMemo(caller navCaller) {
+	if s != nil {
+		s.memo[caller]++
+	}
+}
+
+/*
+================
+legStats.noteClip
+
+One planPath call (wander and sight probes included).
+================
+*/
+func (s *legStats) noteClip(caller navCaller) {
+	if s != nil {
+		s.clips[caller]++
+	}
+}
+
+/*
+================
+legStats.noteAdvance
+
+advanceAndPublish time, cumulative across the direct dispatch and the
+RunAction closure path.
+================
+*/
+func (s *legStats) noteAdvance(elapsed time.Duration) {
+	if s != nil {
+		s.advance += elapsed
+	}
+}
+
+/*
+================
+legStats.noteStep
+
+One advanceInstanceStep invocation, serial or pooled-plan: the
+denominator every per-step census below divides by, counted under
+the bucket of the mode the step read (stepModeOther when it read
+none - a presentation hold that returned before the mover).
+================
+*/
+func (s *legStats) noteStep(mode stepMode) {
+	if s != nil {
+		s.steps++
+		s.modeSteps[mode]++
+	}
+}
+
+/*
+================
+legStats.noteRestGuard
+
+One rest verdict, counted under its failing guard (restGuardPass
+included), so a leg's resting steps partition by what refused
+them (#3027 stage 1).
+================
+*/
+func (s *legStats) noteRestGuard(guard restGuard) {
+	if s != nil {
+		s.restGuards[guard]++
+	}
+}
+
+/*
+================
+legStats.noteRestSettled
+
+One settled candidate: a cadence-due rest step that emitted
+nothing and committed nothing - the settled lane's population,
+with the share whose step drained tactics events counted apart
+(drained) for the lane's drain-and-carry ruling.
+================
+*/
+func (s *legStats) noteRestSettled(drained bool) {
+	if s == nil {
+		return
+	}
+	s.restSettled++
+	if drained {
+		s.restSettledDrained++
+	}
+}
+
+/*
+================
+legStats.noteRechecked
+
+One due suspended actor the pending re-check lane settled: its
+cadence stamped and its due re-armed with no step run.
+================
+*/
+func (s *legStats) noteRechecked() {
+	if s != nil {
+		s.rechecked++
+	}
+}
+
+/*
+================
+legStats.noteCadenceArm
+
+One activity-gate cadence-only commit (or a plan's record of
+one): the gate's re-check stamp, the only row write a due
+re-check makes.
+================
+*/
+func (s *legStats) noteCadenceArm(armed bool) {
+	if armed && s != nil {
+		s.cadenceArms++
+	}
+}
+
+/*
+================
+legStats.noteGateSuspended
+
+One activity-gate suspension: a wandering actor the gate parked
+to pending for want of census cover.
+================
+*/
+func (s *legStats) noteGateSuspended() {
+	if s != nil {
+		s.gateSuspended++
+	}
+}
+
+/*
+================
+legStats.finish
+
+Closes the record with the leg's closing samples: the cold-cache delta
+and the GC pause/assist spent inside the leg.
+================
+*/
+func (s *legStats) finish(navMissesEnd uint64, end gcSample) {
+	s.navMisses = navMissesEnd - s.navStart
+	s.gcPause = time.Duration((end.pause - s.gcStart.pause) * float64(time.Second))
+	s.gcAssist = time.Duration((end.assist - s.gcStart.assist) * float64(time.Second))
+}
+
+/*
+================
+legStats.logSlow
+
+The one structured line for a leg at SlowHookThreshold or beyond. Every
+value is this leg's own count or wall time.
+================
+*/
+func (s *legStats) logSlow(divisionID string) {
+	var plans, outcomes, clips, rest strings.Builder
+	for guard := restGuardPass; guard < restGuardCount; guard++ {
+		if s.restGuards[guard] > 0 {
+			fmt.Fprintf(&rest, "%s:%d ", restGuardNames[guard], s.restGuards[guard])
+		}
+	}
+	for c := range navCallerCount {
+		calls, probes := 0, s.planProbes[c]
+		for o := range navOutcomeCount {
+			calls += s.plans[c][o]
+			if s.plans[c][o] > 0 {
+				fmt.Fprintf(&outcomes, "%s.%s:%d ", navCallerNames[c], navOutcomeNames[o], s.plans[c][o])
+			}
+		}
+		if calls > 0 {
+			fmt.Fprintf(&plans, "%s:%d/%dprobes/%v/memo%d ", navCallerNames[c], calls, probes,
+				s.planTime[c].Round(time.Microsecond), s.memo[c])
+		}
+		if s.clips[c] > 0 {
+			fmt.Fprintf(&clips, "%s:%d ", navCallerNames[c], s.clips[c])
+		}
+	}
+	log.Warnf("simulation: slow monster leg division=%s total=%v dormancy=%v visibility=%v batch=%v advance=%v "+
+		"actors=%d woken=%d resumed=%d plans{%s} outcomes{%s} maxplan=%v/%dprobes clips{%s} navmiss=+%d gcpause=%v gcassist=%v "+
+		"queue=%v lane=%v steps=%d rest{%s} settled=%d drained=%d cadarms=%d suspended=%d rechecked=%d",
+		divisionID, s.total.Round(time.Microsecond), s.dormancy.Round(time.Microsecond), s.visibility.Round(time.Microsecond),
+		s.batch.Round(time.Microsecond), s.advance.Round(time.Microsecond), s.actors, s.woken, s.resumed,
+		strings.TrimSpace(plans.String()), strings.TrimSpace(outcomes.String()),
+		s.maxPlanTime.Round(time.Microsecond), s.maxPlanProbes, strings.TrimSpace(clips.String()),
+		s.navMisses, s.gcPause.Round(time.Microsecond), s.gcAssist.Round(time.Microsecond),
+		s.queue.Round(time.Microsecond), s.lane.Round(time.Microsecond), s.steps,
+		strings.TrimSpace(rest.String()), s.restSettled, s.restSettledDrained, s.cadenceArms, s.gateSuspended, s.rechecked)
+}
+
+/*
+================
+MonsterMoverOps.planRouteTimed
+
+PlanRoute with the leg's attribution when a leg is running (part C);
+outside a leg it is the plain call, so fixtures cost nothing.
+================
+*/
+func (ops *MonsterMoverOps) planRouteTimed(caller navCaller, from monster.Pose, fromOwner NavOwner, goal monster.Pose) *monster.NavigationRoute {
+	if ops.leg == nil {
+		return ops.PlanRoute(from, fromOwner, goal)
+	}
+	started := time.Now()
+	route := ops.PlanRoute(from, fromOwner, goal)
+	ops.leg.notePlan(caller, route, time.Since(started))
+	return route
+}
+
+/*
+================
+MonsterMoverOps.noteWoken
+
+Folds one prepareDormancy pass's woken sets into the leg record and
+into the pending-resume set the actor loop drains (resumed counts).
+================
+*/
+func (ops *MonsterMoverOps) noteWoken(stats *legStats, sets map[populationKey]map[uint32]struct{}) {
+	for key, set := range sets {
+		stats.woken += len(set)
+		if len(set) == 0 {
+			continue
+		}
+		if ops.resumePending == nil {
+			ops.resumePending = make(map[populationKey]map[uint32]struct{})
+		}
+		pending := ops.resumePending[key]
+		if pending == nil {
+			pending = make(map[uint32]struct{}, len(set))
+			ops.resumePending[key] = pending
+		}
+		for gid := range set {
+			pending[gid] = struct{}{}
+		}
+	}
+}
+
+/*
+================
+MonsterMoverOps.noteResumed
+
+True (once) when a mover woken from dormancy reaches its first
+dispatch. An actor removed before dispatching keeps its entry; it is
+bounded by the woken cohort and drops on the actor's next appearance.
+================
+*/
+func (ops *MonsterMoverOps) noteResumed(key populationKey, gid uint32) bool {
+	set := ops.resumePending[key]
+	if set == nil {
+		return false
+	}
+	if _, ok := set[gid]; !ok {
+		return false
+	}
+	delete(set, gid)
+	if len(set) == 0 {
+		delete(ops.resumePending, key)
+	}
+	return true
+}

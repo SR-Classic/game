@@ -1,0 +1,171 @@
+/*
+===========================================================================
+
+cosdeath.go - what a companion's death leaves behind, by kind
+
+Every character death runs the kill credit, which drops a COS's
+transport cargo: a transport's goods go offline and publish unowned, the
+way a monster's drops do. Publishing a drop normally resets its ground
+owner to the winner, but trade goods are exempt from that reset - and
+every transport row is a trade good - so cargo stays unowned whoever
+killed the transport. The fatal dealer is still recorded on the
+settlement, for the scatter's log line only. The one exception is the
+credit itself: a fatal dealer on an opposing free-battle team earns no
+credit, and the cargo stays with the record (dropTransportCargo).
+A periodic (damage-over-time) kill credits its source the same way a
+strike does, so the gate reads the burn dealer's relation too.
+The COS death then releases a vehicle
+with kind 1, deleting its record, as the Clean command does; pets
+keep theirs on the summoner item for revival (cosabnormal.go). A
+captured quest monster is gone with its death, and
+its quest hears it.
+
+===========================================================================
+*/
+package action
+
+import (
+	"time"
+
+	log "github.com/sirupsen/logrus"
+
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/grounditem"
+	"opensro.online/server/internal/game/item/wire"
+)
+
+/*
+================
+settleCompanionDeath
+
+Called inside the owner's character door when a companion first dies.
+================
+*/
+func (rt *Runtime) settleCompanionDeath(o *cosAbnormalOwner) {
+	// Every COS death tells its owner first.
+	o.private = append(o.private, cosRemovalNotice(o.pet.GID))
+	ref := o.ref
+	if ref == nil {
+		found := false
+		if ref, found = rt.cosReference(o.pet); !found {
+			return
+		}
+	}
+	switch band := ref.TidWord >> 11; band {
+	case cosBandRiding, cosBandTransport:
+		if o.c.ActiveCOS != o.pet {
+			return
+		}
+		if band == cosBandTransport && o.pet.Container != nil {
+			rt.dropTransportCargo(o)
+		}
+		o.c.ActiveCOS = nil
+	case domain.MercenaryBand:
+		o.c.RemoveMercenary(o.pet.GID)
+	case domain.CapturedCOSBand:
+		if o.c.CapturedCOS != o.pet {
+			return
+		}
+		o.c.CapturedCOS = nil
+		if rt.CapturedFollowerDied != nil {
+			o.private = append(o.private, rt.CapturedFollowerDied(o.c)...)
+		}
+	}
+}
+
+/*
+================
+dropTransportCargo
+
+Natively the cargo scatters around the dead transport, owned by no
+one: the winner reset that publishing applies to drops never reaches
+a trade good (see the file banner).
+
+One kill earns no credit at all, cargo included: when the fatal
+dealer's side stands in the kill relation's team case against the
+owner - both in a free-battle group, the groups opposing each other
+or either the everyone-opposes group - the native credit is skipped
+and the goods go with the vehicle's record, the way the kill's own
+booking already answers (pkrelation.go's team kill). A monster
+dealer, a suited job opponent and a team-mate's kill all run the
+credit, so their transports drop.
+================
+*/
+func (rt *Runtime) dropTransportCargo(o *cosAbnormalOwner) {
+	_, ownerCape := rt.playerRelationEquipment(o.c)
+	if o.winnerCape != 0 && ownerCape != 0 &&
+		(o.winnerCape != ownerCape || o.winnerCape == freeBattleAllOpponents) {
+		log.WithFields(log.Fields{
+			"cause": "death", "owner": o.c.Name, "winner": o.winnerName,
+		}).Info("trade: transport cargo kept with the record (fatal dealer on an opposing free-battle team)")
+		return
+	}
+	loss := cargoLoss{cause: "death", winnerName: o.winnerName, lostTo: o.winnerAccount}
+	o.public = append(o.public, rt.scatterTransportCargo(o.division, o.c, o.pet, o.now, loss)...)
+}
+
+/*
+================
+cargoLoss
+
+Why a transport's cargo scatters: cause names the case on the log line
+("death", "rider-death", "disconnect"); winnerName is the fatal dealer
+for that line only; lostTo is the dealer's account, stamped on every
+bag (grounditem.Item.LostTo) so job honor can tell a real loss apart.
+Both are "" when no player dealt the death.
+================
+*/
+type cargoLoss struct {
+	cause      string
+	winnerName string
+	lostTo     string
+}
+
+/*
+================
+scatterTransportCargo
+
+The native cargo drop, shared with the port-only trader rule (tradercargodrop.go):
+every row of pet's container lands unowned around the transport, and
+the container empties. winnerName names the fatal dealer for the log
+line only ("" when no hit dealt the death); a bag is never reserved to
+it, as native never reserves trade goods. A row the ground owner
+refuses stays lost with the vehicle - the scatter log line below is
+the only trace it leaves. The caller holds c's door; returns the
+drops' public frames.
+================
+*/
+func (rt *Runtime) scatterTransportCargo(division string, c *enterworld.Character, pet *enterworld.CharacterCOS, nowMs int64, loss cargoLoss) []wire.Frame {
+	at := rt.companionLiveSpawn(division, c, pet, nowMs)
+	now := time.UnixMilli(nowMs)
+	var dropped []grounditem.Item
+	rows := invItemsFromRowsWithin(pet.Container.Rows, int64(pet.Container.Capacity))
+	for _, item := range rows {
+		planned := rt.scatterMonsterDrop(PlanItemDrop(item, item.Quantity, at, "", now), at, cosCargoRarity)
+		planned.LostTo = loss.lostTo
+		if added := rt.addCharacterGround(division, c, planned); added.Gid != 0 {
+			dropped = append(dropped, added)
+		}
+	}
+	killerKind := "none"
+	if loss.winnerName != "" {
+		killerKind = "player"
+	}
+	// rows counts what the container held, bags what the ground owner
+	// accepted: rows > 0 with bags == 0 means registration refused every
+	// row and the goods stayed lost with the vehicle.
+	log.WithFields(log.Fields{
+		"cause": loss.cause, "killer": killerKind, "winner": loss.winnerName,
+		"owner": c.Name, "rows": len(rows), "bags": len(dropped),
+	}).Info("trade: transport cargo scattered")
+	pet.Container.Rows = nil
+	if len(dropped) == 0 {
+		return nil
+	}
+	cargo := rt.groundReferences(dropped)
+	for _, item := range dropped {
+		cargo = append(cargo, wire.DropBroadcastFrames(item.SpawnRow(true))...)
+	}
+	return cargo
+}

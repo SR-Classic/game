@@ -1,0 +1,288 @@
+/*
+===========================================================================
+
+skillwall.go - the Chinese Force walls (Crystal Wall, Fire Wall)
+
+The cast installs the caster's persistent instance and fills the actor's
+single wall slot (+0xC0C) with it, the pool loaded from pw word 1
+at the engage. While the wall stands:
+
+	hits      the hit outcome splits every monster hit: the wall's lanes land on a
+	          second target entry (type-7 records), the defender's own
+	          record loses them (combat.ResolveAgainstWall)
+	drain     the result pass takes the impacts' absorbed total from the pool
+	update    the persistent cast retires the wall once the pool is 0; it pays onff
+	          word 1 MP every onff period or retires it
+	footing   the wall's motion (0x11) refuses further ao / pw casts
+	          as sitting or riding does
+
+The slot empties when the instance retires.
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"strings"
+	"sync/atomic"
+
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/statuseffect"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+// standingWall is one actor's wall slot and its context's remaining counter.
+type standingWall struct {
+	division, name string
+	skillID, token uint32
+	wall           enterworld.SkillWall
+	pool           uint32
+	nextPulse      int64
+}
+
+func wallKey(division, name string) string {
+	return strings.ToLower(division) + "\x00" + strings.ToLower(name)
+}
+
+/*
+==================
+acceptWall
+
+The native persistent cast for a pw row: charge the cast, install the caster's persistent
+instance and load the slot.
+==================
+*/
+func (rt *Runtime) acceptWall(division string, c, snapshot *enterworld.Character, cast wire.SkillAction, skill enterworld.SkillRow) OpResult {
+	now := rt.Now().UnixMilli()
+	if !skill.Wall.Pinned || cast.HasTarget || cast.HasGroundTarget {
+		return OpResult{DiagnosticRefusal: "wall-admission-refused"}
+	}
+	if !enterworld.CharacterAlive(snapshot) || !enterworld.SkillLearned(snapshot, skill.ID) {
+		return OpResult{DiagnosticRefusal: "wall-admission-refused"}
+	}
+	if rt.hasOpenSkillCast(division, snapshot.Name) {
+		return OpResult{DiagnosticRefusal: "wall-action-busy"}
+	}
+	if code := rt.skillAdmission(division, snapshot, skill, now, nil, nil, admitExecution); code != 0 {
+		return offensiveRefusal(code)
+	}
+
+	token := atomic.AddUint32(&rt.castTokenCounter, 1)
+	var frames []wire.Frame
+	var refusal uint16
+	committed := rt.deps.Update(c, "wall", func() bool {
+		if !enterworld.CharacterAlive(c) || !enterworld.SkillLearned(c, skill.ID) {
+			return false
+		}
+		cost, code := rt.offensivePhaseCost(division, c, skill, now, nil)
+		if refusal = code; code != 0 {
+			return false
+		}
+		rt.startSkillCast(division, c, skill, now)
+		installed, ok := rt.commitCharacterEffect(division, c, skill, token, statuseffect.StateActive, true, EffectPresentation{Phase: 1}, now)
+		if !ok {
+			return false
+		}
+		success := wire.SkillCastSuccess{SkillId: skill.ID, CasterGid: enterworld.ObjectIDForCharacter(c), InstanceToken: token}
+		frames = append(frames, wire.SkillCastSelfFrame(success))
+		frames = append(frames, installed...)
+		rt.commitOffensivePhaseCost(division, c, skill, cost, now, false)
+		return true
+	})
+	if !committed {
+		if refusal != 0 {
+			return offensiveRefusal(refusal)
+		}
+		return OpResult{DiagnosticRefusal: "wall-commit-refused"}
+	}
+	// The native persistent cast enters sub-state 0 and, on its
+	// TargetRequired == 0 self-persistent branch, sends the cancel action
+	// (1, 0, castToken, 0) before queueing the sub-state 1 child command that
+	// clears char+C08 and engages the wall in char+C0C. Mode-1 B505 releases the
+	// client's stage-0 WAIT (8E2C90 -> 8DF180) so the caster finishes ANI_SKILL_4
+	// and extinguishes the READY hand effects instead of freezing in ANI_WAIT04.
+	// Natively the standing wall roots through motion state 11 until the wall
+	// retires (B6A0); the native attack-lock test reads char+C08 and char+C44,
+	// not char+C0C, so the
+	// port's wallStanding fold in PlayerAttackLocked carries the root on
+	// the server lanes.
+	rt.queuePersistentRelease(division, c, token, skill, now)
+
+	rt.wallMu.Lock()
+	if rt.walls == nil {
+		rt.walls = map[string]*standingWall{}
+	}
+	rt.walls[wallKey(division, c.Name)] = &standingWall{
+		division: division, name: c.Name, skillID: skill.ID, token: token,
+		wall: skill.Wall, pool: skill.Wall.Pool, nextPulse: now + int64(skill.Aura.PulseMs),
+	}
+	rt.wallMu.Unlock()
+	return OpResult{Frames: frames, Broadcast: frames}
+}
+
+// wallInstanceLive reports the wall's instance still installed and not
+// asked to stop.
+func (rt *Runtime) wallInstanceLive(w *standingWall) bool {
+	for _, effect := range rt.effects.Snapshot(w.division, w.name) {
+		if effect.SkillID == w.skillID && effect.InstanceToken == w.token {
+			return !effect.StopRequested
+		}
+	}
+	return false
+}
+
+// standingWallOf is the defender's slot: the wall rule and pool, when a
+// live wall stands.
+func (rt *Runtime) standingWallOf(division, name string) (standingWall, bool) {
+	rt.wallMu.Lock()
+	w := rt.walls[wallKey(division, name)]
+	rt.wallMu.Unlock()
+	if w == nil || !rt.wallInstanceLive(w) {
+		return standingWall{}, false
+	}
+	rt.wallMu.Lock()
+	defer rt.wallMu.Unlock()
+	return *w, true
+}
+
+// drainWall is the native pool drain: the pool loses the absorbed total, floored at 0.
+func (rt *Runtime) drainWall(division, name string, token, absorbed uint32) {
+	rt.wallMu.Lock()
+	defer rt.wallMu.Unlock()
+	w := rt.walls[wallKey(division, name)]
+	if w == nil || w.token != token {
+		return
+	}
+	w.pool -= min(w.pool, absorbed)
+}
+
+/*
+==================
+wallRecords
+
+The native wall pass for one hit's committed impacts: each covered impact adds
+its absorbed damage to the group total and reports the pool that total
+leaves; an empty pool or an uncovered attack yields a bare type 8. Returns
+the records and the total the pool must lose.
+==================
+*/
+func wallRecords(w standingWall, splits []wallSplit, count int) ([]wire.SkillCastTargetImpact, uint32) {
+	records := make([]wire.SkillCastTargetImpact, 0, count)
+	var total uint32
+	for _, split := range splits[:count] {
+		if w.pool == 0 {
+			records = append(records, wire.SkillCastTargetImpact{Skipped: true})
+			continue
+		}
+		total += split.absorbed
+		record := wire.SkillCastTargetImpact{
+			ResultFlags: split.flags,
+			Damage:      split.absorbed,
+			Absorb: &wire.SkillCastAbsorb{
+				Remaining: uint16(w.pool - min(w.pool, total)),
+				Max:       uint16(w.wall.Pool),
+				Broken:    w.pool <= total,
+			},
+		}
+		if !split.covered {
+			record = wire.SkillCastTargetImpact{Skipped: true}
+		}
+		records = append(records, record)
+	}
+	return records, total
+}
+
+// wallSplit is one impact's wall share.
+type wallSplit struct {
+	absorbed uint32
+	flags    uint8
+	covered  bool
+}
+
+/*
+==================
+advanceWalls
+
+The native persistent update of every standing wall: the caster and instance must
+live, an empty pool retires it, and the onff pulse is paid or
+retires it.
+==================
+*/
+func (rt *Runtime) advanceWalls(now int64) []simulation.DivisionFrames {
+	rt.wallMu.Lock()
+	walls := make([]*standingWall, 0, len(rt.walls))
+	for _, w := range rt.walls {
+		walls = append(walls, w)
+	}
+	rt.wallMu.Unlock()
+
+	var out []simulation.DivisionFrames
+	for _, w := range walls {
+		caster := rt.findCharacter(w.division, w.name)
+		skill, known := rt.deps.SkillData().SkillByID(w.skillID)
+		rt.wallMu.Lock()
+		pool := w.pool
+		rt.wallMu.Unlock()
+		if caster == nil || !known || !enterworld.CharacterAlive(caster) || !rt.wallInstanceLive(w) || pool == 0 {
+			rt.retireWall(w)
+			continue
+		}
+		if now < w.nextPulse {
+			continue
+		}
+		paid, ok := rt.pulseAura(w.division, caster, skill)
+		if !ok {
+			rt.retireWall(w)
+			continue
+		}
+		out = append(out, paid...)
+		w.nextPulse = now + int64(skill.Aura.PulseMs)
+	}
+	return out
+}
+
+// retireWall empties the slot and asks the instance to stop.
+func (rt *Runtime) retireWall(w *standingWall) {
+	rt.wallMu.Lock()
+	if rt.walls[wallKey(w.division, w.name)] == w {
+		delete(rt.walls, wallKey(w.division, w.name))
+	}
+	rt.wallMu.Unlock()
+	request := func() bool {
+		rt.effects.RequestVoluntaryStop(w.division, w.name, w.skillID, w.token)
+		return true
+	}
+	if caster := rt.findCharacter(w.division, w.name); caster != nil {
+		rt.deps.UpdateDeferred(caster, "wall-retire", request)
+		return
+	}
+	request()
+}
+
+// wallStanding feeds the native footing gate.
+func (rt *Runtime) wallStanding(division, name string) bool {
+	_, ok := rt.standingWallOf(division, name)
+	return ok
+}
+
+/*
+==================
+queuePersistentRelease
+
+The native persistent cast sends the mode-1 release (B071 in
+v1.188, B505 here) across all four sub-state 0 branches via
+its cancel-action send: TargetRequired != 0 party aura
+(+0x28C), world-object spawn (+0x294), TargetRequired == 0
+party aura (+0x28C), and TargetRequired == 0 self-persistent / pw
+wall. The port installs the aura or wall at the press, so
+the release lands at the end of the authored casting time, where the native
+lifecycle reaches it: the client's WAIT ends, the shot motion plays and the
+caster goes back to idle while the aura or wall stands. No mode-2 close
+follows: the effect's own retirement (B6A0) ends the cast.
+==================
+*/
+func (rt *Runtime) queuePersistentRelease(division string, c *enterworld.Character, token uint32, skill enterworld.SkillRow, now int64) {
+	rt.queueSkillFinalize(division, c.Name, enterworld.ObjectIDForCharacter(c), now+int64(skill.ActionCastingTimeMs), wire.SkillCastReleaseFrame(token, 0))
+}

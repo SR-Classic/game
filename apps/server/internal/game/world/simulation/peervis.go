@@ -1,0 +1,222 @@
+/*
+===========================================================================
+
+peervis.go - peer visibility and native appearance publication.
+
+===========================================================================
+*/
+package simulation
+
+import (
+	"opensro.online/server/internal/game/item/wire"
+	worldgeom "opensro.online/server/internal/game/world"
+)
+
+// Peer visibility: the character-appearance / object-list lane that makes a
+// second connected character SPAWN as a CICUser on other clients.
+//
+// Movement was already broadcast (the 0x30E3 / 0xB2F5 tick legs), but a gid
+// with no spawn row parks in the client's object-track table (the native
+// 0x30E3 behavior for an unresolved gid) - so no peer was ever visible. This
+// leg pushes one 0x30D7 single-object spawn per (viewer, peer) pair when the
+// peer first becomes visible, and one 0x36AB despawn when the peer's session
+// leaves the division. The row bytes are the wire.PlayerSpawnRow layout,
+// which the client's REAL CICUser_DeserializeAppearanceSpawnData CICUser_DeserializeFull fold chain
+// parses field for field (proven end-to-end by the client parity harness).
+
+// PeerAppearance is the wire-visible appearance of one connected character,
+// value-copied out of the bound enterworld.Character at snapshot time (the
+// SessionSnapshot concurrency contract). Every field traces to persisted
+// character state - no placeholder rows.
+/*
+================
+PeerAppearance
+================
+*/
+type PeerAppearance struct {
+	PVPState    uint8
+	EventTeam   *uint8
+	Walk, Run   float32
+	ActionSpeed float32
+	// RefObjID is the character-model RefObjData id (character.ModelRef,
+	// the same record the local player resolves through client CIGIDObject_ResolveRefObj).
+	RefObjID uint32
+	// Name is the character name (-> CICUser +0x108 via CMsgStreamBuffer_ReadAsciiString).
+	Name string
+	// BodyShapeByte rides the client CICUser_DeserializeSpawnTail lead byte into +0x758.
+	BodyShapeByte uint8
+	// JobType/JobGrade are a dressed job player's job and grade (+0x782 /
+	// +0x783); zero outside job mode.
+	JobType     uint8
+	JobGrade    uint8
+	VisualFlags uint8
+	// Skin is the transform the player wears (RefObjID 0: none).
+	Skin wire.TransformSkin
+	// Equipment is the WORN set (equipment-band inventory slots), in slot
+	// order, for the client CICUser_DeserializeAppearanceSpawnData equip loop.
+	Equipment []wire.PlayerEquipItem
+	// Avatars are the worn avatar dresses (the avatar inventory, socket
+	// order) for the client @0x0086b0c7 avatar loop. Without them a peer who comes
+	// into view is drawn without its dress.
+	Avatars []wire.PlayerEquipItem
+	// GuildName/GuildID/GuildGrantName/CrestParam are the guild half of
+	// the client CICPlayer_DeserializeSpawnData non-local tail, resolved from the store's guild door
+	// (the same rows the 0x32C4 seed encodes) for guild members and left
+	// zero otherwise. A NON-EMPTY GuildName is what arms the client's
+	// client CICPlayer_BindCompanionOwner BindGuild leg (@0x0086a242 tests the +0x7a8 wstring's
+	// size field at +0x7bc), so crests and banner labels can resolve for
+	// peers at all; CrestParam is the wire crestParamA - the
+	// G{prefix}_{guildId}_{crestParamA}.crb filename parameter
+	// (client CGuildCrestManager_UpdateCharacterCrests @0x833e42). AllianceID/AllianceCrest are params B/C: the
+	// peer guild's union and its emblem (the A{prefix}_{B}_{C}.crb file),
+	// zero outside a union.
+	GuildName      string
+	GuildID        uint32
+	GuildGrantName string
+	CrestParam     uint32
+	AllianceID     uint32
+	AllianceCrest  uint32
+	// StallTitle names the stall the peer keeps (empty: none).
+	StallTitle string
+	// StallDecoration is that stall's booth item (zero: the default stall).
+	StallDecoration uint32
+	// FortSiegeAuthority is the guild sub-block's trailing team byte
+	// (client CICPlayer_DeserializeSpawnData @0x0086a1b2 -> CICPlayer_SetFortressWarOfficerTitle -> CICPlayer+0x7e0),
+	// sourced from the member row's FortressRole - the SAME byte the
+	// 0x32C4 member loop carries at +0x5c for the local player. The
+	// six-mark fortress-war gate needs it in {1 Commander, 2 Deputy}.
+	FortSiegeAuthority uint8
+	// SpawnSkills is the peer's active effect list (client 85FB20), so a buff the
+	// peer already had shows when it comes into view.
+	SpawnSkills []wire.SpawnSkillEntry
+}
+
+/*
+================
+ItemIDs
+
+The item ids a spawn row of this appearance names: the worn set, the
+worn avatars and a player skin's copied equipment.
+================
+*/
+func (a *PeerAppearance) ItemIDs() []uint32 {
+	ids := make([]uint32, 0, len(a.Equipment)+len(a.Avatars)+len(a.Skin.Equipment))
+	for _, item := range a.Equipment {
+		ids = append(ids, item.RefObjID)
+	}
+	for _, item := range a.Avatars {
+		ids = append(ids, item.RefObjID)
+	}
+	if a.Skin.Player {
+		ids = append(ids, a.Skin.Equipment[:]...)
+	}
+	return ids
+}
+
+// PeerScaleDenom is the +0x4d8 scale denominator for a player row: an
+// IEEE-754 FLOAT 100.0 on the wire (fld dword @0x0085fba5), which the client
+// turns into the neutral 100.0/100.0 = 1.0 reciprocal at +0x4dc - the same
+// value the NPC create row ships.
+const PeerScaleDenom float32 = 100
+
+// BuildPeerSpawnRow encodes one 0x30D7 CICUser spawn row for a peer at the
+// given pose (callers pass the LIVE interpolated position, never the move
+// goal - the bug D plane rule). Walk/run ride the char-data 20/50 pair
+// (+0x24c/+0x250 sources), and the appear tail is the drop-in presentation
+// byte 1 (the grounditem 0x30D7 convention).
+/*
+================
+BuildPeerSpawnRow
+================
+*/
+func BuildPeerSpawnRow(appearance PeerAppearance, gid uint32, pose Spawn) []byte {
+	walk, run := appearance.Walk, appearance.Run
+	if walk <= 0 {
+		walk = WalkSpeed
+	}
+	if run <= 0 {
+		run = RunSpeed
+	}
+	actionSpeed := appearance.ActionSpeed
+	if actionSpeed <= 0 {
+		actionSpeed = PeerScaleDenom
+	}
+	row := wire.PlayerSpawnRow{
+		RefObjID:      appearance.RefObjID,
+		BodyShapeByte: appearance.BodyShapeByte,
+		Skin:          appearance.Skin,
+		VisualFlags:   appearance.VisualFlags,
+		Equipment:     appearance.Equipment,
+		Avatars:       appearance.Avatars,
+		Gid:           gid,
+		Position: wire.Position{
+			RegionID: pose.RegionID,
+			X:        float32(pose.X),
+			Y:        float32(pose.Y),
+			Z:        float32(pose.Z),
+			Heading:  pose.Angle,
+		},
+		WalkSpeed:          walk,
+		RunSpeed:           run,
+		ScaleDenom:         actionSpeed,
+		Name:               appearance.Name,
+		JobType:            appearance.JobType,
+		JobGrade:           appearance.JobGrade,
+		PVPState:           appearance.PVPState,
+		EventTeam:          appearance.EventTeam,
+		GuildName:          appearance.GuildName,
+		GuildID:            appearance.GuildID,
+		GuildGrantName:     appearance.GuildGrantName,
+		CrestParamA:        appearance.CrestParam,
+		CrestParamB:        appearance.AllianceID,
+		CrestParamC:        appearance.AllianceCrest,
+		StallTitle:         appearance.StallTitle,
+		StallDecoration:    appearance.StallDecoration,
+		FortSiegeAuthority: appearance.FortSiegeAuthority,
+		SpawnSkills:        appearance.SpawnSkills,
+		WithAppearTail:     true,
+		AppearFlag:         1,
+	}
+	return row.Encode()
+}
+
+/*
+================
+freshReferenceIDs
+
+The demanded ids the viewer has not been sent yet, each marked sent.
+A viewer's client keeps every reference row for the whole session
+(the client contract, core.ts: "References stay: a re-entry does not
+resend the item snapshot"), so a row needs to cross to a viewer once,
+however many shown peers wear it and however often a peer is evicted
+and shown again. Without this record a crowded square re-sent each
+peer's full item set on every show - the ~150 KB reference frames
+every 1.5 s to one viewer in the 2026-11-05 stall journal (#2148),
+ahead of which that viewer's inventory answer queued for 8.8 s.
+First-show order is untouched: the fresh rows still ride ahead of
+the spawn row that names them, in the same pushed batch.
+================
+*/
+func freshReferenceIDs(sent map[uint32]bool, ids []uint32) []uint32 {
+	fresh := make([]uint32, 0, len(ids))
+	for _, id := range ids {
+		if id == 0 || sent[id] {
+			continue
+		}
+		sent[id] = true
+		fresh = append(fresh, id)
+	}
+	return fresh
+}
+
+/*
+================
+peerPositionVisible
+================
+*/
+func peerPositionVisible(viewer, object Spawn) bool {
+	return worldgeom.InterestVisible(
+		worldgeom.RegionXZ{RegionID: viewer.RegionID, X: viewer.X, Z: viewer.Z},
+		worldgeom.RegionXZ{RegionID: object.RegionID, X: object.X, Z: object.Z},
+	)
+}

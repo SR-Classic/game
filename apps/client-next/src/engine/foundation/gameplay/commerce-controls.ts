@@ -1,0 +1,46 @@
+/*
+===========================================================================
+
+commerce-controls.ts - the replacement transport's world control frames
+
+Browser-only frames in the transport control range (below 256) that carry
+state native packets cannot: commerce, and the beta public chat
+transcript. The server defines the same numbers (internal/game/action:
+commerce.go, buyback.go, commerce_references.go, itemmall.go;
+internal/game/social/chat: wire.go). The world session admits exactly
+these after EnterWorld; a frame the gate does not know ends the session,
+which is how the Item Mall catalogue disconnected every client (F10).
+
+===========================================================================
+*/
+
+export const SHOP_CATALOG_CONTROL = 11;
+export const SHOP_INVENTORY_CONTROL = 12;
+export const SHOP_BUYBACK_CONTROL = 13;
+export const COMMERCE_REFERENCES_CONTROL = 14;
+export const MALL_CATALOG_CONTROL = 15;
+// The server's replayed public transcript (chat/history.go OpChatHistory).
+export const CHAT_HISTORY_CONTROL = 16;
+// The beta's earned silk pushes the account's new mall balance (server
+// action/betasilk.go opMallBalance; port-only, not native).
+export const MALL_BALANCE_CONTROL = 17;
+// The silk charge history inquiry and its answer (server action/itemmall.go
+// opMallSilkHistory; port-only, not native: the native window's Inquire
+// handler is an empty stub and no packet exists).
+export const MALL_SILK_HISTORY_CONTROL = 18;
+// The crest register upload (server action/crestregister.go
+// opCrestRegister; #2282): the picked crest image rides up, the verdict
+// rides back.
+export const CREST_UPLOAD_CONTROL = 19;
+
+/*
+================
+isWorldControl
+================
+*/
+export function isWorldControl( opcode: number ): boolean {
+	return opcode === SHOP_CATALOG_CONTROL || opcode === SHOP_INVENTORY_CONTROL ||
+		opcode === SHOP_BUYBACK_CONTROL || opcode === COMMERCE_REFERENCES_CONTROL || opcode === MALL_CATALOG_CONTROL ||
+		opcode === CHAT_HISTORY_CONTROL || opcode === MALL_BALANCE_CONTROL || opcode === MALL_SILK_HISTORY_CONTROL ||
+		opcode === CREST_UPLOAD_CONTROL;
+}

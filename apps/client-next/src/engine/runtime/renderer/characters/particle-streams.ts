@@ -1,0 +1,359 @@
+/*
+===========================================================================
+
+particle-streams.ts - the CPU half of emitted particle presentation
+
+An emitted primitive's batch draws one instance per particle slot, and
+the GPU presentation pass (device/particle-shader.ts) writes every slot's
+instance and palette each frame from the slot's tick record
+(foundation/animation/particle-records.ts). This module keeps a batch's
+records current: it rewrites a slot only when its tick state changed (a
+graph tick, a program particle's tick, a birth, a death, a region
+crossing or a moving birth matrix) and fills the per-frame actor rows.
+
+Ticks stay native: program particles advance here exactly as before,
+only when drawn and only to their whole tick.
+
+===========================================================================
+*/
+
+import type { CharacterActor, CharacterModel, CharacterPrimitive } from "@/engine/contracts/character";
+import { SLOT_ALIVE, type ParticleGraphState } from "@/engine/foundation/animation/particle-graph-slots";
+import { particleGraphTime } from "@/engine/foundation/animation/particle-graph-clock";
+import { advanceParticle, type ParticleInstance } from "@/engine/foundation/animation/particle-program";
+import {
+	PARTICLE_TICKS_PER_SECOND,
+	ROTATION_WORK,
+	snapshotParticleTick
+} from "@/engine/foundation/animation/particle-presentation";
+import {
+	ACTOR_FOLLOW,
+	ACTOR_FRACTION,
+	ACTOR_OPACITY,
+	ACTOR_PALETTE,
+	ACTOR_TIME,
+	emittedMatrixMatches,
+	hideRecord,
+	PARTICLE_ACTOR,
+	PARTICLE_RECORD,
+	particleView,
+	recordLive,
+	writeEmittedRecord
+} from "@/engine/foundation/animation/particle-records";
+import { cameraAxes } from "@/engine/foundation/rendering/effect-billboard";
+import type { ParticlePresentation } from "../internal/gpu-contract";
+
+/*
+================
+ParticleHistory
+
+An actor's particle simulation (characters.ts owns it for the actor's
+lifetime): its graph, or its primitives' birth matrices and programs.
+================
+*/
+export interface ParticleHistory {
+	readonly graph?: ParticleGraphState;
+	// The graph's holder follow this frame (particle-holder-link.ts).
+	readonly follow?: Float32Array;
+	readonly matrices: readonly (Float32Array | undefined)[];
+	readonly programs: readonly (ParticleInstance | undefined)[][];
+}
+
+/*
+================
+ParticleRandom
+
+The shared native random table and its cursor; program ticks draw from it.
+================
+*/
+export interface ParticleRandom {
+	readonly table: Float32Array;
+	index: number;
+}
+
+/*
+================
+ParticleRow
+
+One actor's inputs for writeParticleRow. The caller keeps one
+(createParticleRow) and fills it per actor, so the frame allocates nothing.
+================
+*/
+export interface ParticleRow {
+	actor: CharacterActor | undefined;
+	history: ParticleHistory | undefined;
+	// The pose an own-emission particle's palette starts from.
+	pose: { palette( primitive: CharacterPrimitive, out: Float32Array, offset: number ): void; } | undefined;
+	opacity: number;
+}
+
+/*
+================
+createParticleRow
+================
+*/
+export function createParticleRow(): ParticleRow {
+	return { actor: undefined, history: undefined, pose: undefined, opacity: 1 };
+}
+
+/*
+================
+ParticleStream
+
+A batch primitive's presentation input, with what its records were last
+written from: per actor, its history and, for a graph, the revision of
+the graph's records. A row whose actor changes (new batch membership) has
+a new history and is rewritten.
+================
+*/
+export interface ParticleStream extends ParticlePresentation {
+	readonly primitive: CharacterPrimitive;
+	readonly index: number;
+	// Graph particles start from the model's bind scale.
+	readonly graphPalette?: Float32Array;
+	readonly owners: (ParticleHistory | undefined)[];
+	readonly revisions: Float64Array;
+	readonly liveCounts: Uint32Array;
+	readonly extents: Uint32Array;
+	readonly work: Float64Array;
+	readonly basis: Float64Array;
+	// Live particles the last frame drew (the frame probe's count).
+	live: number;
+}
+
+/*
+================
+createParticleStream
+
+The stream of model's primitive index for rows actors. Every slot starts
+empty and every record dirty.
+================
+*/
+export function createParticleStream( model: CharacterModel, index: number, rows: number ): ParticleStream {
+	const primitive = model.primitives[index]!, emission = primitive.emission;
+	if ( !emission ) throw Error( "Particle stream requires an emission" );
+	// The pass writes one palette matrix a slot (particle-shader.ts).
+	if ( primitive.joints.length !== 1 ) throw Error( "Emitted primitive must have one joint" );
+	const slots = emission.capacity ?? emission.births.length;
+	let graphPalette: Float32Array | undefined;
+	if ( model.particleGraph ) {
+		graphPalette = new Float32Array( 16 );
+		for ( let axis = 0; axis < 3; axis++ ) graphPalette[axis * 5] = model.nodes[0]!.scale[axis]!;
+		graphPalette[15] = 1;
+	}
+	return {
+		rows,
+		slots,
+		graph: !!model.particleGraph,
+		view: particleView( primitive.billboard ),
+		lifetime: emission.lifetime,
+		loop: !!emission.loop,
+		frames: primitive.materialFrames,
+		records: new Float32Array( rows * slots * PARTICLE_RECORD ),
+		actors: new Float32Array( rows * PARTICLE_ACTOR ),
+		axes: new Float32Array( 12 ),
+		dirtyStart: 0,
+		dirtyEnd: rows * slots,
+		primitive,
+		index,
+		graphPalette,
+		owners: new Array( rows ).fill( undefined ),
+		revisions: new Float64Array( rows ).fill( NaN ),
+		liveCounts: new Uint32Array( rows ),
+		extents: new Uint32Array( rows ),
+		work: new Float64Array( ROTATION_WORK ),
+		basis: new Float64Array( 9 ),
+		live: 0
+	};
+}
+
+/*
+================
+markDirty
+================
+*/
+function markDirty( stream: ParticleStream, start: number, end: number ): void {
+	stream.dirtyStart = Math.min( stream.dirtyStart, start );
+	stream.dirtyEnd = Math.max( stream.dirtyEnd, end );
+}
+
+/*
+================
+writeGraphRow
+
+A graph's tick writes its drawn emitters' records into the graph's own
+storage (particle-graph.ts) whenever it ticks or shifts with a region
+crossing; the actor's records are copied from there as a block when they
+changed, and otherwise left alone. Slots past the graph's in the previous
+owner's extent are copied too: the graph holds them empty.
+================
+*/
+function writeGraphRow( stream: ParticleStream, index: number, history: ParticleHistory ): void {
+	const graph = history.graph!, n = stream.primitive.particleEmitter!, plan = graph.plan;
+	const count = graph.counts[n]!, first = plan.records[n]!;
+	if ( count > stream.slots ) throw Error( "Particle graph outside its emission capacity" );
+	if ( first < 0 ) throw Error( "Particle graph emitter without its records" );
+	if ( stream.owners[index] === history && stream.revisions[index] === graph.revision ) {
+		stream.live += stream.liveCounts[index]!;
+		return;
+	}
+	const extent = Math.max( count, stream.extents[index]! ), base = index * stream.slots;
+	if ( extent ) {
+		stream.records.set(
+			graph.records.subarray( first * PARTICLE_RECORD, (first + extent) * PARTICLE_RECORD ),
+			base * PARTICLE_RECORD
+		);
+		markDirty( stream, base, base + extent );
+	}
+	let live = 0;
+	for ( let b = 0, s = plan.base[n]!; b < count; b++, s++ ) if ( graph.flags[s]! & SLOT_ALIVE ) live++;
+	stream.live += live;
+	stream.liveCounts[index] = live;
+	stream.extents[index] = count;
+	stream.owners[index] = history;
+	stream.revisions[index] = graph.revision;
+}
+
+/*
+================
+writeEmittedRow
+
+A primitive's own emission: births at fixed times, each drawn at its
+birth matrix. A drawn program particle advances to its whole tick here
+(the last step after a snapshot, so the pass can continue it).
+================
+*/
+function writeEmittedRow(
+	stream: ParticleStream,
+	index: number,
+	actor: CharacterActor,
+	history: ParticleHistory,
+	random: ParticleRandom
+): void {
+	const primitive = stream.primitive, emission = primitive.emission!, program = primitive.particleProgram;
+	const base = index * stream.slots, records = stream.records;
+	const matrices = history.matrices[stream.index]!, programs = history.programs[stream.index]!;
+	const fresh = stream.owners[index] !== history;
+	stream.owners[index] = history;
+	for ( let b = 0; b < stream.slots; b++ ) {
+		const slot = base + b, birth = emission.births[b], at = b * 16;
+		const elapsed = birth === undefined ? -1 : actor.time - birth,
+			age = emission.loop && elapsed >= 0 ? elapsed % emission.lifetime : elapsed;
+		if (
+			birth === undefined || age < 0 || age >= emission.lifetime || !Number.isFinite( matrices[at + 15] ) ||
+			actor.emissionEnd !== undefined && birth >= actor.emissionEnd
+		) {
+			if ( recordLive( records, slot ) ) {
+				hideRecord( records, slot );
+				markDirty( stream, slot, slot + 1 );
+			}
+			continue;
+		}
+		stream.live++;
+		const particle = programs[b];
+		let advanced = false;
+		if ( particle && program ) {
+			const tick = Math.floor( age * PARTICLE_TICKS_PER_SECOND );
+			if ( tick > particle.frame ) {
+				// Advance to the tick before, record it, then take the last
+				// step: the same sequential steps as one call.
+				if ( tick - 1 > particle.frame ) {
+					random.index = advanceParticle( particle, program, tick - 1, random.table, random.index );
+				}
+				snapshotParticleTick( particle );
+				random.index = advanceParticle( particle, program, tick, random.table, random.index );
+				advanced = true;
+			}
+		}
+		if (
+			!fresh && !advanced && recordLive( records, slot ) && emittedMatrixMatches( records, slot, matrices, at )
+		) {
+			continue;
+		}
+		writeEmittedRecord( records, slot, matrices, at, birth, particle, stream.work );
+		markDirty( stream, slot, slot + 1 );
+	}
+}
+
+/*
+================
+writeParticleRow
+
+Actor index's row for this frame, and its slots' records where their tick
+state changed.
+================
+*/
+export function writeParticleRow(
+	stream: ParticleStream,
+	index: number,
+	row: ParticleRow,
+	random: ParticleRandom
+): void {
+	const actor = row.actor, history = row.history;
+	if ( !actor || !history ) throw Error( "Incomplete particle row" );
+	const at = index * PARTICLE_ACTOR, actors = stream.actors, graph = history.graph;
+	actors[at + ACTOR_TIME] = actor.time;
+	actors[at + ACTOR_OPACITY] = row.opacity;
+	if ( stream.graphPalette ) {
+		if ( !graph ) throw Error( "Graph particle stream without its graph" );
+		// Graph records carry their births on the graph's own clock.
+		const graphTime = particleGraphTime( graph, actor.time );
+		actors[at + ACTOR_TIME] = graphTime;
+		actors[at + ACTOR_FRACTION] = graphTime * PARTICLE_TICKS_PER_SECOND - graph.frame;
+		actors.set( stream.graphPalette, at + ACTOR_PALETTE );
+		if ( history.follow ) actors.set( history.follow, at + ACTOR_FOLLOW );
+		writeGraphRow( stream, index, history );
+		return;
+	}
+	if ( !row.pose ) throw Error( "Emitted particle stream without its pose" );
+	actors[at + ACTOR_FRACTION] = 0;
+	row.pose.palette( stream.primitive, actors, at + ACTOR_PALETTE );
+	writeEmittedRow( stream, index, actor, history, random );
+}
+
+/*
+================
+beginParticleFrame
+
+Start a frame: no particles counted yet, and the view mode's camera basis
+from view (the world view matrix the billboards face).
+================
+*/
+export function beginParticleFrame(
+	stream: ParticleStream,
+	view: Float32Array | undefined,
+	activeRows = stream.rows
+): void {
+	if ( !Number.isInteger( activeRows ) || activeRows < 0 || activeRows > stream.rows ) {
+		throw Error( "Particle rows outside retained capacity" );
+	}
+	// Retained capacity must never keep a retired actor visible. Empty records
+	// produce zero matrices in the existing GPU pass, including opaque effects.
+	for ( let row = activeRows; row < stream.rows; row++ ) {
+		if ( !stream.owners[row] ) continue;
+		const first = row * stream.slots, end = first + stream.slots;
+		for ( let slot = first; slot < end; slot++ ) hideRecord( stream.records, slot );
+		stream.owners[row] = undefined;
+		markDirty( stream, first, end );
+	}
+	stream.live = 0;
+	const mode = stream.primitive.billboard;
+	if ( mode !== "camera" && mode !== "y" ) return;
+	if ( !view ) throw Error( "Missing effect camera basis" );
+	cameraAxes( view, mode, stream.basis );
+	for ( let column = 0; column < 3; column++ ) {
+		for ( let row = 0; row < 3; row++ ) stream.axes[column * 4 + row] = stream.basis[column * 3 + row]!;
+	}
+}
+
+/*
+================
+endParticleFrame
+
+The device has taken this frame's dirty records.
+================
+*/
+export function endParticleFrame( stream: ParticleStream ): void {
+	stream.dirtyStart = stream.rows * stream.slots;
+	stream.dirtyEnd = 0;
+}

@@ -1,0 +1,358 @@
+/*
+===========================================================================
+
+reversereturn.go - the reverse return scroll: back to the last recall point
+or to where the player died
+
+The beginner guides (NPC_EU_ADVICE3, NPC_CH_SOLDIER_EM1) hold service 0x1E
+(the reference server's NPC service setup), so their select grant carries
+capability 0x20000000; the talk window then lists two rows (client 5D4410, action
+0x2B) and a click sends 0x7495 [u32 gid][u8 5][u8 choice] (client 6FEF10): 2 is the
+last recall point, 3 the place of the last death.
+
+The reference server's teleport use handler, case 5, is free: the
+NPC must offer a teleport service (8, 9,
+0x1C or 0x1E, else 3), then 0x1C17 under operation mask 0x40000, 0x1C10
+with a transport out, 0x1C20 past max level 20, 2 for any other choice or
+a missing point (0x1C21 for one outside any world), and the move. Its
+own 0x1E test asks the player's service set, which is always
+empty, so it never refuses.
+
+ITEM_MALL_REVERSE_RETURN_SCROLL (3/3/3/3) is used from the bag. A right
+click opens a two-row choice box (message box 0x1E); CGInterface_OnMsgBoxResult
+(6971B0) answers it with CIFInventory_ExecuteItemAction, which sends 0x75BD
+[slot][u16 type][u8 choice]: 2 the last recall point, 3 the last death
+point. Client 755E40 (type 4 = 3) starts the cast as a return scroll's.
+The v1.188 reverse return scroll reads the byte: the
+shared return admissions, the recorded point (0x1885 / 0x1886 when absent),
+the timed cast, and the answer on the item-use channel (0xB5BD with the
+scroll's slot, category-1 notice 390). The v1.150 dialog sends only 2 and
+3. v1.188's choice 7 (a saved point, u32 id) is refused unless the
+port-only SRO_REVERSE_RETURN_MAP option is on (reversemap.go).
+
+INFERENCE: a teleport gate also lists the rows while the player holds a
+scroll, and the click runs the same scroll rule.
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/inventory"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/tunables"
+	"opensro.online/server/internal/game/world/instance"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+const (
+	// gateReverseReturn is the 0x7495 type the reverse return rows send.
+	gateReverseReturn uint8 = 5
+	// The two 0x7495 type-5 choices (client 5DA1B0 case 0x2B rows 1 and 2).
+	reverseReturnLastRecall uint8 = 2
+	reverseReturnLastDeath  uint8 = 3
+
+	// guideReturnMaxLevel is the highest max level the native case 5 serves.
+	guideReturnMaxLevel int64 = 20
+
+	// The low bytes of the native case 5's refusals.
+	errCodeTeleportService uint8 = 0x03
+	errCodeGuideQuestBlock uint8 = 0x17
+	errCodeGuideTransport  uint8 = 0x10
+	errCodeGuideLevel      uint8 = 0x20
+	errCodeGuideNoPoint    uint8 = 0x02
+
+	// operationMaskQuestTravel is the operation mask bit 0x1C17 refuses.
+	operationMaskQuestTravel uint32 = 0x40000
+
+	// The low bytes of the reference server's 0x1885 and 0x1886.
+	errCodeNoRecallPoint uint8 = 0x85
+	errCodeNoDeathPoint  uint8 = 0x86
+	// Reference server: reverse-scroll world restrictions.
+	errCodeReverseWorld uint8 = 0xf5
+	errCodeReverseJob   uint8 = 0xe9
+	errCodeReverseWar   uint8 = 0xf2
+)
+
+/*
+================
+reverseReturnScrollRow
+
+The bag row of the first reverse return scroll the player holds.
+================
+*/
+func (rt *Runtime) reverseReturnScrollRow(c *enterworld.Character) (int, *enterworld.ItemRef, bool) {
+	refs := rt.deps.ItemReferences()
+	if refs == nil {
+		return 0, nil, false
+	}
+	found, slot := -1, int64(0)
+	var held *enterworld.ItemRef
+	for index, row := range c.MissionInventory {
+		if !inventory.InBag(c, row.Slot) || row.StackCount < 1 || found >= 0 && row.Slot >= slot {
+			continue
+		}
+		ref, ok := refs.ItemRefByCodename(row.Codename)
+		if !ok || ref == nil || ref.RefObjID != row.RefObjID || ref.TypeIDs != [4]int64{3, 3, 3, 3} {
+			continue
+		}
+		found, slot, held = index, row.Slot, ref
+	}
+	return found, held, found >= 0
+}
+
+/*
+================
+reverseReturnCapability
+
+A teleport gate's extra select bit while the player holds a reverse return
+scroll (INFERENCE, see the file header). The guides' bit is their service
+0x1E, already in TalkFlags. The caller holds the division lock.
+================
+*/
+func (rt *Runtime) reverseReturnCapability(npc simulation.NpcDef, c *enterworld.Character) uint32 {
+	// The Bandit Den gate offers only its return-point row (0x100) and
+	// is a gate all the same.
+	if npc.TalkFlags&(simulation.NpcTalkFlagTeleport|simulation.NpcTalkFlagResurrectPoint) == 0 {
+		return 0
+	}
+	if _, _, held := rt.reverseReturnScrollRow(c); !held {
+		return 0
+	}
+	return simulation.NpcTalkFlagReverseReturn
+}
+
+/*
+================
+reverseReturnPoint
+
+The recorded point a choice names, or the refusal for a missing one.
+================
+*/
+func reverseReturnPoint(c *enterworld.Character, choice uint8) (travelPoint, uint8) {
+	var point *domain.WorldPoint
+	refusal := errCodeNoRecallPoint
+	if c.World != nil && choice == reverseReturnLastRecall {
+		point = c.World.LastRecallPoint
+	}
+	if choice == reverseReturnLastDeath {
+		refusal = errCodeNoDeathPoint
+		if c.World != nil {
+			point = c.World.LastDeathPoint
+		}
+	}
+	if point == nil || point.RegionID == nil || *point.RegionID == 0 {
+		return travelPoint{}, refusal
+	}
+	// The point keeps its GameWorldID; a recorded world is type 0, entered
+	// on layer 1. Absent means the field.
+	world := instance.ID(domain.DefaultWorldInstance)
+	if point.World != 0 {
+		world = instance.Pack(instance.DefinitionID(point.World), portalWorldLayer)
+	}
+	return travelPoint{spawn: missionSpawnFromWorld(&point.WorldSpawn, simulation.Spawn{}), world: world}, 0
+}
+
+/*
+================
+hasTeleportService
+
+The reference server's teleport service test: a teleport, recall, gate or reverse
+return service.
+================
+*/
+func hasTeleportService(npc simulation.NpcDef) bool {
+	return npc.Services.Has(simulation.NpcServiceTeleport) || npc.Services.Has(simulation.NpcServiceResurrectPoint) ||
+		npc.Services.Has(simulation.NpcServiceTeleportGate) || npc.Services.Has(simulation.NpcServiceReverseReturn)
+}
+
+/*
+================
+handleReverseReturn
+
+0x7495 type 5 from the selected NPC: a teleport gate spends a held scroll
+(the inference above), every other teleport service NPC runs the native free
+case 5.
+================
+*/
+func (rt *Runtime) handleReverseReturn(division string, c *enterworld.Character, gid uint32, choice uint8) OpResult {
+	if c == nil {
+		return portalFailure(2)
+	}
+	unlock := rt.lockDivision(division)
+	defer unlock()
+	if selected, ok := rt.Selected.Get(division, c.Name); !ok || selected != gid {
+		return portalFailure(2)
+	}
+	npc, ok := rt.npcForCurrentViewer(division, c, gid)
+	if !ok {
+		return portalFailure(2)
+	}
+	// The hit-range check before the service test, as every native teleport kind.
+	if !rt.npcWithinHitRange(division, c, npc) {
+		return portalFailure(hitRangeTooFar)
+	}
+	if !hasTeleportService(npc) {
+		return portalFailure(errCodeTeleportService)
+	}
+	if _, _, held := rt.reverseReturnScrollRow(c); held && !npc.Services.Has(simulation.NpcServiceReverseReturn) {
+		if choice != reverseReturnLastRecall && choice != reverseReturnLastDeath {
+			return portalFailure(2)
+		}
+		return rt.scrollReverseReturn(division, c, choice)
+	}
+	return rt.guideReverseReturn(division, c, gid, choice)
+}
+
+/*
+================
+scrollReverseReturn
+
+The held scroll's reverse return from a teleport gate. The caller holds
+the division lock.
+================
+*/
+func (rt *Runtime) scrollReverseReturn(division string, c *enterworld.Character, choice uint8) OpResult {
+	result := itemUseFailure(wire.ErrCodeInvalidRequest)
+	var used *enterworld.ItemRef
+	now := rt.Now().UnixMilli()
+	committed := rt.deps.Update(c, "reverse-return", func() bool {
+		if c.DeletePending {
+			return false
+		}
+		if !enterworld.CharacterAlive(c) {
+			result = itemUseFailure(wire.ErrCodeItemUseDead)
+			return false
+		}
+		row, ref, held := rt.reverseReturnScrollRow(c)
+		if !held {
+			return false
+		}
+		used = ref
+		return rt.beginReverseReturnScroll(division, c, ref, row, reverseReturnTarget{choice: choice}, now, &result)
+	})
+	if committed && used != nil {
+		rt.publishItemUseVisual(c, used, 0, &result)
+	}
+	return result
+}
+
+/*
+================
+reverseReturnTarget
+
+The point a use picked: choice 2 or 3, or the port-only map choice 7
+with its point id.
+================
+*/
+type reverseReturnTarget struct {
+	choice uint8
+	point  uint32
+}
+
+/*
+================
+beginReverseReturnScroll
+
+The reference server's reverse return: the scroll in bag row `row` starts its cast to the chosen point.
+The caller holds the character's update.
+================
+*/
+func (rt *Runtime) beginReverseReturnScroll(division string, c *enterworld.Character, ref *enterworld.ItemRef, row int, target reverseReturnTarget, now int64, result *OpResult) bool {
+	if rt.jobRefusesScroll(tunables.JobBlockReverseReturnScroll, c, result) {
+		return false
+	}
+	// The reference server requires the current world's reference type (+0x20) to be zero.
+	if here, ok := instance.Lookup(instance.ID(domain.CharacterWorldInstance(c)).Definition()); !ok || here.NativeType != 0 {
+		*result = itemUseFailure(errCodeReverseWorld)
+		return false
+	}
+	var destination travelPoint
+	if target.choice == reverseReturnMapChoice {
+		// An id the table does not hold is refused; with the option off the
+		// table is empty, so the native refusal of choice 7 is kept.
+		var found bool
+		if destination, found = rt.reverseMapDestination(target.point); !found {
+			return false
+		}
+	} else if target.choice != reverseReturnLastRecall && target.choice != reverseReturnLastDeath {
+		return false
+	}
+	duration, ok := returnScrollDuration(ref)
+	if !ok || !rt.returnScrollAdmission(division, c, result) {
+		return false
+	}
+	if target.choice != reverseReturnMapChoice {
+		var refusal uint8
+		if destination, refusal = reverseReturnPoint(c, target.choice); refusal != 0 {
+			*result = itemUseFailure(refusal)
+			return false
+		}
+	} else if !rt.reverseMapAdmitsLevel(target.point, c) {
+		// Port-only (reversemap.go): v1.150 has no notice for a level band,
+		// so the item-use level notice answers (INFERENCE).
+		*result = itemUseFailure(wire.ErrCodeItemUseLevelRequired)
+		return false
+	}
+	if rt.transportBarredFromDestination(c, destination.spawn) {
+		*result = itemUseFailure(0x5e)
+		return false
+	}
+	// Reverse return has its own siege admission, not the gate's guild or
+	// population rules. Job mode is refused before active-war mode.
+	if world, ok := instance.Lookup(destination.world.Definition()); ok && world.Siege() {
+		if rt.jobDressed(c) {
+			*result = itemUseFailure(errCodeReverseJob)
+			return false
+		}
+		if rt.Fortresses != nil && rt.Fortresses.WarActive(division) {
+			*result = itemUseFailure(errCodeReverseWar)
+			return false
+		}
+	}
+	return rt.startReturnCast(returnCast{division: division, character: c, row: row,
+		slot: uint8(c.MissionInventory[row].Slot), typeWord: ref.TypeFlags(), duration: duration,
+		destination: &destination, now: now}, result)
+}
+
+/*
+================
+guideReverseReturn
+
+The native teleport use case 5: the free move to the chosen point, refused in the native
+order. The caller holds the division lock.
+================
+*/
+func (rt *Runtime) guideReverseReturn(division string, c *enterworld.Character, gid uint32, choice uint8) OpResult {
+	if rt.QuestTravelBlocks != nil && rt.QuestTravelBlocks(c)&operationMaskQuestTravel != 0 {
+		return portalFailure(errCodeGuideQuestBlock)
+	}
+	if rt.townTravelTransportRefused(c) {
+		return portalFailure(errCodeGuideTransport)
+	}
+	if c.MaxLevel != nil && *c.MaxLevel > guideReturnMaxLevel {
+		return portalFailure(errCodeGuideLevel)
+	}
+	if choice != reverseReturnLastRecall && choice != reverseReturnLastDeath {
+		return portalFailure(errCodeGuideNoPoint)
+	}
+	// 0x1C21 is a recorded point without a world; a port point is
+	// always in the world it was recorded in.
+	point, refusal := reverseReturnPoint(c, choice)
+	if refusal != 0 {
+		return portalFailure(errCodeGuideNoPoint)
+	}
+	if rt.transportBarredFromDestination(c, point.spawn) {
+		return portalFailure(errCodeGuideTransport)
+	}
+	return rt.commitGateTravel(gateTravel{division: division, character: c, destination: point.spawn, world: point.world, reason: "guide-reverse-return",
+		arrived: func() []wire.Frame { return rt.questTeleportFrames(c, gateReverseReturn, gid) }}, func() (int64, OpResult, bool) {
+		if c.DeletePending || !enterworld.CharacterAlive(c) {
+			return 0, portalFailure(2), false
+		}
+		return 0, OpResult{}, true
+	})
+}

@@ -1,0 +1,368 @@
+/*
+===========================================================================
+
+releaseprotocol_test.go - one protocol, refused otherwise
+
+===========================================================================
+*/
+package releaseprotocol
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+)
+
+/*
+================
+serve
+
+Sends one request through Require and reports whether it reached the
+handler, with the recorded response.
+================
+*/
+func serve(t *testing.T, method, declared string) (bool, *httptest.ResponseRecorder) {
+	t.Helper()
+	reached := false
+	handler := Require(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true }))
+	request := httptest.NewRequest(method, "/title/login", nil)
+	if declared != "" {
+		request.Header.Set(Header, declared)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	return reached, recorder
+}
+
+/*
+================
+TestTheCurrentProtocolPasses
+================
+*/
+func TestTheCurrentProtocolPasses(t *testing.T) {
+	if reached, recorder := serve(t, http.MethodPost, strconv.Itoa(Current)); !reached {
+		t.Fatalf("current protocol refused with %d", recorder.Code)
+	}
+}
+
+/*
+================
+TestExpandedPetFramesDoNotReuseReleasedProtocols
+================
+*/
+func TestExpandedPetFramesDoNotReuseReleasedProtocols(t *testing.T) {
+	previous, ok := ContractsOf(13)
+	if !ok || previous.Wanted != 2 || previous.Companions != 2 {
+		t.Fatalf("released protocol 13 changed: %+v", previous)
+	}
+	releasedChat, ok := ContractsOf(14)
+	if !ok || releasedChat.Chat != 1 || releasedChat.Companions != 2 {
+		t.Fatalf("released protocol 14 changed: %+v", releasedChat)
+	}
+	releasedPet, ok := ContractsOf(15)
+	if !ok || releasedPet.Chat != 1 || releasedPet.Companions != 3 {
+		t.Fatalf("released protocol 15 changed: %+v", releasedPet)
+	}
+	if Current <= 15 || WantedContract != 2 || ChatContract != 2 || CompanionsContract != 3 {
+		t.Fatal("named pet links need a new protocol while retaining main's wanted contract")
+	}
+	for _, declared := range []string{"13", "14", "15"} {
+		if reached, recorder := serve(t, http.MethodPost, declared); reached || recorder.Code != http.StatusUpgradeRequired {
+			t.Fatalf("a protocol-%s browser would receive incompatible pet frames", declared)
+		}
+	}
+}
+
+/*
+================
+TestLayeredRegionPlacementsReloadProtocol16Tabs
+
+A protocol-16 tab ignores a placement's seasonal layer and would draw
+every season's props from a rebuilt region bundle, so it gets the 426.
+================
+*/
+func TestLayeredRegionPlacementsReloadProtocol16Tabs(t *testing.T) {
+	released, ok := ContractsOf(16)
+	if !ok || released.Chat != 2 || released.World != 0 {
+		t.Fatalf("released protocol 16 changed: %+v", released)
+	}
+	if Current <= 16 || WorldContract != 1 {
+		t.Fatal("layered region placements need a new protocol")
+	}
+	if reached, recorder := serve(t, http.MethodPost, "16"); reached || recorder.Code != http.StatusUpgradeRequired {
+		t.Fatal("a protocol-16 tab would draw every season's decoration")
+	}
+}
+
+/*
+================
+TestAnyOtherDeclarationIsRefusedAsOutdated
+
+Browsers older than the handshake declare nothing; a stale or garbled
+declaration is no better. Each is told which protocol the server speaks.
+================
+*/
+func TestAnyOtherDeclarationIsRefusedAsOutdated(t *testing.T) {
+	for _, declared := range []string{"", strconv.Itoa(Current - 1), strconv.Itoa(Current + 1), "three"} {
+		reached, recorder := serve(t, http.MethodGet, declared)
+		if reached || recorder.Code != http.StatusUpgradeRequired {
+			t.Fatalf("declared %q: reached %v, status %d; want refused with 426", declared, reached, recorder.Code)
+		}
+		var body struct {
+			Error    string `json:"error"`
+			Protocol int    `json:"protocol"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Error != "client-outdated" || body.Protocol != Current {
+			t.Fatalf("declared %q: body %+v, want client-outdated and protocol %d", declared, body, Current)
+		}
+	}
+}
+
+/*
+================
+TestCORSPreflightPasses
+
+A preflight carries no declaration; refusing it would hide the 426 of the
+real request behind a CORS failure.
+================
+*/
+func TestCORSPreflightPasses(t *testing.T) {
+	if reached, _ := serve(t, http.MethodOptions, ""); !reached {
+		t.Fatal("CORS preflight was refused")
+	}
+}
+
+/*
+================
+TestEveryReleasedProtocolNamesDistinctContracts
+================
+*/
+func TestEveryReleasedProtocolNamesDistinctContracts(t *testing.T) {
+	current, ok := ContractsOf(Current)
+	if !ok || current != (Contracts{Bootstrap: BootstrapContract, Roster: RosterContract, References: ReferencesContract, Companions: CompanionsContract,
+		Effects: EffectsContract, Friends: FriendsContract, Notices: NoticesContract, Movement: MovementContract, Wanted: WantedContract, Chat: ChatContract,
+		World: WorldContract}) {
+		t.Fatalf("protocol %d names %+v, want the current contract constants", Current, current)
+	}
+	seen := map[Contracts]int{}
+	for protocol, contracts := range history {
+		if previous, ok := seen[contracts]; ok {
+			t.Fatalf("protocols %d and %d name the same contracts %+v", previous, protocol, contracts)
+		}
+		seen[contracts] = protocol
+	}
+}
+
+/*
+================
+TestAPreUncappedCompanionClientIsRefused
+
+A protocol-6 browser refuses a COS bag over 140 slots inside its decoder
+(#801 lifted that bound on the server). It must be refused with 426 and
+told to reload before it can reach a decoder that would end its session.
+================
+*/
+func TestAPreUncappedCompanionClientIsRefused(t *testing.T) {
+	const uncappedBags = 2
+	for protocol, contracts := range history {
+		if contracts.Companions >= uncappedBags {
+			continue
+		}
+		if reached, recorder := serve(t, http.MethodPost, strconv.Itoa(protocol)); reached || recorder.Code != http.StatusUpgradeRequired {
+			t.Fatalf("protocol %d (companions %d): reached %v, status %d; want refused with 426",
+				protocol, contracts.Companions, reached, recorder.Code)
+		}
+	}
+	if CompanionsContract < uncappedBags {
+		t.Fatalf("CompanionsContract = %d; this build encodes uncapped COS bags", CompanionsContract)
+	}
+}
+
+/*
+================
+TestAClientWithoutOneShotRetirementIsRefused
+
+A protocol-7 browser keeps every token-0 attached effect the server now
+sends for a heal, cure or revival (no B6A0 ever ends one) and throws at
+2048 rows, ending its session mid-play. It must be refused with 426 and
+told to reload before it can reach that stream.
+================
+*/
+func TestAClientWithoutOneShotRetirementIsRefused(t *testing.T) {
+	const retiresOneShots = 1
+	refused := 0
+	for protocol, contracts := range history {
+		if contracts.Effects >= retiresOneShots {
+			continue
+		}
+		if reached, recorder := serve(t, http.MethodPost, strconv.Itoa(protocol)); reached || recorder.Code != http.StatusUpgradeRequired {
+			t.Fatalf("protocol %d (effects %d): reached %v, status %d; want refused with 426",
+				protocol, contracts.Effects, reached, recorder.Code)
+		}
+		refused++
+	}
+	if _, ok := history[7]; !ok || refused == 0 {
+		t.Fatal("the protocol-7 client is not in the history this test refuses")
+	}
+	if EffectsContract < retiresOneShots {
+		t.Fatalf("EffectsContract = %d; this build sends token-0 one-shots", EffectsContract)
+	}
+}
+
+/*
+================
+TestAClientThatCannotAnswerAFriendRequestIsRefused
+
+A protocol-8 browser ignores the target's friend prompt (S->C 0x7164) and
+never sends the 0x3012 consent, so every request to it waits out the
+window and cancels. It must be refused with 426 and told to reload.
+================
+*/
+func TestAClientThatCannotAnswerAFriendRequestIsRefused(t *testing.T) {
+	const answersPrompts = 1
+	refused := 0
+	for protocol, contracts := range history {
+		if contracts.Friends >= answersPrompts {
+			continue
+		}
+		if reached, recorder := serve(t, http.MethodPost, strconv.Itoa(protocol)); reached || recorder.Code != http.StatusUpgradeRequired {
+			t.Fatalf("protocol %d (friends %d): reached %v, status %d; want refused with 426",
+				protocol, contracts.Friends, reached, recorder.Code)
+		}
+		refused++
+	}
+	if _, ok := history[8]; !ok || refused == 0 {
+		t.Fatal("the protocol-8 client is not in the history this test refuses")
+	}
+	if FriendsContract < answersPrompts {
+		t.Fatalf("FriendsContract = %d; this build prompts friend request targets", FriendsContract)
+	}
+}
+
+/*
+================
+TestAClientThatDropsTheNoticeChannelsIsRefused
+
+A protocol-9 browser drops the port-only 0x3667 notice channels 0x80 (job
+kills) and 0x81 (seal drops, +8..+11), so its player never sees them. It
+must be refused with 426 and told to reload.
+================
+*/
+func TestAClientThatDropsTheNoticeChannelsIsRefused(t *testing.T) {
+	const showsNoticeChannels = 1
+	refused := 0
+	for protocol, contracts := range history {
+		if contracts.Notices >= showsNoticeChannels {
+			continue
+		}
+		if reached, recorder := serve(t, http.MethodPost, strconv.Itoa(protocol)); reached || recorder.Code != http.StatusUpgradeRequired {
+			t.Fatalf("protocol %d (notices %d): reached %v, status %d; want refused with 426",
+				protocol, contracts.Notices, reached, recorder.Code)
+		}
+		refused++
+	}
+	if _, ok := history[9]; !ok || refused == 0 {
+		t.Fatal("the protocol-9 client is not in the history this test refuses")
+	}
+	if NoticesContract < showsNoticeChannels {
+		t.Fatalf("NoticesContract = %d; this build sends the notice channels", NoticesContract)
+	}
+}
+
+/*
+================
+TestAClientThatReadsTheNarrowSourceBlockIsRefused
+
+A protocol-10 browser reads the 0xB738 acknowledgement's source block
+as i16 x10 words: the wider f32 block fails its length check and every
+movement answer is dropped, so no walker ever walks for it. It must be
+refused with 426 and told to reload (#1744).
+================
+*/
+func TestAClientThatReadsTheNarrowSourceBlockIsRefused(t *testing.T) {
+	const readsTheFloatedSource = 1
+	refused := 0
+	for protocol, contracts := range history {
+		if contracts.Movement >= readsTheFloatedSource {
+			continue
+		}
+		if reached, recorder := serve(t, http.MethodPost, strconv.Itoa(protocol)); reached || recorder.Code != http.StatusUpgradeRequired {
+			t.Fatalf("protocol %d (movement %d): reached %v, status %d; want refused with 426",
+				protocol, contracts.Movement, reached, recorder.Code)
+		}
+		refused++
+	}
+	if _, ok := history[10]; !ok || refused == 0 {
+		t.Fatal("the protocol-10 client is not in the history this test refuses")
+	}
+	if MovementContract < readsTheFloatedSource {
+		t.Fatalf("MovementContract = %d; this build sends the floated source block", MovementContract)
+	}
+}
+
+/*
+================
+TestAClientWithoutTheWantedStateIsRefused
+
+A protocol-11 browser is never sent the port-only 0x3FBA most-wanted
+state for the buff-board row, so a streak holder never sees the row
+that explains the streak (#1849). It decodes nothing wrong, but the
+display the rule promises depends on the frame, so it must be refused
+with 426 and told to reload.
+================
+*/
+func TestAClientWithoutTheWantedStateIsRefused(t *testing.T) {
+	const showsTheWantedState = 1
+	refused := 0
+	for protocol, contracts := range history {
+		if contracts.Wanted >= showsTheWantedState {
+			continue
+		}
+		if reached, recorder := serve(t, http.MethodPost, strconv.Itoa(protocol)); reached || recorder.Code != http.StatusUpgradeRequired {
+			t.Fatalf("protocol %d (wanted %d): reached %v, status %d; want refused with 426",
+				protocol, contracts.Wanted, reached, recorder.Code)
+		}
+		refused++
+	}
+	if _, ok := history[11]; !ok || refused == 0 {
+		t.Fatal("the protocol-11 client is not in the history this test refuses")
+	}
+	if WantedContract < showsTheWantedState {
+		t.Fatalf("WantedContract = %d; this build sends the wanted state", WantedContract)
+	}
+}
+
+/*
+================
+TestAClientWithoutChatLinksIsRefused
+
+Port-only, not native (SRO_CHAT_ITEM_LINKS): a protocol-13 browser reads
+a player line that carries an item-link tail as trailing bytes and fails
+the session, so it is refused with 426 and told to reload.
+================
+*/
+func TestAClientWithoutChatLinksIsRefused(t *testing.T) {
+	const readsChatLinks = 1
+	refused := 0
+	for protocol, contracts := range history {
+		if contracts.Chat >= readsChatLinks {
+			continue
+		}
+		if reached, recorder := serve(t, http.MethodPost, strconv.Itoa(protocol)); reached || recorder.Code != http.StatusUpgradeRequired {
+			t.Fatalf("protocol %d (chat %d): reached %v, status %d; want refused with 426",
+				protocol, contracts.Chat, reached, recorder.Code)
+		}
+		refused++
+	}
+	if _, ok := history[13]; !ok || refused == 0 {
+		t.Fatal("the protocol-13 client is not in the history this test refuses")
+	}
+	if ChatContract < readsChatLinks || Current < 14 {
+		t.Fatalf("ChatContract = %d, Current = %d; this build sends link tails since protocol 14", ChatContract, Current)
+	}
+}

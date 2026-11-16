@@ -1,0 +1,431 @@
+/*
+===========================================================================
+
+skillcost.go - skill MP costs and cooldowns
+
+Checks run from the native skill prerequisite and cost check; the amount
+actually charged is the prepared snapshot of the cast, which later
+regeneration or drain must not change.
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"opensro.online/server/internal/game/combat"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+)
+
+/*
+===============================================================================
+
+CHECKS
+
+===============================================================================
+*/
+
+/*
+==================
+resourceCostAt
+
+The admission MP check: flat plus vitalPercent of maximum
+MP, then a player's parameter 0x8D rate (ftol(rate / 100 * cost),
+natively), against the current gauge. The check compares strictly, so exact MP
+is enough. A row without parsed consumption is refused 0x3003.
+==================
+*/
+func resourceCostAt(currentMP, maxMP int64, skill enterworld.SkillRow, rate float32) (int64, uint16) {
+	if !skill.Consumption.Pinned || skill.Group == 0 {
+		return 0, 0x3003
+	}
+	cost := int64(skill.Consumption.MP) + vitalPercent(maxMP, uint32(skill.Consumption.MPPercent))
+	cost = crtFtol(float64(rate) / 100 * float64(int32(cost)))
+	if cost > currentMP {
+		return 0, 0x3004
+	}
+	return cost, 0
+}
+
+/*
+==================
+hpCostRefusal
+
+Natively the HP cost is the flat word plus the percent of maximum
+HP (truncated); current HP below it refuses 0x3013. The HP check runs
+before the MP check.
+==================
+*/
+func hpCostRefusal(currentHP, maxHP int64, skill enterworld.SkillRow) uint16 {
+	cost := int64(skill.Consumption.HP) + vitalPercent(maxHP, uint32(skill.Consumption.HPPercent))
+	if cost > 0 && currentHP < cost {
+		return 0x3013
+	}
+	return 0
+}
+
+/*
+================
+offensiveResourceCost
+
+offensiveResourceCost is the HP check, then resourceCostAt on the
+caster's keeper maximum (param 4), stored current MP and parameter 0x8D.
+================
+*/
+func (rt *Runtime) offensiveResourceCost(division string, c *enterworld.Character, skill enterworld.SkillRow) (int64, uint16) {
+	skill.Consumption = rt.sookManaConsumption(division, c, skill.Consumption, rt.Now().UnixMilli())
+	stats, _, err := rt.playerCombatStats(division, c)
+	maxHP, maxMP, currentHP, currentMP := keeperVitalsFrom(c, stats, err)
+	return resourceCostVerdict(maxHP, maxMP, currentHP, currentMP, stats, err, skill)
+}
+
+/*
+==================
+resourceCostVerdict
+
+offensiveResourceCost on keeper vitals and a projection the caller
+already holds: the HP check, then resourceCostAt on the keeper
+maximum (param 4), the stored current MP and parameter 0x8D. The
+waiting cast judges through here on its memoised stats (#2139), so
+the wait and release verdicts cannot drift apart.
+==================
+*/
+func resourceCostVerdict(maxHP, maxMP, currentHP, currentMP int64, stats combat.Stats, err error, skill enterworld.SkillRow) (int64, uint16) {
+	return resourceCostVerdictFor(maxHP, maxMP, currentHP, currentMP, stats, err, skill.Consumption, skill.Group)
+}
+
+/*
+==================
+resourceCostVerdictFor
+
+resourceCostVerdict on the price shape alone: the waiting cast's
+prepared snapshot carries only the consumption and group, and the
+verdict reads nothing else of the row (#2139).
+==================
+*/
+func resourceCostVerdictFor(maxHP, maxMP, currentHP, currentMP int64, stats combat.Stats, err error, consumption enterworld.SkillConsumption, group uint32) (int64, uint16) {
+	skill := enterworld.SkillRow{Consumption: consumption, Group: group}
+	if refusal := hpCostRefusal(currentHP, maxHP, skill); refusal != 0 {
+		return 0, refusal
+	}
+	// A row that costs no MP is free at any rate; only a cost reads it.
+	rate := float32(combat.FullMPConsumptionRate)
+	if skill.Consumption.MP != 0 || skill.Consumption.MPPercent != 0 {
+		if err != nil {
+			return 0, 0x3003
+		}
+		rate = combat.MPConsumptionRate(stats)
+	}
+	return resourceCostAt(currentMP, maxMP, skill, rate)
+}
+
+/*
+================
+offensiveCost
+
+offensiveCost is the full check for a new cast: data, cooldown, then MP.
+================
+*/
+func (rt *Runtime) offensiveCost(division string, c *enterworld.Character, skill enterworld.SkillRow, nowMs int64) (int64, uint16) {
+	return rt.checkedCost(division, c, skill, nowMs, true)
+}
+
+/*
+================
+checkedCost
+
+The one owner of the fresh-cast checks, in the server's order: data
+(0x3003), cooldown (0x3005) unless cooldown is false, then resources. A
+linked chain stage passes false (stagePhaseCost).
+================
+*/
+func (rt *Runtime) checkedCost(division string, c *enterworld.Character, skill enterworld.SkillRow, nowMs int64, cooldown bool) (int64, uint16) {
+	if !skill.Consumption.Pinned || skill.Group == 0 || nowMs < 0 {
+		return 0, 0x3003
+	}
+	if cooldown && skillCoolingDown(c, skill, nowMs) {
+		return 0, 0x3005
+	}
+	return rt.offensiveResourceCost(division, c, skill)
+}
+
+/*
+==================
+skillCoolingDown
+
+The native cooldown availability check, negated. A nonzero shared
+group (ref+8F) reads the group map, otherwise the skill's own entry. The
+deadline itself is already available.
+==================
+*/
+func skillCoolingDown(c *enterworld.Character, skill enterworld.SkillRow, nowMs int64) bool {
+	return skillCooldownDeadline(c, skill) > nowMs
+}
+
+/*
+==================
+skillCooldownDeadline
+
+When the skill's cooldown entry expires (0 when none applies). The native check
+bypasses both maps for an authored zero duration; a shared group selects
+its own map and does not also consult the skill map.
+==================
+*/
+func skillCooldownDeadline(c *enterworld.Character, skill enterworld.SkillRow) int64 {
+	if skill.CoolTimeMs == 0 {
+		return 0
+	}
+	if skill.CoolTimeGroup != 0 {
+		return c.SharedSkillCooldowns[skill.CoolTimeGroup]
+	}
+	return c.OffensiveSkillCooldowns[skill.Group]
+}
+
+/*
+==================
+offensivePhaseCost
+
+The check and the amount for one phase of a cast. A released cast
+(prepared != nil) rechecks MP but not the cooldown its own preparation
+installed, and is charged its prepared snapshot. A fresh cast is checked
+in full and charged a new snapshot.
+==================
+*/
+func (rt *Runtime) offensivePhaseCost(division string, c *enterworld.Character, skill enterworld.SkillRow, now int64, prepared *pendingProjectileCast) (skillCharge, uint16) {
+	return rt.phaseCost(division, c, skill, now, prepared, true)
+}
+
+/*
+==================
+stagePhaseCost
+
+offensivePhaseCost for one stage of a skill sequence. A linked stage
+(rootID != 0) is admitted without the cooldown (the skill-cast auto command returns the linked
+row to admission state 2, see acceptSkillStagePhaseAt) and its cost check
+skips it too: the stage rows share the root's group, whose cooldown the
+root installed when it fired, so checking it refused every second hit of
+a chain with a cooldown (Windless Spear) with 0x3005. Each stage still pays
+its own resources.
+==================
+*/
+func (rt *Runtime) stagePhaseCost(division string, c *enterworld.Character, skill enterworld.SkillRow, now int64, prepared *pendingProjectileCast, rootID uint32) (skillCharge, uint16) {
+	return rt.phaseCost(division, c, skill, now, prepared, rootID == 0)
+}
+
+/*
+==================
+phaseCost
+
+The shared body of offensivePhaseCost and stagePhaseCost; cooldown says
+whether a fresh phase checks the skill's cooldown.
+==================
+*/
+func (rt *Runtime) phaseCost(division string, c *enterworld.Character, skill enterworld.SkillRow, now int64, prepared *pendingProjectileCast, cooldown bool) (skillCharge, uint16) {
+	if prepared != nil {
+		if _, refusal := rt.offensiveResourceCost(division, c, skill); refusal != 0 {
+			return skillCharge{}, refusal
+		}
+		return prepared.executionCost, 0
+	}
+
+	if _, refusal := rt.checkedCost(division, c, skill, now, cooldown); refusal != 0 {
+		return skillCharge{}, refusal
+	}
+	cost, err := rt.preparedExecutionMPCost(division, c, skill)
+	if err != nil {
+		return skillCharge{}, 0x3003
+	}
+	return skillCharge{mp: cost, hp: rt.preparedExecutionHPCost(division, c, skill)}, 0
+}
+
+/*
+================
+skillCharge
+
+skillCharge is the prepared snapshot the native cast stores on the context: HP at
++0x10, MP at +0x14. Release charges it as prepared.
+================
+*/
+type skillCharge struct{ mp, hp int64 }
+
+/*
+================
+preparedExecutionHPCost
+
+The flat word plus the percent of CURRENT HP (admission uses maximum HP).
+A persistent cast divides on x87 before multiplying. Instant and
+projectile casts instead wrap a signed 32-bit product before dividing by 100;
+the same prepared-cost arithmetic owns MP. HP never applies the MP rate.
+================
+*/
+func (rt *Runtime) preparedExecutionHPCost(division string, c *enterworld.Character, skill enterworld.SkillRow) int64 {
+	_, _, currentHP, _ := rt.playerKeeperVitals(division, c)
+	return int64(combat.PreparedCost(uint32(currentHP), uint32(skill.Consumption.HP),
+		skill.Consumption.HPPercent, skill.TimedEffect.Pinned, false, 0))
+}
+
+/*
+===============================================================================
+
+PREPARED SNAPSHOT
+
+===============================================================================
+*/
+
+/*
+==================
+preparedExecutionMPCost
+
+The charged amount (combat.PreparedCost) at the caster's parameter 0x8D
+rate, then its MP Decrease cuts. Instant and persistent casts take the
+cuts; the projectile action, picked by RefSkill+0x168 in
+the native skill action handler, does not. The rate is 100 until a dcmp buff
+(Dancing of Mana) lowers it.
+==================
+*/
+func (rt *Runtime) preparedExecutionMPCost(division string, c *enterworld.Character, skill enterworld.SkillRow) (int64, error) {
+	if rt.sookPowerActive(division, c, sookMana, rt.Now().UnixMilli()) {
+		return 0, nil
+	}
+	stats, _, err := rt.playerCombatStats(division, c)
+	if err != nil {
+		return 0, err
+	}
+	_, _, _, currentMP := keeperVitalsFrom(c, stats, nil)
+	cost := combat.PreparedCost(uint32(currentMP), skill.Consumption.MP,
+		skill.Consumption.MPPercent, skill.TimedEffect.Pinned, true, combat.MPConsumptionRate(stats))
+	if skill.ActionHandler != enterworld.SkillActionProjectile {
+		cost = combat.ApplyMPDecrease(cost, skill.Attack.Parameters, stats.SkillParameters)
+	}
+	return int64(cost), nil
+}
+
+/*
+==================
+vitalPercent
+
+percent of a vital as the native cost code forms it: fild vital, fild
+percent, fdiv 100.0, fmulp, then truncation.
+The division comes first, so this is vital * (percent / 100), which is not
+(vital * percent) / 100: 41 % of 300 is 122 here.
+==================
+*/
+func vitalPercent(vital int64, percent uint32) int64 {
+	if percent == 0 {
+		return 0
+	}
+	return crtFtol(float64(int32(vital)) * (float64(percent) / 100))
+}
+
+/*
+===============================================================================
+
+CHARGING
+
+===============================================================================
+*/
+
+/*
+================
+commitOffensivePhaseCost
+
+commitOffensivePhaseCost charges HP and MP: a released cast pays its snapshot,
+a fresh cast also starts its cooldown.
+================
+*/
+func (rt *Runtime) commitOffensivePhaseCost(division string, c *enterworld.Character, skill enterworld.SkillRow, cost skillCharge, now int64, prepared bool) {
+	if prepared {
+		rt.commitOffensiveResources(division, c, cost)
+		return
+	}
+	rt.commitOffensiveCost(division, c, skill, cost, now)
+}
+
+/*
+================
+commitOffensiveCost
+
+================
+*/
+func (rt *Runtime) commitOffensiveCost(division string, c *enterworld.Character, skill enterworld.SkillRow, cost skillCharge, nowMs int64) {
+	rt.commitOffensiveResources(division, c, cost)
+	rt.registerPlayerSkillCooldown(division, c, skill, nowMs)
+}
+
+/*
+================
+commitOffensiveResources
+
+commitOffensiveResources is the native resource consumption: MP through ConsumeMana, HP
+clamped to leave 1 (a skill's HP cost never kills).
+================
+*/
+func (rt *Runtime) commitOffensiveResources(division string, c *enterworld.Character, cost skillCharge) {
+	if rt.sookPowerActive(division, c, sookMana, rt.Now().UnixMilli()) {
+		cost.mp = 0
+	}
+	_, maxMP, currentHP, currentMP := rt.playerKeeperVitals(division, c)
+	mp := int64(combat.ConsumeMana(uint32(currentMP), uint32(maxMP), int32(cost.mp)))
+	c.CurrentMP = &mp
+	if hp := max(0, cost.hp); hp != 0 {
+		if hp >= currentHP {
+			hp = max(0, currentHP-1)
+		}
+		left := currentHP - hp
+		c.CurrentHP = &left
+	}
+}
+
+/*
+==================
+registerOffensiveCooldown
+
+Drops expired entries, then starts the skill's cooldown. A nonzero ref+8F
+also starts the shared group's.
+==================
+*/
+func registerOffensiveCooldown(c *enterworld.Character, skill enterworld.SkillRow, nowMs int64) {
+	if c.OffensiveSkillCooldowns == nil {
+		c.OffensiveSkillCooldowns = map[uint32]int64{}
+	}
+	for group, until := range c.OffensiveSkillCooldowns {
+		if until <= nowMs {
+			delete(c.OffensiveSkillCooldowns, group)
+		}
+	}
+	for group, until := range c.SharedSkillCooldowns {
+		if until <= nowMs {
+			delete(c.SharedSkillCooldowns, group)
+		}
+	}
+	if skill.CoolTimeMs == 0 {
+		return
+	}
+
+	until := nowMs + int64(skill.CoolTimeMs)
+	c.OffensiveSkillCooldowns[skill.Group] = until
+	if skill.CoolTimeGroup != 0 {
+		if c.SharedSkillCooldowns == nil {
+			c.SharedSkillCooldowns = map[uint8]int64{}
+		}
+		c.SharedSkillCooldowns[skill.CoolTimeGroup] = until
+	}
+}
+
+/*
+================
+offensiveRefusal
+
+offensiveRefusal is the cast result (wire.OpSkillCastResult) {2, code}.
+It is the actor's alone, so it is also the ActorPrivate tail: a refusal
+produced by the simulation tick (a pursuit that arrives in range, then fails
+admission) reaches the actor beside the tick's public frames instead of
+being dropped or published to peers.
+================
+*/
+func offensiveRefusal(code uint16) OpResult {
+	payload := wire.NewWriter(2).U8(2).U8(uint8(code)).Payload()
+	frame := wire.Frame{Opcode: wire.OpSkillCastResult, Payload: payload}
+	return OpResult{Frames: []wire.Frame{frame}, ActorPrivate: []wire.Frame{frame}}
+}

@@ -1,0 +1,269 @@
+/*
+===========================================================================
+
+overhead-layout.ts - the rows stacked over a character's name
+
+The guild or companion-owner row, the vitals (quick status), the fortress mark and
+crest, a stall's title, and (port-only, #2958) a 5-star caravan's star
+row over its transport; speech rises above the highest row.
+withoutBoardPass is the same stack with the /id byte clear: only the stall
+title and speech board remain. A Contributor's title (port-only, #3358)
+is no row of its own: it rides the name board, left of the name, as
+the owner asked (titledNameRow).
+
+===========================================================================
+*/
+import { iconPath } from "./icon";
+import type { EntityState } from "@/engine/contracts/world";
+import type { GameplayState } from "@/engine/contracts/gameplay";
+import type { GameOptions } from "@/engine/foundation/gameplay/game-options";
+import type { UiQuad } from "@/engine/contracts/ui";
+import { quickStatus } from "./quick-status";
+import { fortressActive, fortressStatus } from "@/engine/foundation/gameplay/fortress";
+import { STALL_TITLE_MODE } from "@/engine/foundation/gameplay/interaction-approach";
+import { NAME_COLOR_WHITE, nameColorRgba } from "@/engine/foundation/gameplay/name-color";
+import { TRADE_STARS_MAX, tradeStarTint } from "@/engine/foundation/gameplay/cos-trade-info";
+
+// CICCos 855CBC subtracts the double 20.0 at C46198 before drawing the owner.
+const COMPANION_OWNER_Y = -20;
+// 854B95..854C02's tid-word gates: low byte 0xC6 and band 5 (server's
+// MercenaryBand): every guild soldier reference carries this one word.
+const GUILD_SOLDIER_TID_WORD = 0x29c6;
+// The stall title (the +0x464 board) rides this far above the highest row.
+const STALL_TITLE_RISE = 20;
+// Port-only (#2958): a 5-star caravan's star row over its transport. The
+// art and the 5-star tint are the transport bag's own (6A7DD0,
+// cos-trade-info.ts); the row rides this far above the highest row.
+const CARAVAN_STAR_PATH = "/assets/images/Media_extracted/interface/ifcommon/com_star.png";
+const CARAVAN_STAR_RISE = 20;
+// Port-only, not native (#3358): a rostered player's Contributor title,
+// yellow (0xffff00) as the owner asked, on the name board left of the
+// name, in the guild and fortress wars too (owner, 2026-11-14), not on
+// a row of its own. v1.150 has no such placement to copy: its one
+// player title, the fortress officer title, rides the guild row as
+// "[Guild(Title)]" (client 86BA5F). The roster is the server's word
+// (contributor-titles.ts); with SRO_CONTRIBUTOR_TITLES off no frame
+// arrives and no title ever shows.
+export const CONTRIBUTOR_TITLE_TEXT = "Contributor";
+export const CONTRIBUTOR_TITLE_COLOR = [ 1, 1, 0, 1 ] as const;
+// The gap between the title and the name on the board, in pixels.
+export const TITLE_NAME_GAP = 4;
+
+/*
+================
+titledNameRow
+
+The name board's one line with a title in front: the title's left edge
+and the name's, both relative to the board's centre, so the pair is
+centred together as one board. With no title the name is centred alone,
+exactly as before.
+================
+*/
+export function titledNameRow( titleWidth: number, nameWidth: number ) {
+	const lead = titleWidth > 0 ? titleWidth + TITLE_NAME_GAP : 0,
+		total = lead + nameWidth,
+		left = -(total >> 1);
+	return { left, nameLeft: left + lead, total };
+}
+
+/*
+================
+companionOwnerShown
+
+CICCos 855C40 draws the owner board, and lifts the anchor the status gauge
+then uses, only with a non-empty owner name (+78C) and the Options
+"Monster names" byte (+E) set (855C51..855C67).
+================
+*/
+function companionOwnerShown( entity: EntityState, options: GameOptions ): boolean {
+	return entity.kind === "cos" && !!entity.ownerName && options.monsterNames;
+}
+
+/*
+================
+companionOwnerNameplate
+
+854B54 copies the visible owner's name color into the COS owner board
+(+794); with no visible owner, 854C0E paints it white. The spawn's owner
+name stays either way.
+================
+*/
+export function companionOwnerNameplate(
+	entity: EntityState,
+	owner: EntityState | undefined,
+	options: GameOptions,
+	ownerGuildColour?: UiQuad["color"]
+) {
+	if ( !companionOwnerShown( entity, options ) ) return null;
+	const user = owner?.gid === entity.ownerGid && (owner?.kind === "player" || owner?.kind === "local-player");
+	// 854B95..854C21: a guild soldier's owner board deviates. With the
+	// owner visible it takes the owner guild label colour (the guild row
+	// colour above, computed by the caller for the owner entity), and
+	// 854C0C skips the white reset when the owner is absent, so it keeps
+	// its own name colour instead of painting white.
+	if ( entity.tidWord === GUILD_SOLDIER_TID_WORD ) {
+		return {
+			text: entity.ownerName ?? "",
+			color: user && ownerGuildColour ?
+				ownerGuildColour :
+				user ?
+				nameColorRgba( owner.nameColor ?? NAME_COLOR_WHITE ) :
+				nameColorRgba( entity.nameColor ?? NAME_COLOR_WHITE ),
+			y: COMPANION_OWNER_Y
+		};
+	}
+	return {
+		text: entity.ownerName ?? "",
+		color: nameColorRgba( user ? owner.nameColor ?? NAME_COLOR_WHITE : NAME_COLOR_WHITE ),
+		y: COMPANION_OWNER_Y
+	};
+}
+
+/*
+================
+overheadLayout
+
+85F4A0 dispatches kind 4 independently of the base-name gate. 86B350
+consumes 20 pixels for the guild row, then 85F660 consumes 25 for vitals.
+================
+*/
+export function overheadLayout(
+	entity: EntityState,
+	local: EntityState | undefined,
+	game: GameplayState,
+	options: GameOptions,
+	copy: ( key: string ) => string = () => ""
+) {
+	const social = game.social, own = entity.gid === game.localGid;
+	const guild = own ? social?.guild : undefined, name = own ? guild?.name : entity.guildName;
+	const grant = own ? guild?.members.find( m => m.name === social?.localName )?.grant : entity.guildGrantName;
+	const hold = entity.equipment?.find( i => i.slot === 8 )?.typeFlags;
+	const plain = hold === undefined || ![ 0x800, 0x1000, 0x1800 ].includes( hold & 0xf800 );
+	// +7E0 is a guild office bit, not a separate attacker/defender team.
+	const role = social?.roleUpdates?.find( r => r.name === entity.name )?.role ??
+		(own ? guild?.members.find( m => m.name === social?.localName )?.role : entity.guildWarTeam);
+	const roleKey = ({
+		1: "COMMANDER",
+		2: "SUBCOMMANDER",
+		4: "BATTLEMANAGER",
+		8: "PRODUCTMANAGER",
+		16: "TRAINERMANAGER",
+		32: "ENGINEER"
+	} as Record<number, string>)[role ?? 0];
+	const roleText = roleKey && game.fortress &&
+			(fortressActive( game.fortress ) || game.fortress.wars.some( w => w.name === name )) ?
+		copy( "UIIT_STT_FORT_GUILD_" + roleKey ) :
+		"";
+	const guildText = options.guildNames && plain && name ?
+		"[" + name + (grant ? " * " + grant : "") + (roleText ? (grant ? "" : " * ") + "(" + roleText + ")" : "") +
+		"]" :
+		"";
+	const color: UiQuad["color"] = name && name === social?.guild?.name ?
+		[ 254 / 255, 173 / 255, 46 / 255, 1 ] :
+		social?.alliances?.some( g => g.name === name ) ?
+		[ 160 / 255, 254 / 255, 104 / 255, 1 ] :
+		social?.wars?.some( w => w.name === name ) ?
+		[ 1, 0, 0, 1 ] :
+		[ 102 / 255, 185 / 255, 1, 1 ];
+	// Port-only, not native (#3358): the Contributor title in front of a
+	// rostered player's name, the local player's own included; the board
+	// pass below hides it with the name board's other rows.
+	const contributorText = (entity.kind === "player" || entity.kind === "local-player") && entity.name &&
+			game.contributorTitles?.includes( entity.name ) ?
+		CONTRIBUTOR_TITLE_TEXT :
+		"";
+	const status = quickStatus( entity, local, game, options ),
+		guildY = guildText ? -20 : 0,
+		ownerY = companionOwnerShown( entity, options ) ? COMPANION_OWNER_Y : 0,
+		statusY = Math.min( guildY, ownerY ) - (status ? 25 : 0);
+	let fortressMark: { path: string; y: number; } | null = null;
+	const war = game.fortress, team = role, targetGuild = own ? guild?.id : entity.guildId;
+	if ( options.fortressNames && war && fortressActive( war ) && targetGuild && (team === 1 || team === 2) ) {
+		const localGuild = social?.guild?.id ?? 0,
+			verdict = fortressStatus( war, localGuild, targetGuild, social?.alliances?.map( a => a.id ) ?? [] );
+		const kind = verdict === 0xc9 || verdict === 0xcb ?
+			"fortress" :
+			verdict === 0xca || verdict === 0xcc && war.registered.includes( localGuild ) ?
+			"defensive" :
+			verdict === 0xcc ?
+			"aggressive" :
+			null;
+		if ( kind ) {
+			fortressMark = {
+				path: "/assets/images/Media_extracted/icon/etc/mark_" + kind + (team + 1) + ".png",
+				y: -(options.guildNames ? 64 : 44) - (own ?
+					options.ownStatus ? 16 : 0 :
+					options.partyStatus && social?.members.some( m => m.name === entity.name ) ?
+					16 :
+					0)
+			};
+		}
+	}
+	const ownerFortress = game.fortress?.wars.find( w => w.name === name ),
+		fortressCrest = ownerFortress ?
+			iconPath( game.fortress?.fortresses.find( f => f.id === ownerFortress.id )?.icon ) :
+			null;
+	// 751430 / 86A26D: a stall's title rides above the rest (SetOverheadStallTitle, 0xFFFEB5FF).
+	// 869750 (SetStallName) stores the title bracketed - "[" + title + "]" - and the
+	// spawn row (869DF0) and the 0x30DF open both draw that bracketed form; only the
+	// 0x34B7 rename handler passes the raw packet string to the board, the one native
+	// slip. entity.titleText stays raw for the stall window; the board brackets here.
+	const stallText = entity.appearanceState?.[6] === STALL_TITLE_MODE && entity.titleText ?
+			"[" + entity.titleText + "]" :
+			"",
+		stallY = statusY - (stallText ? STALL_TITLE_RISE : 0);
+	// Port-only, not native (#2958): the fifth star shows on the
+	// transport's nameplate, five stars in the bag window's row and tint,
+	// above every other row; speech rises above it in turn.
+	const caravanMark = entity.kind === "cos" && game.caravanStars?.includes( entity.gid ) ?
+			{ path: CARAVAN_STAR_PATH, tint: tradeStarTint( TRADE_STARS_MAX ), y: stallY - CARAVAN_STAR_RISE } :
+			null,
+		speechY = caravanMark ? caravanMark.y : stallY;
+	return {
+		fortressCrest,
+		guildText,
+		guildColor: color,
+		guildY,
+		contributorText,
+		contributorColor: CONTRIBUTOR_TITLE_COLOR,
+		status,
+		statusY,
+		speechY,
+		fortressMark,
+		caravanMark,
+		stallText,
+		stallY
+	};
+}
+
+export type OverheadLayout = ReturnType<typeof overheadLayout>;
+
+/*
+================
+withoutBoardPass
+
+The overhead stack while the /id byte (0xCCB5D8) is clear. 85F5DC branches
+past both the name board and the kind-4 overhead pass (vtable+0x3C at
+85F5FD), so no guild row, fortress mark or crest, companion-owner row or
+quick-status gauge draws, and none of them lifts the board anchor (+0x4E4;
+86B350, 855C40 and 85F660 each subtract their row). The +0x464 board (stall
+title or speech) is past the branch at 85F609 and still draws, from the
+unlifted anchor.
+================
+*/
+export function withoutBoardPass( layout: OverheadLayout ): OverheadLayout {
+	const stallY = layout.stallText ? -STALL_TITLE_RISE : 0;
+	return {
+		...layout,
+		fortressCrest: null,
+		guildText: "",
+		guildY: 0,
+		contributorText: "",
+		status: null,
+		statusY: 0,
+		fortressMark: null,
+		caravanMark: null,
+		speechY: stallY,
+		stallY
+	};
+}

@@ -1,0 +1,85 @@
+/*
+===========================================================================
+
+loot.go - party-owned rotating pickup recipients
+
+Retail moves the first member entry to the tail and returns its GID
+(the reference server erases the head of its member list and re-inserts
+it at the end). Pickup eligibility is evaluated by the action owner after
+this rotation;
+the party half of it (may a member take another member's drop) lives here,
+so the GameWorld wiring and the action tests share one rule.
+
+===========================================================================
+*/
+package party
+
+/*
+================
+NextLootMember
+
+Reconcile the rotation against current membership without changing roster
+order. The same registry lock owns joins, leaves and the pickup cursor.
+Callers ask while they choose the recipient, before any grant: the
+reference server's two recipient selections (the player's ground pickup
+and the pet's) both rotate first, so a pickup refused afterwards still
+spends the member's turn (#3423).
+================
+*/
+func (r *Registry) NextLootMember(division, name string) uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p := r.byKey[memberKey(division, name)]
+	if p == nil || p.optionBits&PartyOptionItemShare == 0 {
+		return 0
+	}
+	members := make(map[uint32]bool, len(p.members))
+	for _, member := range p.members {
+		members[member.MemberID] = true
+	}
+	order := p.lootOrder[:0]
+	for _, gid := range p.lootOrder {
+		if members[gid] {
+			order = append(order, gid)
+			delete(members, gid)
+		}
+	}
+	for _, member := range p.members {
+		if members[member.MemberID] {
+			order = append(order, member.MemberID)
+		}
+	}
+	if len(order) == 0 {
+		p.lootOrder = nil
+		return 0
+	}
+	gid := order[0]
+	copy(order, order[1:])
+	order[len(order)-1] = gid
+	p.lootOrder = order
+	return gid
+}
+
+/*
+================
+CanPickupOwnedDrop
+
+A character may take a drop reserved to ownerJID when both are in the same
+party and that party shares items. Self-ownership is the action owner's
+check, not this one. The action runtime takes this as CanPickupOwnedDrop.
+================
+*/
+func (r *Registry) CanPickupOwnedDrop(divisionID, characterName string, ownerJID uint32) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p := r.byKey[memberKey(divisionID, characterName)]
+	if p == nil || p.optionBits&PartyOptionItemShare == 0 {
+		return false
+	}
+	for _, member := range p.members {
+		if member.MemberID == ownerJID {
+			return true
+		}
+	}
+	return false
+}

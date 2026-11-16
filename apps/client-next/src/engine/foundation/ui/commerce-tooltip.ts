@@ -1,0 +1,139 @@
+/*
+===========================================================================
+
+commerce-tooltip.ts - authoritative prices at the tooltip context boundary
+
+An item describes its properties; an offer describes the transaction price.
+Keep these separate so identical item instances in different shops, packages,
+and buyback entries do not inherit a cached or guessed price.
+
+===========================================================================
+*/
+
+import type { GameplayState } from "@/engine/contracts/gameplay";
+import type { MallOffer } from "@/engine/contracts/item-mall";
+import {
+	SHOP_CURRENCY_GUILD_POINT,
+	SHOP_CURRENCY_HONOR,
+	SHOP_CURRENCY_NASRUN_TOKEN,
+	type ShopPrice
+} from "@/engine/foundation/gameplay/commerce";
+import type { TooltipRow } from "./tooltip-rows";
+
+const PRICE_COLOR = 0xffffffff;
+
+/*
+================
+CommerceLabels
+
+The localized words of a price line.
+================
+*/
+export interface CommerceLabels {
+	readonly price: string;
+	readonly gold: string;
+	readonly honor: string;
+	readonly point: string;
+	readonly guildPoint: string;
+	readonly guildPointUnit: string;
+	// Port-only (SRO_NASRUN): no native string names the token, so the
+	// caller passes the port's own words.
+	readonly nasrunToken: string;
+	readonly nasrunTokenHeld: string;
+}
+
+/*
+================
+commerceTooltip
+
+Native 5592B0 appends the active slot's transaction price after item details.
+Its package branch at 559AF6 prices the package once, not each contained item.
+The server's decimal-string quote already includes merchant adjustments;
+preserve it without narrowing 64-bit gold through a JavaScript number. An
+honor-priced package (payment index 5) prints "%s : %I64d%s" with
+UIIT_STT_TC_HONOR_POINT and UIIT_STT_SILKMALL_P_POINT (559FA8). A package
+with several price rows gets one line each, in payment order (559AF6 walks
+indexes 0..5): gold, then guild points (index 3, UIIT_STT_GUILD_POINT and
+UIIT_STT_GUILD_POINT_GP), then honor.
+================
+*/
+export function commerceTooltip(
+	id: string,
+	game: Pick<GameplayState, "shop">,
+	labels: CommerceLabels
+): readonly TooltipRow[] {
+	const shop = game.shop;
+	if ( !shop || shop.error ) return [];
+	let rows: readonly ShopPrice[] = [];
+	if ( id.startsWith( "shop-offer:" ) ) {
+		const offer = shop.offers[Number( id.slice( "shop-offer:".length ) )];
+		if ( offer ) rows = offer.prices ?? [ { currency: offer.currency ?? 0, amount: offer.price } ];
+	} else if ( id.startsWith( "shop-buyback:" ) ) {
+		const price = shop.buyback?.[Number( id.slice( "shop-buyback:".length ) )]?.price;
+		if ( price !== undefined ) rows = [ { currency: 0, amount: price } ];
+	}
+	if ( !rows.length ) return [];
+	const lines = rows.map( row => ({ value: priceLine( row, labels ), color: PRICE_COLOR }) );
+	// A token offer also shows the balance it is paid from.
+	if ( rows.some( row => row.currency === SHOP_CURRENCY_NASRUN_TOKEN ) && shop.nasrunTokens !== undefined ) {
+		lines.push( { value: `${labels.nasrunTokenHeld} : ${shop.nasrunTokens}`, color: PRICE_COLOR } );
+	}
+	return [ { value: " ", color: 0 }, ...lines ];
+}
+
+/*
+================
+priceLine
+================
+*/
+function priceLine(
+	row: ShopPrice,
+	labels: CommerceLabels
+) {
+	if ( row.currency === SHOP_CURRENCY_HONOR ) return `${labels.honor} : ${row.amount}${labels.point}`;
+	if ( row.currency === SHOP_CURRENCY_NASRUN_TOKEN ) return `${labels.nasrunToken} : ${row.amount}`;
+	if ( row.currency === SHOP_CURRENCY_GUILD_POINT ) {
+		return `${labels.guildPoint} : ${row.amount}${labels.guildPointUnit}`;
+	}
+	return `${labels.price} : ${row.amount} ${labels.gold}`;
+}
+
+/*
+================
+MallLabels
+
+The localized words of a mall price line.
+================
+*/
+export interface MallLabels {
+	readonly rollOfCloth: string;
+	readonly silk: string;
+	readonly giftSilk: string;
+}
+
+/*
+================
+mallTooltipRows
+
+The item-mall leg of 5592B0 (pane 0xf): the package price object's silk
+rows, "%s : %I64d%s" under the ROLL_OF_CLOTH caption - charged silk
+(+0x8, SILKMALL_SILK) and received gift silk (+0xC,
+SILK_INQUIRY_GET_SILK) - each only where its currency bit is authored,
+at zero as elsewhere (mallCurrencyRows). The object's gold, guild,
+war and honor rows cannot occur here: the mall catalogue admits mask
+bits 2/4/16 only (item-mall-catalog.ts).
+================
+*/
+export function mallTooltipRows(
+	offer: MallOffer,
+	labels: MallLabels
+): readonly TooltipRow[] {
+	const lines: string[] = [];
+	if ( offer.currencyMask & 2 ) lines.push( `${labels.rollOfCloth} : ${offer.silk}${labels.silk}` );
+	if ( offer.currencyMask & 4 ) lines.push( `${labels.rollOfCloth} : ${offer.giftSilk}${labels.giftSilk}` );
+	if ( !lines.length ) return [];
+	return [
+		{ value: " ", color: 0 },
+		...lines.map( value => ({ value, color: PRICE_COLOR }) )
+	];
+}

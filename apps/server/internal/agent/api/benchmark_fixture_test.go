@@ -1,0 +1,401 @@
+/*
+===========================================================================
+
+benchmark_fixture_test.go - the development scenario reset, end to end
+
+Requests go through the authenticated handler into a test authority store:
+the reset's exactness and idempotence, and the optional loadout.
+
+===========================================================================
+*/
+package agentapi
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/domain/charactervitals"
+)
+
+func benchmarkFixtureRequest(characterName string) map[string]any {
+	return map[string]any{
+		"characterName": characterName,
+		"fixtureId":     "europe-field-ordinary-run-v1",
+		"movementMode":  3,
+		"spawn": map[string]any{
+			"regionId": 0x6e4a,
+			"x":        1756.0,
+			"y":        7.0,
+			"z":        525.0,
+			"angle":    0x4000,
+		},
+	}
+}
+
+func postBenchmarkFixtureReset(t *testing.T, handler http.Handler, body any) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, BenchmarkFixtureResetPath, bytes.NewReader(payload))
+	declareBrowser(request)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	var response map[string]any
+	if recorder.Body.Len() > 0 && recorder.Header().Get("Content-Type") == "application/json" {
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return recorder, response
+}
+
+func TestBenchmarkFixtureResetRouteIsAbsentByDefault(t *testing.T) {
+	api, _ := newTestAPI(t)
+	recorder, _ := postBenchmarkFixtureReset(t, authenticatedHandler(t, api, testAccount), benchmarkFixtureRequest("FixtureHero"))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("disabled fixture route = %d, want 404", recorder.Code)
+	}
+}
+
+func TestBenchmarkFixtureResetIsAuthenticatedExactIdempotentAndStateScoped(t *testing.T) {
+	api, authority := newTestAPI(t)
+	api.benchmarkFixtureControl = true
+	handler := authenticatedHandler(t, api, testAccount)
+	postJSON(t, handler, "/character/create", createBody("FixtureHero"))
+	character := authority.Characters().CharactersForDivision(testDivision)[0]
+	rebirthRegion, returnRegion, dungeonFloor := int64(0x62a8), int64(0x7e7e), int64(4)
+	oldRegion, oldAngle, oldMode := int64(0x6d49), int64(7), int64(1)
+	oldX, oldY, oldZ := 1639.0, -10.0, 1150.0
+	authority.MutateCharacter(character, "seed benchmark fixture reset", func() {
+		character.World = &domain.CharacterWorld{
+			Spawn:              &domain.WorldSpawn{RegionID: &oldRegion, X: &oldX, Y: &oldY, Z: &oldZ, Angle: &oldAngle},
+			AuthoredAreaReturn: &domain.WorldSpawn{RegionID: &returnRegion},
+			RebirthPoint:       &domain.WorldSpawn{RegionID: &rebirthRegion},
+			MovementMode:       &oldMode,
+			DungeonFloorIndex:  &dungeonFloor,
+			UpdatedAt:          "preserve-me",
+			MoveSegment:        json.RawMessage(`{"moving":true}`),
+		}
+	})
+
+	recorder, response := postBenchmarkFixtureReset(t, handler, benchmarkFixtureRequest("FixtureHero"))
+	if recorder.Code != http.StatusOK || response["ok"] != true || response["outcome"] != "reset" {
+		t.Fatalf("fixture reset = %d %#v", recorder.Code, response)
+	}
+	authority.ReadCharacters(testDivision, func([]*domain.Character) {
+		world := character.World
+		if world == nil || !worldSpawnIsSettled(world.Spawn) || *world.Spawn.RegionID != 0x6e4a ||
+			*world.Spawn.X != 1756 || *world.Spawn.Y != 7 || *world.Spawn.Z != 525 || *world.Spawn.Angle != 0x4000 ||
+			world.MovementMode == nil || *world.MovementMode != 3 || !world.SpawnSet || !world.MovementSourceSeeded {
+			t.Fatalf("fixture world not reset exactly: %+v", world)
+		}
+		if world.AuthoredAreaReturn != nil || world.DungeonFloorIndex != nil || len(world.MoveSegment) != 0 {
+			t.Fatalf("fixture reset retained transient world state: %+v", world)
+		}
+		if world.RebirthPoint == nil || world.RebirthPoint.RegionID == nil || *world.RebirthPoint.RegionID != rebirthRegion ||
+			world.UpdatedAt != "preserve-me" {
+			t.Fatalf("fixture reset dropped unrelated world state: %+v", world)
+		}
+	})
+
+	recorder, response = postBenchmarkFixtureReset(t, handler, benchmarkFixtureRequest("FixtureHero"))
+	if recorder.Code != http.StatusOK || response["outcome"] != "already-reset" {
+		t.Fatalf("idempotent fixture reset = %d %#v", recorder.Code, response)
+	}
+
+	foreign := authenticatedHandler(t, api, "different-account")
+	recorder, response = postBenchmarkFixtureReset(t, foreign, benchmarkFixtureRequest("FixtureHero"))
+	if recorder.Code != http.StatusNotFound || response["code"] != "UNKNOWN_CHARACTER" {
+		t.Fatalf("foreign fixture reset = %d %#v", recorder.Code, response)
+	}
+}
+
+func TestBenchmarkFixtureResetRefusesLiveCharacterAndInvalidCoordinates(t *testing.T) {
+	api, _ := newTestAPI(t)
+	api.benchmarkFixtureControl = true
+	handler := authenticatedHandler(t, api, testAccount)
+	postJSON(t, handler, "/character/create", createBody("FixtureHero"))
+
+	api.acquireCharacterControl = func(string, string) (func(), bool) { return nil, false }
+	recorder, response := postBenchmarkFixtureReset(t, handler, benchmarkFixtureRequest("FixtureHero"))
+	if recorder.Code != http.StatusConflict || response["code"] != "CHARACTER_IN_PLAY" || recorder.Header().Get("Retry-After") != "1" {
+		t.Fatalf("live fixture reset = %d %#v", recorder.Code, response)
+	}
+
+	api.acquireCharacterControl = nil
+	invalid := benchmarkFixtureRequest("FixtureHero")
+	invalid["spawn"].(map[string]any)["x"] = 1920
+	recorder, response = postBenchmarkFixtureReset(t, handler, invalid)
+	if recorder.Code != http.StatusBadRequest || response["code"] != "BAD_REQUEST" {
+		t.Fatalf("invalid fixture reset = %d %#v", recorder.Code, response)
+	}
+}
+
+/*
+================
+TestBenchmarkFixtureResetAcceptsDungeonFrameSpawns
+
+Dungeon regions (the 0x8000 region bit) carry positions in the floor's own
+wide frame - the Qin-Shi Tomb nests sit thousands of units either side of
+zero - so a cave fixture pose is in range; the same coordinates outdoors,
+or a cave pose outside the frame, are still refused.
+================
+*/
+func TestBenchmarkFixtureResetAcceptsDungeonFrameSpawns(t *testing.T) {
+	api, _ := newTestAPI(t)
+	api.benchmarkFixtureControl = true
+	handler := authenticatedHandler(t, api, testAccount)
+	postJSON(t, handler, "/character/create", createBody("FixtureHero"))
+
+	dungeon := benchmarkFixtureRequest("FixtureHero")
+	spawn := dungeon["spawn"].(map[string]any)
+	spawn["regionId"], spawn["x"], spawn["y"], spawn["z"] = 0x8005, 14122.1, 667.43, -174.86
+	recorder, response := postBenchmarkFixtureReset(t, handler, dungeon)
+	if recorder.Code != http.StatusOK || response["outcome"] != "reset" {
+		t.Fatalf("dungeon fixture reset = %d %#v", recorder.Code, response)
+	}
+	if recorder, response = postBenchmarkFixtureReset(t, handler, dungeon); recorder.Code != http.StatusOK || response["outcome"] != "already-reset" {
+		t.Fatalf("repeat dungeon reset = %d %#v, want already-reset", recorder.Code, response)
+	}
+
+	outdoor := benchmarkFixtureRequest("FixtureHero")
+	spawn = outdoor["spawn"].(map[string]any)
+	spawn["x"], spawn["z"] = 14122.1, -174.86
+	if recorder, _ := postBenchmarkFixtureReset(t, handler, outdoor); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("wide-frame outdoor reset = %d, want 400", recorder.Code)
+	}
+
+	spawn = dungeon["spawn"].(map[string]any)
+	spawn["x"] = 32768
+	if recorder, _ := postBenchmarkFixtureReset(t, handler, dungeon); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("out-of-frame dungeon reset = %d, want 400", recorder.Code)
+	}
+}
+
+func TestBenchmarkFixtureResetRequiresSessionWhenEnabled(t *testing.T) {
+	api, _ := newTestAPI(t)
+	api.benchmarkFixtureControl = true
+	recorder, _ := postBenchmarkFixtureReset(t, api.Handler(), benchmarkFixtureRequest("FixtureHero"))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated fixture reset = %d, want 401", recorder.Code)
+	}
+}
+
+/*
+================
+TestBenchmarkFixtureLoadoutTeachesSkillsAndDerivesVitals
+
+A probe character gets what a scenario needs (Ghost Walk 114 and 19639 at
+a level and intellect that can pay their MP) without losing a skill it
+knew; stored vitals are cleared so login derives them full; a repeat is a
+no-op; an out-of-range loadout is refused.
+================
+*/
+func TestBenchmarkFixtureLoadoutTeachesSkillsAndDerivesVitals(t *testing.T) {
+	api, authority := newTestAPI(t)
+	api.benchmarkFixtureControl = true
+	api.skillGroup = testSkillGroups
+	api.levelCap = testLevelCap
+	handler := authenticatedHandler(t, api, testAccount)
+	postJSON(t, handler, "/character/create", createBody("FixtureHero"))
+	character := authority.Characters().CharactersForDivision(testDivision)[0]
+	hp, mp, maxLevel := int64(40), int64(25), int64(3)
+	authority.MutateCharacter(character, "seed loadout", func() {
+		character.Skills = []uint32{1, 2, 114}
+		character.CurrentHP, character.CurrentMP, character.MaxLevel = &hp, &mp, &maxLevel
+	})
+	body := benchmarkFixtureRequest("FixtureHero")
+	body["loadout"] = map[string]any{"level": 90, "intellect": 109, "skills": []uint32{114, 19639}}
+
+	recorder, response := postBenchmarkFixtureReset(t, handler, body)
+	if recorder.Code != http.StatusOK || response["outcome"] != "reset" {
+		t.Fatalf("loadout reset = %d %#v", recorder.Code, response)
+	}
+	authority.ReadCharacters(testDivision, func([]*domain.Character) {
+		if character.Level == nil || *character.Level != 90 || character.Intellect == nil || *character.Intellect != 109 ||
+			character.MaxLevel == nil || *character.MaxLevel != 90 {
+			t.Fatalf("level/intellect/maxLevel = %v/%v/%v", character.Level, character.Intellect, character.MaxLevel)
+		}
+		if got := character.Skills; len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 114 || got[3] != 19639 {
+			t.Fatalf("skills = %v, want known skills kept and 19639 added once", got)
+		}
+		if character.CurrentHP != nil || character.CurrentMP != nil {
+			t.Fatalf("stored vitals kept: hp %v mp %v", character.CurrentHP, character.CurrentMP)
+		}
+	})
+	if recorder, response = postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusOK || response["outcome"] != "already-reset" {
+		t.Fatalf("repeat = %d %#v, want already-reset", recorder.Code, response)
+	}
+	for _, loadout := range []map[string]any{
+		{"level": 0, "intellect": 109, "skills": []uint32{114}},
+		{"level": 90, "intellect": 0, "skills": []uint32{114}},
+		{"level": testLevelCap + 1, "intellect": 109, "skills": []uint32{114}},
+		{"level": 90, "intellect": 109, "skills": []uint32{0}},
+	} {
+		body["loadout"] = loadout
+		if recorder, _ := postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusBadRequest {
+			t.Fatalf("loadout %v = %d, want 400", loadout, recorder.Code)
+		}
+	}
+}
+
+/*
+================
+TestBenchmarkFixtureLoadoutSetsStrength
+
+A crowd scenario's strength reaches the character so its derived HP lets the
+peer survive the monsters it draws; zero keeps the character's own, a
+changed strength is not "already reset", and an out-of-range one is refused.
+================
+*/
+func TestBenchmarkFixtureLoadoutSetsStrength(t *testing.T) {
+	api, authority := newTestAPI(t)
+	api.benchmarkFixtureControl = true
+	api.skillGroup = testSkillGroups
+	api.levelCap = testLevelCap
+	handler := authenticatedHandler(t, api, testAccount)
+	postJSON(t, handler, "/character/create", createBody("FixtureTank"))
+	character := authority.Characters().CharactersForDivision(testDivision)[0]
+	var before int64
+	authority.ReadCharacters(testDivision, func([]*domain.Character) {
+		if character.Strength != nil {
+			before = *character.Strength
+		}
+	})
+	body := benchmarkFixtureRequest("FixtureTank")
+	body["loadout"] = map[string]any{"level": 90, "intellect": 109, "skills": []uint32{114}}
+	if recorder, _ := postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusOK {
+		t.Fatalf("strength-less loadout = %d", recorder.Code)
+	}
+	authority.ReadCharacters(testDivision, func([]*domain.Character) {
+		if character.Strength == nil || *character.Strength != before {
+			t.Fatalf("a loadout without strength changed it to %v (was %d)", character.Strength, before)
+		}
+	})
+
+	body["loadout"] = map[string]any{"level": 90, "intellect": 109, "strength": 450, "skills": []uint32{114}}
+	recorder, response := postBenchmarkFixtureReset(t, handler, body)
+	if recorder.Code != http.StatusOK || response["outcome"] != "reset" {
+		t.Fatalf("strength loadout = %d %#v, want a reset (strength differs)", recorder.Code, response)
+	}
+	authority.ReadCharacters(testDivision, func([]*domain.Character) {
+		if character.Strength == nil || *character.Strength != 450 || character.CurrentHP != nil {
+			t.Fatalf("strength %v hp %v; want 450 and HP derived at login", character.Strength, character.CurrentHP)
+		}
+	})
+	if recorder, response = postBenchmarkFixtureReset(t, handler, body); response["outcome"] != "already-reset" {
+		t.Fatalf("repeat = %d %#v, want already-reset", recorder.Code, response)
+	}
+	for _, strength := range []int{-1, 2001} {
+		body["loadout"] = map[string]any{"level": 90, "intellect": 109, "strength": strength, "skills": []uint32{114}}
+		if recorder, _ := postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusBadRequest {
+			t.Fatalf("strength %d = %d, want 400", strength, recorder.Code)
+		}
+	}
+}
+
+/*
+================
+testSkillGroups
+
+The real groups of the skills these tests teach: Ghost Walk Phantom ranks
+share 261 and Shadow ranks share 768.
+================
+*/
+func testSkillGroups(id uint32) (uint32, bool) {
+	group, ok := map[uint32]uint32{1: 1, 2: 2, 40: 40, 70: 70, 114: 261, 1287: 261, 19636: 768, 19639: 768}[id]
+	return group, ok
+}
+
+/*
+================
+TestBenchmarkFixtureLoadoutReplacesRankAndRefusesUnknownSkills
+
+A higher rank of a known skill replaces the old rank in place, so the
+character keeps one current id per group; an id the skill data does not
+know, or any skill without a resolver, is refused before anything changes.
+================
+*/
+func TestBenchmarkFixtureLoadoutReplacesRankAndRefusesUnknownSkills(t *testing.T) {
+	api, authority := newTestAPI(t)
+	api.benchmarkFixtureControl = true
+	api.skillGroup = testSkillGroups
+	api.levelCap = testLevelCap
+	handler := authenticatedHandler(t, api, testAccount)
+	postJSON(t, handler, "/character/create", createBody("FixtureHero"))
+	character := authority.Characters().CharactersForDivision(testDivision)[0]
+	authority.MutateCharacter(character, "seed ranks", func() { character.Skills = []uint32{1, 19636, 70} })
+
+	body := benchmarkFixtureRequest("FixtureHero")
+	body["loadout"] = map[string]any{"level": 90, "intellect": 109, "skills": []uint32{19639, 1287}}
+	if recorder, response := postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusOK || response["outcome"] != "reset" {
+		t.Fatalf("rank replacement = %d %#v", recorder.Code, response)
+	}
+	authority.ReadCharacters(testDivision, func([]*domain.Character) {
+		if got := character.Skills; len(got) != 4 || got[0] != 1 || got[1] != 19639 || got[2] != 70 || got[3] != 1287 {
+			t.Fatalf("skills = %v, want [1 19639 70 1287]: Shadow rank replaced in place, Phantom appended", got)
+		}
+	})
+	if recorder, response := postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusOK || response["outcome"] != "already-reset" {
+		t.Fatalf("repeat = %d %#v, want already-reset", recorder.Code, response)
+	}
+
+	body["loadout"] = map[string]any{"level": 90, "intellect": 109, "skills": []uint32{999999}}
+	if recorder, _ := postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unknown skill = %d, want 400", recorder.Code)
+	}
+	api.skillGroup = nil
+	body["loadout"] = map[string]any{"level": 90, "intellect": 109, "skills": []uint32{19639}}
+	if recorder, _ := postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("skills without a resolver = %d, want 400", recorder.Code)
+	}
+}
+
+// testLevelCap stands in for progression.LevelCap, which the API receives
+// through its Config rather than importing.
+const testLevelCap = 90
+
+/*
+================
+TestBenchmarkFixtureResetRevivesACorpse
+
+A scratch character a test left dead at the fixture's own spot is reset,
+not "already reset": it comes back at full derived vitals, and the next
+reset is idempotent again.
+================
+*/
+func TestBenchmarkFixtureResetRevivesACorpse(t *testing.T) {
+	api, authority := newTestAPI(t)
+	api.benchmarkFixtureControl = true
+	handler := authenticatedHandler(t, api, testAccount)
+	postJSON(t, handler, "/character/create", createBody("FixtureDead"))
+	character := authority.Characters().CharactersForDivision(testDivision)[0]
+	body := benchmarkFixtureRequest("FixtureDead")
+	if recorder, response := postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusOK || response["outcome"] != "reset" {
+		t.Fatalf("first reset = %d %#v", recorder.Code, response)
+	}
+	zero, mp := int64(0), int64(12)
+	authority.MutateCharacter(character, "die at the fixture", func() {
+		character.CurrentHP, character.CurrentMP = &zero, &mp
+	})
+
+	recorder, response := postBenchmarkFixtureReset(t, handler, body)
+	if recorder.Code != http.StatusOK || response["outcome"] != "reset" {
+		t.Fatalf("corpse reset = %d %#v, want reset", recorder.Code, response)
+	}
+	authority.ReadCharacters(testDivision, func([]*domain.Character) {
+		if character.CurrentHP != nil || character.CurrentMP != nil || !charactervitals.Alive(character) {
+			t.Fatalf("corpse kept hp %v mp %v", character.CurrentHP, character.CurrentMP)
+		}
+	})
+	if recorder, response = postBenchmarkFixtureReset(t, handler, body); recorder.Code != http.StatusOK || response["outcome"] != "already-reset" {
+		t.Fatalf("repeat = %d %#v, want already-reset", recorder.Code, response)
+	}
+}

@@ -1,0 +1,576 @@
+/*
+===========================================================================
+
+wiring_authority.go - wiring authority
+
+===========================================================================
+*/
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+	"opensro.online/server/internal/agent/api"
+	"opensro.online/server/internal/cluster/shard"
+	"opensro.online/server/internal/data/store"
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/action"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/loot"
+	"opensro.online/server/internal/game/progression"
+	"opensro.online/server/internal/game/quest"
+	"opensro.online/server/internal/game/social/crest"
+	"opensro.online/server/internal/game/world/monster"
+	"opensro.online/server/internal/game/world/simulation"
+	"opensro.online/server/internal/platform/readiness"
+	"opensro.online/server/internal/security/auth"
+	"opensro.online/server/internal/transport"
+)
+
+const storeReadyFailedWritesFloor = 3
+
+/*
+================================================================================
+Authority composition
+
+The store is the sole durable gameplay authority. The agent HTTP surface and
+every game lane receive that same authority before network traffic starts.
+================================================================================
+*/
+
+/*
+================
+questDefinitionLoader
+================
+*/
+type questDefinitionLoader func() (*quest.Definitions, error)
+
+/*
+================
+authorityPlane
+================
+*/
+type authorityPlane struct {
+	store      *store.Store
+	agentAPI   *agentapi.API
+	loadQuests questDefinitionLoader
+	textdata   *enterworld.TextdataCatalogs
+	// crests is the uploaded-crest store over the marks directory
+	// (#2282): shared by the action runtime (the register lane) and
+	// the Agent API (the /marks/ resolver). Nil when no marks
+	// directory is configured - uploads have nowhere to live.
+	crests *crest.Store
+}
+
+/*
+================
+characterPresentationProjector
+================
+*/
+func characterPresentationProjector(
+	roster *enterworld.Roster,
+	levels enterworld.LevelDataSource,
+) agentapi.CharacterPresentationProjector {
+	return func(character *domain.Character) agentapi.CharacterPresentation {
+		entry := enterworld.ResolveLocalPlayerEntry(character, roster)
+		loadout := entry.VisualLoadout
+		raceIndex := domain.RaceEurope
+		if entry.RaceKey == enterworld.RaceKeyChina {
+			raceIndex = domain.RaceChina
+		}
+		gender := domain.GenderFemale
+		if entry.SexSelector1AC != 0 {
+			gender = domain.GenderMale
+		}
+		return agentapi.CharacterPresentation{
+			ExperiencePercent: enterworld.CharacterExperiencePercent(character, levels),
+			RaceIndex:         raceIndex,
+			Gender:            gender,
+			VisualLoadout: agentapi.CharacterVisualLoadout{
+				ModelCodename:    loadout.ModelCodename,
+				Items:            characterItems(loadout.Items),
+				Avatars:          characterItems(loadout.Avatars),
+				AnimationSetName: loadout.AnimationSetName,
+				HeightScale:      loadout.HeightScale,
+				VolumeScale:      loadout.VolumeScale,
+			},
+		}
+	}
+}
+
+/*
+================
+characterItems
+================
+*/
+func characterItems(items []enterworld.VisualItem) []agentapi.CharacterItem {
+	out := make([]agentapi.CharacterItem, 0, len(items))
+	for _, item := range items {
+		out = append(out, agentapi.CharacterItem{RefObjID: item.RefObjID, Plus: item.Plus})
+	}
+	return out
+}
+
+/*
+================
+authorityTextdata
+
+What opening the authority needs of the game data, loaded without the
+save: the textdata catalogues (every env-gated transform applied) and
+the quest definitions loader. The standby handover loads this before
+it holds the shard guard (opensro-ops#281); any other boot loads it on
+its way to the store, in the same order.
+================
+*/
+type authorityTextdata struct {
+	catalogs   *enterworld.TextdataCatalogs
+	loadQuests questDefinitionLoader
+}
+
+/*
+================
+loadAuthorityTextdata
+================
+*/
+func loadAuthorityTextdata(devPaths enterworld.DevPaths) (authorityTextdata, error) {
+	textdataDir := devPaths.TextdataDir
+	textdata, err := enterworld.LoadTextdataCatalogs(textdataDir)
+	if err != nil {
+		return authorityTextdata{}, err
+	}
+	if err := loot.InitCap110(textdataDir, monster.Cap110Enabled()); err != nil {
+		return authorityTextdata{}, err
+	}
+	textdata.Items.ApplyAttackPetExpansion()
+	// Port-only, not native: raise configured stack caps before any owner
+	// reads a reference row. Unset keeps every itemdata cap.
+	stackSizes, err := enterworld.StackSizesFromEnv()
+	if err != nil {
+		return authorityTextdata{}, err
+	}
+	raised, err := textdata.Items.ApplyStackSizes(stackSizes)
+	if err != nil {
+		return authorityTextdata{}, err
+	}
+	if len(stackSizes) > 0 {
+		log.Infof("items: %s=%s raised %d item cap(s) (port-only, not native)", enterworld.EnvStackSizes, stackSizes, raised)
+	}
+	// Port-only, not native: trade goods are worth TradeGoodsPriceFactor times
+	// their v1.150 price (SRO_TRADE_TIERS, enterworld/tradegoodsprice.go).
+	if action.TradeTiersFromEnv() {
+		scaled, err := textdata.Items.ApplyTradeGoodsPriceFactor(enterworld.TradeGoodsPriceFactor)
+		if err != nil {
+			return authorityTextdata{}, err
+		}
+		log.Infof("trade: %s priced %d trade goods x%d (port-only, not native)", action.EnvTradeTiers, scaled, enterworld.TradeGoodsPriceFactor)
+	}
+	// Port-only, not native: the Item Mall transports move 1.5 times as fast.
+	if enterworld.MallTransportSpeedFromEnv() {
+		scaled, err := textdata.Items.ApplyMallTransportSpeed()
+		if err != nil {
+			return authorityTextdata{}, err
+		}
+		log.Infof("cos: %s scaled %d mall transport(s) (port-only, not native)", enterworld.EnvMallTransportSpeed, scaled)
+	}
+	// Port-only, not native (#2474): the job trade transports move 1.3
+	// times as fast (malltransport's families keep their own 1.5 rule).
+	if enterworld.JobTransportSpeedFromEnv() {
+		scaled, err := textdata.Items.ApplyJobTransportSpeed()
+		if err != nil {
+			return authorityTextdata{}, err
+		}
+		log.Infof("cos: %s scaled %d job transport(s) (port-only, not native)", enterworld.EnvJobTransportSpeed, scaled)
+	}
+	// Port-only, not native: the Item Mall vehicles and pets move faster
+	// (1.3 times by default, game/tunables).
+	rideFactor, rideOn, err := enterworld.MallRideSpeedFromEnv()
+	if err != nil {
+		return authorityTextdata{}, err
+	}
+	if rideOn {
+		scaled, err := textdata.Items.ApplyMallRideSpeed(rideFactor)
+		if err != nil {
+			return authorityTextdata{}, err
+		}
+		log.Infof("cos: %s=%v scaled %d mall vehicle and pet row(s) (port-only, not native)",
+			enterworld.EnvMallRideSpeed, rideFactor, scaled)
+	}
+	questCatalog := quest.NewCatalog(textdataDir)
+	loadQuests := sync.OnceValues(func() (*quest.Definitions, error) {
+		return quest.LoadDefinitions(questCatalog, enterworld.NewTextdataItems(questCatalog.Dir()))
+	})
+	return authorityTextdata{catalogs: textdata, loadQuests: loadQuests}, nil
+}
+
+// crestMarksSubdir is the marks directory's name inside a shard's
+// authority directory when no operator names one (crestMarksDir).
+const crestMarksSubdir = "marks"
+
+/*
+================
+crestMarksDir
+
+The directory the crest store and GET /marks/ share: SRO_AGENT_MARKS_DIR
+when an operator names one, otherwise crestMarksSubdir inside the shard's
+authority directory (#3454). Guild crests are native (the client uploads
+a crest and fetches it back from the MarkFTP host), so a shard without the
+operator setting must still accept them: with no directory every upload
+was refused. The authority directory is the one per-shard directory every
+deployment keeps across releases; the release proof already redirects it
+into its own state, and the store's permission walk skips subdirectories.
+================
+*/
+func crestMarksDir(configured, authorityDir string) string {
+	if dir := strings.TrimSpace(configured); dir != "" {
+		return dir
+	}
+	if authorityDir == "" {
+		return ""
+	}
+	return filepath.Join(authorityDir, crestMarksSubdir)
+}
+
+/*
+================
+openAuthorityPlane
+================
+*/
+func openAuthorityPlane(
+	startupContext context.Context,
+	ts *transport.Server,
+	ownedShard shard.Definition,
+	accountIDs []string,
+	ready *readiness.Gate,
+	devPaths enterworld.DevPaths,
+	characterRoster *enterworld.Roster,
+	sessionVerifier *auth.AgentSessionVerifier,
+	enterWorldSecret []byte,
+	loaded authorityTextdata,
+) (authorityPlane, error) {
+	if err := startupContext.Err(); err != nil {
+		return authorityPlane{}, err
+	}
+	textdata := loaded.catalogs
+	options := store.OptionsFromEnv()
+	// The startup context reaches the store's open (#3186): a stop
+	// during the long load leaves within a second, and a cancelled
+	// open never quarantines or recovers on its way out.
+	options.Context = startupContext
+	// Port-only, not native (owner, 2026-11-07, #2769): new characters are
+	// created at the 2.5-page inventory base; the world entry raises the
+	// rest (wiring_gameplay.go publishes the same reading to the entry).
+	options.InventoryPages = enterworld.InventoryPagesFromEnv()
+	options.DefaultSkills = enterworld.DefaultSkillSeeder(textdata.Skills)
+	options.DefaultInventory = enterworld.StarterInventorySeeder(
+		characterRoster,
+		textdata.Items,
+		devPaths.EquipItemsEnabled,
+	)
+
+	options.DefaultQuests = func(raceKey string) ([]enterworld.ActiveQuestRecord, error) {
+		definitions, err := loaded.loadQuests()
+		if err != nil {
+			return nil, err
+		}
+		return quest.DefaultQuestSeeder(definitions)(raceKey)
+	}
+
+	ts.SetBootPhase(transport.BootPhaseOpeningStore)
+	authorityStore, err := store.Open(store.DirForShardFromEnv(ownedShard.ID), options)
+	if err != nil {
+		return authorityPlane{}, fmt.Errorf("store: %w", err)
+	}
+	authorityStore.ReapMaturedDeletions()
+	if err := authorityStore.ValidateShardState([]string{ownedShard.ID}); err != nil {
+		authorityStore.Close()
+		return authorityPlane{}, fmt.Errorf("shard %q authority: %w", ownedShard.ID, err)
+	}
+	if err := authorityStore.ValidateCharacterOwners(accountIDs); err != nil {
+		authorityStore.Close()
+		return authorityPlane{}, fmt.Errorf(
+			"shard %q character ownership: %w",
+			ownedShard.ID,
+			err,
+		)
+	}
+	gmIdentities, err := store.GMCharactersFromEnv()
+	if err != nil {
+		authorityStore.Close()
+		return authorityPlane{}, fmt.Errorf("GM allowlist: %w", err)
+	}
+	authorityStore.ReconcileGMPrivilege(gmIdentities)
+
+	levelCap, err := progression.LevelCapFromEnv()
+	if err != nil {
+		authorityStore.Close()
+		return authorityPlane{}, err
+	}
+	// The published skill tier and the level cap are separate switches
+	// (the build's skill import and database snapshot publish the rows;
+	// SRO_LEVEL_CAP admits the levels). A table whose top tier outruns
+	// the cap leaves those ranks board-visible but unlearnable, answered
+	// only by the generic mastery refusal, so say so once at startup.
+	if highest := textdata.Skills.MaxMasteryRequirement(); highest > 100 && highest > levelCap {
+		log.Warnf("skills: loaded table requires mastery %d but %s caps progression at %d; "+
+			"the top ranks will show on the board and refuse learning (raise the cap or rebuild without the database tier)",
+			highest, progression.EnvLevelCap, levelCap)
+	}
+	// The crest store lives in the marks directory (#2282): uploaded
+	// crests are stored there content-addressed beside any host art,
+	// and the same instance serves the register lane, so an upload
+	// resolves by name the moment it commits. Every shard has one
+	// (crestMarksDir, #3454).
+	marksDir := crestMarksDir(os.Getenv(agentapi.EnvMarksDir), authorityStore.Dir())
+	var crests *crest.Store
+	if marksDir != "" {
+		var err error
+		crests, err = crest.NewStore(marksDir)
+		if err != nil {
+			authorityStore.Close()
+			return authorityPlane{}, fmt.Errorf("crest store: %w", err)
+		}
+	}
+	config := agentapi.Config{
+		Store:                 authorityStore,
+		CharacterPresentation: characterPresentationProjector(characterRoster, textdata.Levels),
+		CharacterCreationValid: func(character *domain.Character) bool {
+			return enterworld.CharacterCreationValid(character, characterRoster)
+		},
+		CharacterNameAllowed:    textdata.NameFilter.Allowed,
+		ShardID:                 ownedShard.ID,
+		AgentSessionVerifier:    sessionVerifier,
+		PrivateNetwork:          os.Getenv("SRO_GAMEWORLD_PRIVATE_NETWORK") == "1",
+		Readiness:               ready,
+		EnterWorldAuthSecret:    enterWorldSecret,
+		MarksDir:                marksDir,
+		Crests:                  crests,
+		MaintenanceGatePath:     strings.TrimSpace(os.Getenv(agentapi.EnvMaintenanceGate)),
+		MaintenanceMessage:      agentapi.MaintenanceMessageFromEnv(),
+		AuthoredAreas:           devPaths.AuthoredAreas,
+		BenchmarkFixtureControl: os.Getenv(agentapi.EnvBenchmarkFixtureControl) == "1",
+		LevelCap:                levelCap,
+		SkillGroup: func(id uint32) (uint32, bool) {
+			row, ok := textdata.Skills.SkillByID(id)
+			return row.Group, ok
+		},
+	}
+	config.CharacterInPlay = func(divisionID, characterName string) bool {
+		key := divisionID + ":" + strings.ToLower(characterName)
+		_, bound := ts.Hub.BoundSession(key)
+		return bound
+	}
+	config.AcquireCharacterControl = func(
+		divisionID string,
+		characterName string,
+	) (func(), bool) {
+		key := divisionID + ":" + strings.ToLower(characterName)
+		lease, acquired := ts.Hub.AcquireBindingControl(key)
+		if !acquired {
+			return nil, false
+		}
+		return lease.Release, true
+	}
+	api, err := agentapi.New(config)
+	if err != nil {
+		authorityStore.Close()
+		return authorityPlane{}, fmt.Errorf("agentapi: %w", err)
+	}
+
+	return authorityPlane{
+		store:      authorityStore,
+		agentAPI:   api,
+		loadQuests: loaded.loadQuests,
+		textdata:   textdata,
+		crests:     crests,
+	}, nil
+}
+
+/*
+================
+newBootstrapDependencies
+================
+*/
+func newBootstrapDependencies(
+	authorityStore *store.Store,
+	paths enterworld.DevPaths,
+	characterRoster *enterworld.Roster,
+	ownedShard shard.Definition,
+	textdata *enterworld.TextdataCatalogs,
+) (*enterworld.Deps, error) {
+	deps, err := enterworld.NewDevDepsWithRoster(paths, textdata, characterRoster)
+	if err != nil {
+		return nil, err
+	}
+	deps.Characters = authorityStore.Characters()
+	deps.ResolveDivisionID = func(requested string) string {
+		if requested == ownedShard.ID {
+			return ownedShard.ID
+		}
+		return ""
+	}
+	deps.MutateCharacter = func(character *enterworld.Character, label string, mutate func()) {
+		if character != nil {
+			label += " " + character.Name
+		}
+		authorityStore.MutateCharacter(character, label, mutate)
+	}
+	deps.MutateCharacters = func(characters []*enterworld.Character, label string, mutate func()) {
+		authorityStore.MutateCharacters(characters, label, mutate)
+	}
+	deps.UpdateCharacter = func(character *enterworld.Character, label string, update func() bool) bool {
+		if character != nil {
+			label += " " + character.Name
+		}
+		return authorityStore.UpdateCharacter(character, label, update)
+	}
+	deps.UpdateCharacters = authorityStore.UpdateCharacters
+	deps.ItemSaleNote = authorityStore.NoteItemSale
+	// The trade history rows (trade_history.go, port-only) are noted inside
+	// each trade's commit door, so they ride its transaction.
+	deps.TradeNote = authorityStore.NoteTrade
+	deps.MutateCharacterDeferred = func(character *enterworld.Character, label string, mutate func()) {
+		if character != nil {
+			label += " " + character.Name
+		}
+		authorityStore.MutateCharacterDeferred(character, label, mutate)
+	}
+	deps.MutateCharactersDeferred = authorityStore.MutateCharactersDeferred
+	deps.UpdateCharacterDeferred = func(character *enterworld.Character, label string, update func() bool) bool {
+		if character != nil {
+			label += " " + character.Name
+		}
+		return authorityStore.UpdateCharacterDeferred(character, label, update)
+	}
+	deps.UpdateCharactersDeferred = authorityStore.UpdateCharactersDeferred
+	deps.UpdateTrade = authorityStore.UpdateTrade
+	deps.HalloweenAccountRecord = authorityStore.HalloweenAccount
+	deps.SookArenaAccountRecord = authorityStore.SookArenaAccount
+	deps.CloseJobWeek = authorityStore.CloseJobWeek
+	deps.JobRankings = authorityStore.JobRankings
+	deps.ReadCharacter = func(divisionID string, read func()) {
+		authorityStore.ReadState(read)
+	}
+	deps.ReadLock = func(string) { authorityStore.ReadLock() }
+	deps.ReadUnlock = func(string) { authorityStore.ReadUnlock() }
+	deps.CharacterWriteEpoch = authorityStore.CharacterWriteEpoch
+	deps.CanEnterWorldRegion = func(character *enterworld.Character, regionID uint16) bool {
+		return paths.AuthoredAreas.CanEnterRegion(regionID, character != nil && character.GMPrivilege)
+	}
+	deps.Letters = authorityStore.Letters()
+	deps.Guilds = authorityStore.Guilds()
+	deps.GuildWars = authorityStore.GuildWars()
+	deps.TrainingCamps = authorityStore.TrainingCamps()
+	deps.Fortresses = authorityStore.Fortresses()
+	deps.Alliances = authorityStore.Alliances()
+	return deps, nil
+}
+
+/*
+================
+readinessProgress
+
+What readiness asks of the simulation: nil while ticks keep finishing
+(simulation.Ticker.Progress).
+================
+*/
+type readinessProgress interface {
+	Progress(now time.Time) error
+}
+
+/*
+================
+configureReadiness
+
+Installs readyCheck as the transport's readiness probe. Liveness
+(/transport/healthz) stays independent of it.
+================
+*/
+func configureReadiness(
+	ts *transport.Server,
+	authorityStore *store.Store,
+	ready *readiness.Gate,
+	progress readinessProgress,
+) {
+	ts.SetReadyCheck(readyCheck(authorityStore, ready, progress))
+}
+
+/*
+================
+tickCommit
+
+The store's batch as the ticker drives it: one transaction per tick for the
+tick-only doors (store tickbatch.go). A failed flush is already loud: the
+store logs PERSIST FAILING and readiness fails on its health.
+================
+*/
+func tickCommit(authorityStore *store.Store) simulation.TickCommit {
+	return simulation.TickCommit{
+		Begin: authorityStore.BeginTickBatch,
+		Flush: func() simulation.TickCommitStats {
+			stats := authorityStore.FlushTickBatch()
+			return simulation.TickCommitStats{Deferred: stats.Deferred, Rows: stats.Rows, Elapsed: stats.Duration,
+				Flushed: stats.Flushed, Failed: stats.Err != nil}
+		},
+	}
+}
+
+/*
+================
+readyCheck
+
+The probe answers from atomics only: the process gate, the tick progress
+and the store's published health. It never takes the store or gameplay
+locks, so a stalled tick or a writer queued behind a reader yields a prompt
+not-ready instead of a probe that waits with them (#570).
+================
+*/
+func readyCheck(authorityStore *store.Store, ready *readiness.Gate, progress readinessProgress) func() error {
+	return func() error {
+		if !ready.Ready() {
+			return fmt.Errorf("process is not accepting traffic")
+		}
+		if err := progress.Progress(time.Now()); err != nil {
+			return err
+		}
+		health := authorityStore.Health()
+		if health.FailedWrites < storeReadyFailedWritesFloor {
+			return nil
+		}
+		return fmt.Errorf(
+			"authority store persist failing: %d consecutive failed write(s) since %s: %s",
+			health.FailedWrites,
+			health.FailingSince.Format(time.RFC3339),
+			health.LastError,
+		)
+	}
+}
+
+/*
+================
+logAuthorityReady
+================
+*/
+func logAuthorityReady(authorityStore *store.Store, deps *enterworld.Deps) {
+	characterCount := 0
+	divisionIDs := authorityStore.DivisionIDs()
+	for _, divisionID := range divisionIDs {
+		characterCount += len(deps.CharactersForDivision(divisionID))
+	}
+
+	ground := authorityStore.GroundSnapshotForRestore()
+	meta := authorityStore.MetaView()
+	log.Infof(
+		"store: authority ready: %d character(s) across %d division(s), %d ground item(s), gidCounter=%d",
+		characterCount,
+		len(divisionIDs),
+		ground.ItemCount(),
+		meta.GidCounter,
+	)
+}

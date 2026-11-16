@@ -1,0 +1,225 @@
+/*
+===========================================================================
+
+skill-cooldowns.ts - the local player's skill cooldowns on the server's clock
+
+776830 -> 67ADD0 -> 84AAC0. UI references query the same manager by skill or
+nonzero cool-time group (84B010/84B0E0); cast retirement is independent.
+
+Every row is placed where the server's cooldown runs, in local time. The
+cast-start answer (B245) arrives one delivery after the server started the
+cooldown, so an accepted row starts that delivery earlier. Between a press
+and its answer a provisional row stands in: it starts when the press reaches
+the server, so a re-press in that round trip is held or denied locally
+instead of reaching a server whose cooldown already runs. The answer
+replaces it; a refusal or a missing answer removes it.
+
+===========================================================================
+*/
+import type { SkillMetadata } from "./skill-catalog";
+
+// How long a finished row is kept for the slot's completion flash.
+const RETAIN_AFTER_MS = 500;
+const MAX_ROWS = 4096;
+const MAX_WIRE_MS = 0xffffffff;
+
+/*
+================
+SkillCooldown
+
+provisionalUntilMs marks a stand-in for an unanswered press, dropped at
+that time.
+================
+*/
+export interface SkillCooldown {
+	readonly skill: number;
+	readonly group: number;
+	readonly startedAtMs: number;
+	readonly durationMs: number;
+	readonly provisionalUntilMs?: number;
+}
+
+/*
+================
+skillCooldown
+
+The running cooldown of skill (or its nonzero group) at now, or null.
+================
+*/
+export function skillCooldown(
+	rows: readonly SkillCooldown[],
+	skill: number,
+	group: number,
+	now: number
+): { remainingMs: number; fraction: number; } | null {
+	const row = rows.find( r =>
+		(r.skill === skill || !!group && r.group === group) && now < r.startedAtMs + r.durationMs
+	);
+	if ( !row ) return null;
+	const remainingMs = Math.max( 0, row.startedAtMs + row.durationMs - now );
+	return { remainingMs, fraction: Math.min( 1, remainingMs / row.durationMs ) };
+}
+
+/*
+================
+createSkillCooldowns
+================
+*/
+export function createSkillCooldowns() {
+	let rows: readonly SkillCooldown[] = [];
+	/*
+	================
+	place
+
+	Replace the row of skill and its group with one starting at startedAtMs.
+	================
+	*/
+	function place( skill: SkillMetadata, startedAtMs: number, now: number, provisionalUntilMs?: number ) {
+		if ( !skill.cooldownMs ) return;
+		const group = skill.cooldownGroup ?? 0;
+		const retained = rows.filter( r =>
+			now < r.startedAtMs + r.durationMs + RETAIN_AFTER_MS && r.skill !== skill.id &&
+			(!group || r.group !== group)
+		);
+		if ( retained.length >= MAX_ROWS ) throw Error( "Skill cooldown capacity exceeded" );
+		rows = [ ...retained, {
+			skill: skill.id,
+			group,
+			startedAtMs,
+			durationMs: skill.cooldownMs,
+			...(provisionalUntilMs === undefined ? {} : { provisionalUntilMs })
+		} ];
+	}
+	/*
+ ================
+ recover
+
+ Port-only: shorten confirmed reuse, preserving duration and pending presses.
+ ================
+ */
+	function recover( milliseconds: number, now: number ) {
+		rows = rows.map( row =>
+			row.provisionalUntilMs === undefined && row.startedAtMs + row.durationMs > now ?
+				{ ...row, startedAtMs: Math.max( now - row.durationMs, row.startedAtMs - milliseconds ) } :
+				row
+		);
+	}
+
+	return {
+		/*
+		================
+		restore
+
+		Optional entry rows carry server deadlines as remaining milliseconds. Anchor
+		them at receipt, so loading references cannot restart or extend reuse.
+		Older servers omit the projection; their entries start with no cooldowns.
+		Validate the whole list before replacing this owner's state.
+		================
+		*/
+		restore( value: unknown, catalog: readonly SkillMetadata[], receivedAtMs: number ) {
+			const entry = value as { skillCooldowns?: unknown; };
+			const source = entry.skillCooldowns;
+			if ( source === undefined ) {
+				rows = [];
+				return;
+			}
+			if ( !Array.isArray( source ) || source.length > MAX_ROWS || !Number.isFinite( receivedAtMs ) ) {
+				throw Error( "Invalid entry skill cooldowns" );
+			}
+			const next: SkillCooldown[] = [], seen = new Set<number>();
+			for ( const row of source ) {
+				if ( !row || typeof row !== "object" || Array.isArray( row ) ) {
+					throw Error( "Invalid entry skill cooldown" );
+				}
+				const { skill, remainingMs, durationMs } = row;
+				const ref = catalog.find( item => item.id === skill );
+				if (
+					!ref?.cooldownMs || seen.has( skill ) ||
+					![ remainingMs, durationMs ].every( n => Number.isInteger( n ) && n > 0 && n <= MAX_WIRE_MS )
+				) throw Error( "Invalid entry skill cooldown" );
+				seen.add( skill );
+				next.push( {
+					skill,
+					group: ref.cooldownGroup ?? 0,
+					startedAtMs: receivedAtMs + remainingMs - durationMs,
+					durationMs
+				} );
+			}
+			rows = next;
+		},
+		/*
+		================
+		accepted
+
+		The server started the cooldown at startedAtMs (local time).
+		================
+		*/
+		accepted( skill: SkillMetadata, startedAtMs: number, now: number ) {
+			place( skill, startedAtMs, now );
+		},
+		/*
+		================
+		pressed
+
+		A sent press: the server starts the cooldown when the press reaches
+		it, at arrivesAtMs. The row stands in until untilMs.
+		================
+		*/
+		pressed( skill: SkillMetadata, arrivesAtMs: number, untilMs: number, now: number ) {
+			place( skill, arrivesAtMs, now, untilMs );
+		},
+		/*
+		================
+		refused
+
+		The server refused a press (B245 [2, code] names no skill): drop every
+		stand-in.
+		================
+		*/
+		refused() {
+			const next = rows.filter( r => r.provisionalUntilMs === undefined );
+			const changed = next.length !== rows.length;
+			rows = next;
+			return changed;
+		},
+		/*
+        ================
+        receiveRecovery
+
+        Port-only Mana Spring recovery is validated before any cooldown changes.
+        ================
+        */
+		receiveRecovery( op: number, p: Uint8Array, now: number ) {
+			if ( op !== 0x3fb8 ) return false;
+			if ( p.length !== 2 || p[0] !== 0xf4 || p[1] !== 1 ) throw Error( "Invalid Mana Spring recovery" );
+			recover( 500, now );
+			return true;
+		},
+		recover,
+		state: () => rows,
+		/*
+		================
+		step
+
+		Expire finished rows and unanswered stand-ins.
+		================
+		*/
+		step( now: number ) {
+			const next = rows.filter( r =>
+				now < r.startedAtMs + r.durationMs + RETAIN_AFTER_MS &&
+				(r.provisionalUntilMs === undefined || now < r.provisionalUntilMs)
+			);
+			if ( next.length === rows.length ) return false;
+			rows = next;
+			return true;
+		},
+		/*
+		================
+		clear
+		================
+		*/
+		clear() {
+			rows = [];
+		}
+	};
+}

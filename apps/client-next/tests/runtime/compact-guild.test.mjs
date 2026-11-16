@@ -1,0 +1,558 @@
+/*
+===========================================================================
+
+compact-guild.test.mjs - populated community pages retain native glyph metrics
+
+Use the production UI and retail asset fixture. Exercise the existing social,
+grant and war controls at portrait and short landscape sizes, then return to
+the authored desktop layout.
+
+===========================================================================
+*/
+import test from "node:test";
+import assert from "node:assert/strict";
+import { uiFixture, fontAtlas } from "../helpers/ui-fixture.mjs";
+import { defined } from "../helpers/defined.mjs";
+const { emptySocial } = await import( "../../src/engine/foundation/gameplay/social.ts" );
+// This file exercises the touch layout at small sizes. Node has no
+// matchMedia and the production reader defaults to a fine pointer, so the
+// test chooses touch by stubbing a coarse pointer before any UI is created
+// (it reads the display class once, at creation).
+globalThis.matchMedia = /** @type {typeof globalThis.matchMedia} */ (
+	/** @type {unknown} */ (() => ({ matches: true, media: "(pointer: coarse)" }))
+);
+const { topmostControlAt } = await import( "../../src/engine/foundation/ui/hit-test.ts" );
+const { panelCloseId } = await import( "../../src/engine/foundation/ui/panels.ts" );
+
+/*
+================
+guildState
+================
+*/
+function guildState() {
+	const members = Array.from( { length: 18 }, ( _, i ) => ({
+		id: i + 1,
+		name: "Member" + String( i + 1 ).padStart( 2, "0" ),
+		grade: i === 0 ? 0 : 1,
+		level: 40 + i,
+		permissions: 31,
+		donated: i * 100,
+		grant: "Officer",
+		model: 1907,
+		role: 1,
+		offline: i % 2,
+		warScore: i * 10
+	}) );
+	return {
+		...emptySocial( members[0].name ),
+		self: 1,
+		allianceMaster: 7,
+		guild: {
+			id: 7,
+			name: "Native Guild",
+			level: 5,
+			gp: 12345,
+			subject: "Guild notice",
+			contents: "Notice body",
+			crest: 0,
+			members
+		},
+		alliances: Array.from(
+			{ length: 8 },
+			( _, i ) => ({ id: 7 + i, name: "Ally" + i, level: 5, master: members[0].name, model: 1907, flags: 18 })
+		),
+		wars: Array.from(
+			{ length: 12 },
+			( _, i ) => ({
+				id: 50 + i,
+				enemyId: 100 + i,
+				name: "Enemy" + i,
+				type: 1,
+				localScore: 10,
+				enemyScore: 20,
+				word38: 100,
+				word3c: 3600,
+				ending: false
+			})
+		)
+	};
+}
+
+/*
+================
+nativeGlyphs
+================
+*/
+function nativeGlyphs( fixture ) {
+	const scene = defined( fixture.scenes.at( -1 ) ),
+		glyphs = scene.quads.filter( quad => quad.texture === fontAtlas.image );
+	assert.ok( glyphs.length > 0, "actual font ink was published" );
+	for ( const glyph of glyphs ) {
+		assert.ok( glyph.rect[2] >= glyph.uv[2] * fontAtlas.atlasWidth * .99, "native glyph width" );
+		assert.ok( glyph.rect[3] >= glyph.uv[3] * fontAtlas.atlasHeight * .99, "native glyph height" );
+	}
+}
+
+/*
+================
+contained
+================
+*/
+function contained( output, width, height ) {
+	for ( const control of output.controls ) {
+		if ( !/^(guild-|social-|union-|war-|friend-|letter-|close$)/.test( control.id ) ) continue;
+		const [x, y, w, h] = control.rect;
+		assert.ok(
+			w > 0 && h > 0 && x >= 0 && y >= 0 && x + w <= width + .01 && y + h <= height + .01,
+			control.id + " has no hidden hit target beyond the viewport"
+		);
+	}
+}
+
+for ( const [width, height] of [ [ 375, 667 ], [ 667, 375 ] ] ) {
+	test(`populated Guild pages keep native text and controls at ${width}x${height}`, () => {
+		const sent = [], fixture = uiFixture( command => sent.push( command ) );
+		let time = 0, published;
+		/*
+		================
+		draw
+		================
+		*/
+		function draw() {
+			published = fixture.ui.step( fixture.state, ++time * 100 ) ?? published;
+			assert.equal( fixture.ui.stats().error, null, "Guild draw must not retain an old product after an error" );
+			const output = defined( published );
+			contained( output, fixture.state.width, fixture.state.height );
+			return output;
+		}
+		try {
+			Object.assign( fixture.state.gameplay, { social: guildState() } );
+			fixture.state.width = width;
+			fixture.state.height = height;
+			draw();
+			fixture.ui.event( { kind: "activate", id: "open-window:Guild" } );
+			let output = draw();
+			nativeGlyphs( fixture );
+			const tabs = output.controls.filter( control => control.id.startsWith( "guild-tab:" ) );
+			assert.deepEqual( tabs.filter( control => !control.disabled ).map( control => control.id ), [
+				"guild-tab:0",
+				"guild-tab:1",
+				"guild-tab:2",
+				"guild-tab:3",
+				"guild-tab:4",
+				"guild-tab:5"
+			] );
+			assert.equal( new Set( tabs.map( control => control.rect[1] ) ).size, width < 477 ? 2 : 1 );
+			const firstMembers = output.controls.filter( control => control.id.startsWith( "social-member:" ) ).map(
+				control => control.id
+			);
+			assert.ok( firstMembers.length >= 3 );
+			const member = defined( output.controls.find( control => control.id === firstMembers[1] ) );
+			const hit = defined(
+				topmostControlAt(
+					output.controls,
+					member.rect[0] + member.rect[2] / 2,
+					member.rect[1] + member.rect[3] / 2
+				)
+			);
+			assert.equal( hit.id, member.id, "member wins the DOM bridge hit order over guild-list" );
+			fixture.ui.event( { kind: "activate", id: hit.id } );
+			output = draw();
+			assert.equal( output.controls.find( control => control.id === member.id )?.selected, true );
+			fixture.ui.event( { kind: "activate", id: "social-next" } );
+			output = draw();
+			assert.notDeepEqual(
+				output.controls.filter( control => control.id.startsWith( "social-member:" ) ).map( control =>
+					control.id
+				),
+				firstMembers
+			);
+			fixture.ui.event( { kind: "activate", id: "guild-tab:1" } );
+			output = draw();
+			assert.equal( output.controls.filter( control => control.id.startsWith( "social-member:" ) ).length, 8 );
+			nativeGlyphs( fixture );
+			fixture.ui.event( { kind: "activate", id: "war-relation:1" } );
+			output = draw();
+			assert.equal( output.controls.filter( control => control.id.startsWith( "war-select:" ) ).length, 9 );
+			const enemies = output.controls.filter( control => control.id.startsWith( "war-select:" ) ).map( control =>
+				control.id
+			);
+			fixture.ui.event( { kind: "activate", id: "war-scroll-down" } );
+			output = draw();
+			assert.notDeepEqual(
+				output.controls.filter( control => control.id.startsWith( "war-select:" ) ).map( control =>
+					control.id
+				),
+				enemies
+			);
+			nativeGlyphs( fixture );
+			fixture.ui.event( { kind: "activate", id: "guild-tab:2" } );
+			output = draw();
+			assert.equal( output.controls.filter( control => control.id.startsWith( "war-select:" ) ).length, 6 );
+			assert.ok( output.controls.some( control => control.id === "war-members-down" ) );
+			nativeGlyphs( fixture );
+			// The Letter page reflowed: its rows and commands, then the write and
+			// read windows narrowed into the viewport.
+			const row = { sender: "Berk", modelRefId: 1907, received: 0, read: false, body: "Hello" };
+			Object.assign( fixture.state.gameplay, { letters: { rows: [ row ], reading: -1 } } );
+			fixture.ui.event( { kind: "activate", id: "guild-tab:5" } );
+			output = draw();
+			assert.ok( output.controls.some( control => control.id === "letter-row:0" ) );
+			assert.ok( output.controls.some( control => control.id === "letter-write" && !control.disabled ) );
+			fixture.ui.event( { kind: "activate", id: "letter-write" } );
+			output = draw();
+			assert.ok( output.controls.some( control => control.id === "letter-receiver" ) );
+			assert.ok( output.controls.some( control => control.id === "letter-body" ) );
+			fixture.ui.event( { kind: "activate", id: "letter-write-cancel" } );
+			draw();
+			Object.assign( fixture.state.gameplay, { letters: { rows: [ row ], reading: 0 } } );
+			output = draw();
+			assert.ok( output.controls.some( control => control.id === "letter-read-close" ) );
+			Object.assign( fixture.state.gameplay, { letters: { rows: [ row ], reading: -1 } } );
+			draw();
+			fixture.ui.event( { kind: "activate", id: "guild-tab:4" } );
+			output = draw();
+			assert.ok(
+				!output.controls.some( control => control.id === "guild-tab:0" ),
+				"Blocking retains its existing separate route"
+			);
+			fixture.ui.event( { kind: "activate", id: panelCloseId( "Blocking" ) } );
+			draw();
+			fixture.state.width = 1600;
+			fixture.state.height = 900;
+			fixture.ui.event( { kind: "activate", id: "open-window:Guild" } );
+			output = draw();
+			fixture.ui.event( { kind: "activate", id: "guild-tab:0" } );
+			output = draw();
+			assert.equal( output.controls.filter( control => control.id.startsWith( "social-member:" ) ).length, 6 );
+			assert.ok(
+				!output.controls.some( control => control.id === "social-next" ),
+				"native desktop branch restored"
+			);
+			nativeGlyphs( fixture );
+			fixture.state.width = width;
+			fixture.state.height = height;
+			draw();
+			fixture.ui.event( { kind: "activate", id: "guild-dialog:authority" } );
+			output = draw();
+			assert.deepEqual( fixture.ui.stats().windowMissing, [], "authority artwork must be admitted" );
+			assert.equal(
+				output.controls.filter( control => control.id.startsWith( "guild-grant:" ) ).length,
+				25,
+				"authority panel: " + JSON.stringify( fixture.ui.stats() )
+			);
+			nativeGlyphs( fixture );
+			const checkedInk = defined( fixture.scenes.at( -1 ) ).quads.filter( quad =>
+				quad.texture.endsWith( "/com_checkbutton_on.png" )
+			).length;
+			fixture.ui.event( { kind: "activate", id: "guild-grant:2:1" } );
+			output = draw();
+			assert.equal(
+				output.controls.find( control =>
+					control.id === "guild-grant:2:1"
+				)?.selected,
+				false
+			);
+			assert.equal(
+				defined( fixture.scenes.at( -1 ) ).quads.filter( quad =>
+					quad.texture.endsWith( "/com_checkbutton_on.png" )
+				).length,
+				checkedInk - 1,
+				"toggling a right removes its painted check mark"
+			);
+			if ( width > height ) {
+				fixture.state.height = 320;
+				output = draw();
+				assert.equal(
+					output.controls.filter( control => control.id.startsWith( "guild-grant:" ) ).length,
+					15,
+					"shorter landscape admits three complete authority rows"
+				);
+			}
+			const visited = new Set();
+			for ( let page = 0; page < 18; page++ ) {
+				const pager = defined( output.controls.find( control => control.id === "guild-grant-next" ) );
+				const confirm = defined( output.controls.find( control => control.id === "guild-grant-ok" ) );
+				assert.ok( pager.rect[1] + pager.rect[3] <= confirm.rect[1], "pager does not overlap confirmation" );
+				for ( const control of output.controls.filter( control => control.id.startsWith( "guild-grant:" ) ) ) {
+					visited.add( Number( control.id.split( ":" )[1] ) );
+					assert.ok( control.rect[1] + control.rect[3] < pager.rect[1], "rights stay above pager and OK" );
+				}
+				if ( pager.disabled ) break;
+				fixture.ui.event( { kind: "activate", id: "guild-grant-next" } );
+				output = draw();
+			}
+			assert.deepEqual(
+				[ ...visited ].sort( ( a, b ) => a - b ),
+				Array.from( { length: 17 }, ( _, i ) => i + 2 ),
+				"all non-master members are reachable; native policy excludes the master"
+			);
+			fixture.ui.event( { kind: "activate", id: "guild-grant:18:1" } );
+			output = draw();
+			nativeGlyphs( fixture );
+			for ( let page = 0; page < 18; page++ ) {
+				if ( output.controls.find( control => control.id === "guild-grant-prev" )?.disabled ) break;
+				fixture.ui.event( { kind: "activate", id: "guild-grant-prev" } );
+				output = draw();
+			}
+			assert.equal(
+				output.controls.find( control => control.id === "guild-grant:2:1" )?.selected,
+				false,
+				"earlier edits survive paging away and back"
+			);
+			fixture.ui.event( { kind: "activate", id: "guild-grant-ok" } );
+			assert.deepEqual( sent.at( -1 )?.command, {
+				kind: "guild-permissions",
+				grants: [ { id: 2, permissions: 30 }, { id: 18, permissions: 30 } ]
+			} );
+		} finally {
+			fixture.dispose();
+		}
+	});
+}
+
+test("a guild master outside any party can donate and open the authority panel without an error", () => {
+	const fixture = uiFixture();
+	let time = 0, published;
+	/*
+	================
+	draw
+	================
+	*/
+	function draw() {
+		published = fixture.ui.step( fixture.state, ++time * 100 ) ?? published;
+		assert.equal( fixture.ui.stats().error, null, "Guild draw must not fail" );
+		return defined( published );
+	}
+	try {
+		// social.self is the party id: 0 when the master is in no party.
+		Object.assign( fixture.state.gameplay, { social: { ...guildState(), self: 0 } } );
+		fixture.state.width = 1600;
+		fixture.state.height = 900;
+		draw();
+		// The first world frame shows the Item Mall notice; it is modal.
+		fixture.ui.event( { kind: "activate", id: "mall-notice-close" } );
+		draw();
+		fixture.ui.event( { kind: "activate", id: "open-window:Guild" } );
+		draw();
+		fixture.ui.event( { kind: "activate", id: "guild-tab:0" } );
+		let output = draw();
+		for ( const id of [ "guild-dialog:donate", "guild-dialog:title", "guild-dialog:role" ] ) {
+			assert.equal( output.controls.find( control => control.id === id )?.disabled, false, id );
+		}
+		// The desktop page read control 150, which its decoder omits, and
+		// threw "reading 'rect'" here; draw() asserts the UI kept no error.
+		fixture.ui.event( { kind: "activate", id: "guild-dialog:authority" } );
+		draw();
+		draw();
+	} finally {
+		fixture.dispose();
+	}
+});
+
+/*
+================
+friendRows
+
+A roster longer than one page: Berk online, the rest offline.
+================
+*/
+function friendRows() {
+	return Array.from( { length: 14 }, ( _, i ) => ({
+		jid: 100 + i,
+		name: i === 0 ? "Berk" : "Friend" + i,
+		modelRefId: 1907,
+		online: i === 0
+	}) );
+}
+
+for ( const [width, height] of [ [ 1600, 900 ], [ 375, 667 ] ] ) {
+	test(`the Friends tab lists the roster and drives add, delete, whisper and the request prompt at ${width}x${height}`, () => {
+		const sent = [], fixture = uiFixture( command => sent.push( command ) );
+		let time = 0, published;
+		/*
+		================
+		draw
+		================
+		*/
+		function draw() {
+			published = fixture.ui.step( fixture.state, ++time * 100 ) ?? published;
+			assert.equal( fixture.ui.stats().error, null );
+			const output = defined( published );
+			contained( output, fixture.state.width, fixture.state.height );
+			return output;
+		}
+		/*
+		================
+		gameplay
+		================
+		*/
+		const gameplay = () => sent.filter( c => c.kind === "gameplay" ).map( c => c.command );
+		try {
+			Object.assign( fixture.state.gameplay, {
+				social: guildState(),
+				friends: { rows: friendRows(), prompt: null, pending: false }
+			} );
+			fixture.state.width = width;
+			fixture.state.height = height;
+			draw();
+			fixture.ui.event( { kind: "activate", id: "open-window:Guild" } );
+			draw();
+			fixture.ui.event( { kind: "activate", id: "guild-tab:3" } );
+			let output = draw();
+			const rows = output.controls.filter( control => control.id.startsWith( "friend-row:" ) );
+			assert.ok( rows.length >= 5 && rows.length < 14, "one page of the roster: " + rows.length );
+			assert.equal( rows[0].label, "Berk" );
+			const whisper = defined( output.controls.find( control => control.id === "friend-whisper" ) );
+			const remove = defined( output.controls.find( control => control.id === "friend-remove" ) );
+			// The original never disables them (friends.md): without a selection
+			// each does nothing.
+			assert.equal( whisper.disabled, false, "nothing selected, still enabled" );
+			assert.equal( remove.disabled, false );
+			fixture.ui.event( { kind: "activate", id: "friend-remove" } );
+			output = draw();
+			assert.ok(
+				!output.controls.some( control => control.id === "friend-ok" ),
+				"no question without a selection"
+			);
+			fixture.ui.event( { kind: "activate", id: "friend-down" } );
+			output = draw();
+			assert.notEqual(
+				output.controls.find( control => control.id.startsWith( "friend-row:" ) )?.id,
+				rows[0].id,
+				"the list scrolls"
+			);
+			fixture.ui.event( { kind: "activate", id: "friend-up" } );
+			output = draw();
+			fixture.ui.event( { kind: "activate", id: "friend-row:100" } );
+			output = draw();
+			assert.equal( output.controls.find( control => control.id === "friend-whisper" )?.disabled, false );
+			fixture.ui.event( { kind: "activate", id: "friend-remove" } );
+			output = draw();
+			assert.ok( output.controls.some( control => control.id === "friend-ok" ), "the delete question" );
+			fixture.ui.event( { kind: "activate", id: "friend-ok" } );
+			draw();
+			assert.deepEqual( gameplay().at( -1 ), { kind: "friend-delete", jid: 100 } );
+			fixture.ui.event( { kind: "activate", id: "friend-add" } );
+			output = draw();
+			assert.ok( output.controls.some( control => control.id === "friend-name" ), "the name box" );
+			fixture.ui.event( { kind: "edit", id: "friend-name", value: "Cale", start: 4, end: 4, composing: false } );
+			fixture.ui.event( { kind: "activate", id: "friend-ok" } );
+			draw();
+			assert.deepEqual( gameplay().at( -1 ), { kind: "friend-request", name: "Cale" } );
+			fixture.state.gameplay.friends = {
+				rows: friendRows(),
+				prompt: { jid: 7, serial: 3, name: "Dora" },
+				pending: false
+			};
+			output = draw();
+			assert.ok( output.controls.some( control => control.id === "friend-accept" ), "the request prompt" );
+			assert.ok( output.controls.some( control => control.id === "friend-refuse" ) );
+			fixture.ui.event( { kind: "activate", id: "friend-refuse" } );
+			draw();
+			assert.deepEqual( gameplay().at( -1 ), { kind: "friend-answer", accept: false } );
+		} finally {
+			fixture.dispose();
+		}
+	});
+}
+
+test("compact HUD draws EXP/SP progression and keeps quickslots 0..10 uncovered and droppable while windows are open", () => {
+	const sent = [], fixture = uiFixture( command => sent.push( command ) );
+	let time = 0, published;
+	/*
+	================
+	draw
+	================
+	*/
+	function draw( steps = 4 ) {
+		for ( let i = 0; i < steps; i++ ) {
+			published = fixture.ui.step( fixture.state, ++time * 100 ) ?? published;
+			assert.equal( fixture.ui.stats().error, null );
+		}
+		return defined( published );
+	}
+	try {
+		Object.assign( fixture.state.gameplay, {
+			skills: [ 3 ],
+			progression: {
+				level: 20,
+				experience: "141000",
+				skillExperience: 200,
+				skillPoints: 42,
+				masteries: [ { id: 257, level: 7 } ]
+			}
+		} );
+		for ( const [width, height] of [ [ 375, 667 ], [ 609, 327 ], [ 667, 375 ] ] ) {
+			fixture.state.width = width;
+			fixture.state.height = height;
+			let output = draw( 24 );
+			const scene = defined( fixture.scenes.at( -1 ) );
+			const expSegments = scene.quads.filter(
+				quad => typeof quad.texture === "string" && quad.texture.endsWith( "/ub_exp_bar.png" )
+			);
+			assert.ok( expSegments.length > 0, `${width}x${height}: compact HUD draws ub_exp_bar segments` );
+			nativeGlyphs( fixture );
+			for (
+				const panel of /** @type {const} */ ([
+					"Skills",
+					"Inventory",
+					"Character",
+					"Actions",
+					"Party",
+					"Quests"
+				])
+			) {
+				fixture.ui.event( { kind: "activate", id: "open-window:" + panel } );
+				output = draw();
+				for ( let slot = 0; slot <= 10; slot++ ) {
+					const hotbar = defined( output.controls.find( c => c.id === "hotbar:" + slot ) );
+					const hit = defined(
+						topmostControlAt(
+							output.controls,
+							hotbar.rect[0] + hotbar.rect[2] / 2,
+							hotbar.rect[1] + hotbar.rect[3] / 2
+						)
+					);
+					assert.equal(
+						hit.id,
+						"hotbar:" + slot,
+						`${width}x${height} ${panel}: hotbar:${slot} stays uncovered at its center`
+					);
+				}
+				if ( panel === "Skills" && width === 609 ) {
+					fixture.ui.event( { kind: "activate", id: "skill-tab:0" } );
+					fixture.ui.event( { kind: "activate", id: "skill-mastery:257" } );
+					output = draw();
+					const skill = defined(
+						output.controls.find( c => c.id.startsWith( "skill:" ) && c.draggable )
+					);
+					const skillId = Number( skill.id.slice( 6 ) );
+					for ( let slot = 4; slot <= 9; slot++ ) {
+						const target = defined( output.controls.find( c => c.id === "hotbar:" + slot ) );
+						const before = sent.length;
+						fixture.ui.event( {
+							kind: "drag-end",
+							id: skill.id,
+							x: target.rect[0] + target.rect[2] / 2,
+							y: target.rect[1] + target.rect[3] / 2
+						} );
+						draw();
+						assert.ok( sent.length > before, `slot ${slot} accepted skill drag` );
+						assert.deepEqual( sent.at( -1 ), {
+							kind: "gameplay",
+							command: {
+								kind: "quickslot-set",
+								binding: { slot, kind: 0x49, payload: skillId }
+							}
+						} );
+					}
+				}
+				fixture.ui.event( { kind: "activate", id: panelCloseId( panel ) } );
+				draw();
+			}
+		}
+	} finally {
+		fixture.dispose();
+	}
+});

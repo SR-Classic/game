@@ -1,0 +1,986 @@
+/*
+===========================================================================
+
+deps.go - bootstrap dependencies and authority composition
+
+===========================================================================
+*/
+package enterworld
+
+import (
+	"fmt"
+	"opensro.online/server/internal/domain"
+	"strings"
+	"sync"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/world/instance"
+	"opensro.online/server/internal/game/world/simulation"
+	"opensro.online/server/internal/transport"
+)
+
+// StaticCharacterSource is an in-memory CharacterSource.
+/*
+================
+StaticCharacterSource
+================
+*/
+type StaticCharacterSource map[string][]*Character
+
+// CharactersForDivision returns the division's characters.
+/*
+================
+CharactersForDivision
+================
+*/
+func (s StaticCharacterSource) CharactersForDivision(divisionID string) []*Character {
+	return s[divisionID]
+}
+
+// Deps owns bootstrap composition. Other gameplay packages consume narrow,
+// package-owned ports rather than retaining this concrete type.
+/*
+================
+Deps
+================
+*/
+/*
+================
+refObjSnapshotCache
+
+Memoizes the filtered RefObj snapshot (bootstrap.go) for one
+BrowserReferences generation. The snapshot's inputs are boot-static:
+the roster, the NPC roster, the summonable refs and the monster
+template are loaded once and never mutated afterwards. The production
+constructor installs the holder; a nil holder computes on every Build,
+as fixtures always have.
+================
+*/
+type refObjSnapshotCache struct {
+	mu     sync.Mutex
+	refs   *BrowserReferences
+	rows   []RefObjRow
+	cached bool
+}
+
+type Deps struct {
+	BrowserReferences *BrowserReferences
+	// SiegeStructUpgrades is the resolved siege structure upgrade
+	// table the bootstrap publishes (fortress_upgrades.go); the
+	// composition root resolves it once from the boot textdata, and
+	// fixtures leave it empty.
+	SiegeStructUpgrades []SiegeStructUpgradeRow
+	// refObjCache memoizes the filtered RefObj snapshot; installed by
+	// NewDevDepsWithRoster, nil in fixtures (see refObjSnapshotCache).
+	refObjCache *refObjSnapshotCache
+	Roster      *Roster
+	Characters  CharacterSource
+
+	Items        ItemRefSource
+	Levels       LevelDataSource
+	Skills       SkillDataSource
+	MagicOptions MagicOptionSource
+	// SetGroups is the port-only dormant set catalogue (setgroups.go);
+	// consumers read it through SetCatalogue, which gates on the flag.
+	SetGroups         SetCatalogueSource
+	EquipItemsEnabled bool
+	// StarterKit is the beta starter kit (starterkit.go); empty when disabled.
+	StarterKit []WireItem
+	// MasteryTotalOverride is shared with progression; zero means native.
+	MasteryTotalOverride int64
+	// LevelCap publishes the shard's configured character level cap
+	// (SRO_LEVEL_CAP, progression's vocabulary) so the client's level
+	// windows follow it; zero is the native cap and publishes nothing.
+	LevelCap int64
+	// SlowEnterThreshold is the enter-handler duration that earns the
+	// "bootstrap: slow enter world" phase log (register.go): an entry
+	// past it names the gate wait against the total. Zero means the
+	// production default; tests set it so a held gate trips the line
+	// without waiting out that bound.
+	SlowEnterThreshold time.Duration
+	// GateWaitBound caps how long the enter handler waits for the
+	// publication gate before abandoning the entry unanswered
+	// (register.go): the gate is taken before scene admission, so a
+	// parked wait is invisible to both the bootstrap watchdog and the
+	// slow-entry log. Zero means the production default; tests set it
+	// so a held gate trips the abandonment without waiting it out.
+	GateWaitBound time.Duration
+	// EncodeEntryPayload renders the browser entry payload for one
+	// built bootstrap result (browserEntryPayload); nil uses it with
+	// BrowserReferences. A test seam: the entry handler now encodes
+	// after releasing the publication gate, and a test proves the
+	// gate is free while the encoder runs.
+	EncodeEntryPayload func(result *BootstrapResult) ([]byte, error)
+	// InventoryPages publishes the port-only SRO_INVENTORY_PAGES rule
+	// (inventory_pages.go): world entry presents and adopts the 2.5-page
+	// base; false is native.
+	InventoryPages bool
+	// ChatItemLinks publishes the port-only SRO_CHAT_ITEM_LINKS rule as its
+	// per-line link limit (game/social/chat itemlinks.go); 0 is native.
+	ChatItemLinks int64
+	// StorageAutoStack publishes the port-only SRO_STORAGE_AUTO_STACK rule
+	// (action/storageautostack.go); false is native.
+	StorageAutoStack bool
+	// FastDenReturn publishes the port-only SRO_FAST_DEN_RETURN rule
+	// (action/denreturn.go); false is native.
+	FastDenReturn bool
+	// TradeTiers publishes the port-only SRO_TRADE_TIERS rule
+	// (action/tradetiers.go); false is native.
+	TradeTiers bool
+	// JobSuitHidesArmor publishes the port-only SRO_JOB_SUIT_HIDES_ARMOR
+	// rule (action/jobsuitarmor.go); false is native.
+	JobSuitHidesArmor bool
+	// MoonlitThiefSuit publishes the port-only SRO_MOONLIT_THIEF_SUIT rule
+	// (action/moonlitthiefsuit.go); false is native.
+	MoonlitThiefSuit bool
+	// Alexandria publishes the port-only SRO_ALEXANDRIA switch
+	// (world/alexandria); false is native.
+	Alexandria bool
+	// RaisedGoldCaps publishes the port-only SRO_RAISED_GOLD_CAPS rule
+	// (action/goldcaps.go): the client's stall price editor and warehouse
+	// deposit dialog raise their native caps; false is native.
+	RaisedGoldCaps bool
+	// StarterRefills are the beta's HP/MP potion refills (starterrefill.go);
+	// empty when the kit is disabled.
+	StarterRefills []StarterRefill
+	// NpcSpawns is the shared static-world NPC policy consumed by bootstrap,
+	// selection and the simulation ticker. One composition-owned value prevents
+	// the old env/default roster split from creating objects no action lane
+	// could resolve.
+	NpcSpawns NpcSpawnConfig
+
+	RestoreEntryEffects  func(divisionID, characterName string)
+	PrepareEntry         func(divisionID, characterName string) error
+	EntryPopulationLease func(divisionID, characterName string) (instance.Lease, bool)
+	// Pure quest projection on the detached entry snapshot; never grants items.
+	NormalizeEntryQuests func(character *Character) error
+	// EntryBetaSilk grants the beta's starter silk once per account
+	// (SRO_BETA_SILK, port-only, action/betasilk.go); nil in native mode.
+	EntryBetaSilk func(character *Character)
+	// RemoveExpiredEventBoxes retires a finished event's boxes from every
+	// container (port-only, action/halloween.go); false leaves every row
+	// untouched, so the entry door writes only for a character that
+	// actually held a box past the window's end.
+	RemoveExpiredEventBoxes      func(character *Character) bool
+	AdmitCharacterSession        func(divisionID, characterName string, session uint64) error
+	RetireCharacterSession       func(divisionID, characterName string, session uint64)
+	EntryActionSpeed             func(divisionID, characterName string) float32
+	EntryCompanionActionSpeed    func(division string, character *Character, pet *CharacterCOS) float32
+	EntryCompanionMovementSpeeds func(division string, character *Character, pet *CharacterCOS) (float32, float32)
+	EntryMovementSpeeds          func(divisionID, characterName string) (float32, float32)
+	EntryCompanionSpawn          func(string, *Character, *CharacterCOS) simulation.Spawn
+	EntrySkills                  func(divisionID, characterName string) []EntrySkill
+	ObjectListRows               func(divisionID string, character *Character, entry *LocalPlayerEntry) []Packet
+	MonsterState                 *simulation.MonsterState
+	RefObjSnapshot               func() []RefObjRow
+	// ExtraRefItemCodenames names the division-dependent item references a
+	// login carries (the ground). StaticRefItemCodenames names the fixed set
+	// every viewer needs; it is published once in BrowserReferences.
+	ExtraRefItemCodenames  func(divisionID string) []string
+	StaticRefItemCodenames func() []string
+	// Now is the bootstrap's clock. The server wiring points it at the action
+	// runtime's clock so both agree on every pet-skill deadline; nil falls
+	// back to the wall clock.
+	Now func() time.Time
+	// TrackTimedWindows hands a character with pet-skill windows to the action
+	// runtime's tick sweep, which alone retires spent rows with the native
+	// zero pair. Without it a window re-raised at world entry would sit at
+	// zero on the client: CIFMagicStateBoard_OnUpdate (6E6AA0) does not retire
+	// a kind-3 pet-skill window solely because its timer reached zero.
+	TrackTimedWindows func(divisionID, characterName string)
+	// TrackMostWanted hands a character holding a Most Wanted streak to
+	// the action runtime's tick sweep (port-only, #1849), which sends
+	// the entry wanted state and enforces the level's seven-day lapse.
+	// Without it a relogged holder's buff-board row would never appear
+	// and a lapsed level would outlive its seven days.
+	TrackMostWanted func(divisionID, characterName string)
+	// ExtraMagicOptionIDs names options live item producers can create after
+	// bootstrap. Their definitions must precede the first result body.
+	ExtraMagicOptionIDs func() []uint32
+	// AvatarMagicOptions are the options the smith may grant each avatar
+	// part (magicoptionassign.txt), which the grant window lists.
+	AvatarMagicOptions    func() []AvatarMagicOptionRow
+	SpawnTerrainHeight    func(regionID uint16, x, z float64) (float64, bool)
+	SpawnSurfaceHeight    func(regionID uint16, x, authoredY, z float64) (float64, bool)
+	RelocateStrandedSpawn func(spawn simulation.Spawn) (
+		result simulation.Spawn,
+		stranded bool,
+		rescueFound bool,
+	)
+	// AdoptEntrySpawn commits a spawn the entry moved (lift or rescue) to the
+	// live world and the record, so server and client agree on the stand.
+	AdoptEntrySpawn     func(divisionID, characterName string, spawn simulation.Spawn)
+	CanEnterWorldRegion func(character *Character, regionID uint16) bool
+	PlayerBaseStats     func(character *Character) (wire.BaseStats, error)
+
+	MutateCharacter  func(character *Character, label string, mutate func())
+	MutateCharacters func(characters []*Character, label string, mutate func())
+	UpdateCharacter  func(character *Character, label string, update func() bool) bool
+	UpdateCharacters func(characters []*Character, label string, update func() bool) bool
+	UpdateTrade      func(characters []*Character, label string, update func(*domain.TradeRewardPool) bool) bool
+	// The deferred doors (store tickbatch.go) leave their rows to the
+	// tick's one batched commit. Only tick-only paths use them; nil falls
+	// back to the immediate door.
+	MutateCharacterDeferred  func(character *Character, label string, mutate func())
+	MutateCharactersDeferred func(characters []*Character, label string, mutate func())
+	UpdateCharacterDeferred  func(character *Character, label string, update func() bool) bool
+	UpdateCharactersDeferred func(characters []*Character, label string, update func() bool) bool
+	// OnCharacterLevelChanged runs after a character update door releases its
+	// authority lock when a character's Level changed during the transaction:
+	// natively the level transition recovers the character's vitals and the
+	// training-camp member status goes out with it.
+	OnCharacterLevelChanged func(character *Character)
+	// CloseJobWeek and JobRankings own the job guilds' weekly close and its
+	// ranking snapshot (store jobweek.go).
+	CloseJobWeek func(divisionID string, week int64, label string) bool
+	JobRankings  func(divisionID string) domain.JobRankings
+	// QueueRename queues a name-change scroll's rename on the authority
+	// store (port-only, #1689, SRO_NAME_CHANGE_SCROLL). It runs OUTSIDE
+	// every character commit door - it takes the store's own lock - and
+	// answers why a queue was refused. Nil refuses every queue.
+	QueueRename func(divisionID string, character *Character, name string, nowMs int64) (RenameQueueOutcome, error)
+	// fixtureJobRankings is CloseWeek's snapshot when no authority is wired.
+	fixtureJobRankings map[string]domain.JobRankings
+	// HalloweenAccountRecord is the account's daily Halloween box count
+	// (store halloweenboxes.go, port-only #2547): the live record, read
+	// or mutated only inside a write door. Nil keeps the records in
+	// fixtureHalloweenBoxes below.
+	HalloweenAccountRecord func(accountID string) *domain.HalloweenBoxAccount
+	// fixtureHalloweenBoxes is HalloweenAccount's store when no authority
+	// is wired.
+	fixtureHalloweenBoxes map[string]*domain.HalloweenBoxAccount
+	// SookArenaAccountRecord is the account's survival arena daily
+	// entry count (store sookarenaaccounts.go, port-only #3322): the
+	// live record, read or mutated only inside a write door. Nil keeps
+	// the records in fixtureSookArenaAccounts below.
+	SookArenaAccountRecord func(accountID string) *domain.SookArenaAccount
+	// fixtureSookArenaAccounts is SookArenaAccount's store when no
+	// authority is wired.
+	fixtureSookArenaAccounts map[string]*domain.SookArenaAccount
+	ReadCharacter            func(divisionID string, read func())
+	// CharacterWriteEpoch is the authority's per-record write count
+	// (store CharacterWriteEpoch): a reader that copied a record at
+	// one epoch may reuse the copy while the epoch stands. Nil leaves
+	// every copy unshared (WriteEpoch reports unwired).
+	CharacterWriteEpoch func(character *Character) uint64
+	// ReadLock and ReadUnlock are the two halves of the read door the
+	// callback above runs between, exposed so a per-tick reader can
+	// hold the door as a value (AcquireRead) instead of boxing a
+	// closure per call (#2030). Both nil reads unguarded, as the
+	// callback does when ReadCharacter is unset.
+	ReadLock   func(divisionID string)
+	ReadUnlock func(divisionID string)
+
+	SystemMessages    func(character *Character) interface{}
+	ResolveDivisionID func(requestDivisionID string) string
+	// ItemSaleNote takes one ordinary merchant sale's item evidence
+	// into the economy's per-item hourly buckets (store
+	// NoteItemSale, #3307): the sold item's codename, how many, and
+	// the gold the seller was credited. Installed by the server
+	// wiring with the authority store; nil keeps no item evidence,
+	// as a detached composition has no ledger to keep it in.
+	ItemSaleNote func(charID int64, item string, count int, gold int64) error
+	// TradeNote takes the two records of one committed exchange or stall
+	// sale (store NoteTrade, trade_history.go, port-only): both parties'
+	// rows, noted from inside the trade's commit door so they join its
+	// transaction. Installed by the server wiring with the authority store;
+	// nil keeps no trade history.
+	TradeNote func(records []domain.TradeRecord) error
+	// LockPublication orders bootstrap snapshots with action/tick inventory
+	// receipts. The returned release runs only after the full batch is queued.
+	// The label names this holder class for the gate-hold report.
+	LockPublication func(divisionID, label string) func()
+	// FriendConsent receives a ConsentAnswerLength 0x3012 body: the native
+	// client's friend-request answer shares the opcode with the port's
+	// empty game-ready (RegisterGameReady). Nil drops consents.
+	FriendConsent func(session *transport.Session, payload []byte)
+	OnWorldBound  func(
+		session *transport.Session,
+		divisionID string,
+		character *Character,
+	)
+	// PublishEntry, when set, runs the successful entry batch's send: the
+	// guild lane records which guild block (the 0x32C4 seed) the session
+	// now holds in the same order as the send (guild/baseline.go). Nil
+	// sends directly.
+	PublishEntry func(
+		session *transport.Session,
+		divisionID string,
+		character *Character,
+		send func() error,
+	) error
+	// Immutable references consumed by scene-local client owners must be
+	// republished after every bootstrap, including same-session travel.
+	SceneReferenceFrames func() []wire.Frame
+	// ReconcileSceneObjects runs once a loading scene goes live. Removals
+	// committed while it loaded reached no viewer (scope routing skips a
+	// loading scene), so the owner retires bootstrap objects that are gone,
+	// and repeats state the new local player starts without (the trade
+	// level of a loaded transport).
+	ReconcileSceneObjects  func(session *transport.Session, divisionID string, character *Character)
+	CommunitySeedFramesFor func(
+		divisionID string,
+		character *Character,
+	) []Packet
+	// EntryEventFrames are a login's (not a re-entry's) port-only seeds:
+	// a running event's notices (action/halloween_waves.go) and the saved
+	// Survival Arena chest (action/sookarena_chest.go, #3376). It runs
+	// after the publication gate opens and takes the division lock
+	// itself; nil or empty sends nothing.
+	EntryEventFrames func(divisionID string, character *Character) []Packet
+	// EntryEventGroups are the running events' groups every entry lists
+	// beside the character's own (the entered tail and the JSON entry):
+	// port-only, action/event_groups.go; nil adds none.
+	EntryEventGroups func() []uint32
+
+	Letters       LetterStore
+	Guilds        GuildStore
+	GuildWars     domain.GuildWarStore
+	TrainingCamps TrainingCampStore
+	// Fortresses keeps fortress occupation and the war's requests.
+	Fortresses FortressStore
+	// Alliances keeps the guild unions.
+	Alliances AllianceStore
+}
+
+// NpcSpawnPolicy exposes the composition-owned static NPC world through a
+// narrow optional port. Itemops type-asserts this method so detached test
+// dependencies do not need to manufacture world data.
+/*
+================
+NpcSpawnConfig
+================
+*/
+func (d *Deps) NpcSpawnPolicy() NpcSpawnConfig {
+	if d == nil {
+		return NpcSpawnConfig{}
+	}
+	return d.NpcSpawns
+}
+
+// Mutate routes an accepted single-character mutation through its commit
+// door. Detached unit compositions execute in memory.
+/*
+================
+Mutate
+================
+*/
+func (d *Deps) Mutate(character *Character, label string, mutate func()) {
+	if d.MutateCharacter != nil {
+		d.MutateCharacter(character, label, mutate)
+		return
+	}
+	mutate()
+}
+
+/*
+================
+NoteItemSale
+
+Notes one committed merchant sale's item evidence (ItemSaleNote);
+unwired keeps nothing. A failed note is the ledger's loss alone -
+the sale already landed - so it is logged, never returned.
+================
+*/
+func (d *Deps) NoteItemSale(charID int64, item string, count int, gold int64) {
+	if d.ItemSaleNote == nil {
+		return
+	}
+	if err := d.ItemSaleNote(charID, item, count, gold); err != nil {
+		log.Warnf("economy item sale note: %v", err)
+	}
+}
+
+/*
+================
+NoteTrade
+
+Notes one committed trade's two records (TradeNote, port-only). Called from
+inside the trade's commit door, so the rows join that transaction. A refused
+note is logged, never returned: the trade has already happened, and a history
+write must never undo it. Unwired keeps nothing.
+================
+*/
+func (d *Deps) NoteTrade(records []domain.TradeRecord) {
+	if d.TradeNote == nil {
+		return
+	}
+	if err := d.TradeNote(records); err != nil {
+		log.Warnf("trade history note: %v", err)
+	}
+}
+
+// Update routes a validate-and-change operation through the conditional
+// character commit door. A false callback result is a refusal: no dirty state
+// and no database transaction are produced.
+/*
+================
+bool
+================
+*/
+func (d *Deps) Update(character *Character, label string, update func() bool) bool {
+	characters := []*Character{character}
+	if d.UpdateCharacter != nil {
+		return d.runCharacterUpdate(characters, label, update, func(fn func() bool) bool {
+			return d.UpdateCharacter(character, label, fn)
+		})
+	}
+	if update == nil {
+		return false
+	}
+	// A detached composition may provide only the unconditional commit seam.
+	if d.MutateCharacter != nil {
+		return d.runCharacterUpdate(characters, label, update, func(fn func() bool) bool {
+			changed := false
+			d.MutateCharacter(character, label, func() {
+				changed = fn()
+			})
+			return changed
+		})
+	}
+	return d.runCharacterUpdate(characters, label, update, func(fn func() bool) bool {
+		return fn()
+	})
+}
+
+// RenameQueueOutcome says how a name-change scroll's queue request ended
+// (port-only, #1689). The scroll's handler maps each refusal to its own
+// failure byte; the store's error vocabulary stays behind the composition
+// that wires Deps.QueueRename.
+type RenameQueueOutcome uint8
+
+const (
+	RenameQueued RenameQueueOutcome = iota
+	RenameRefusedInvalidName
+	RenameRefusedNameTaken
+	RenameRefusedNameReserved
+	RenameRefusedAlreadyQueued
+	RenameRefusedCooldown
+)
+
+/*
+================
+QueueCharacterRename
+
+Queues a paid rename for the next login through the wired authority door.
+An unwired composition refuses: the scroll keeps its native unsupported
+answer because the caller checks the feature flag first.
+================
+*/
+func (d *Deps) QueueCharacterRename(divisionID string, character *Character, name string, nowMs int64) (RenameQueueOutcome, error) {
+	if d == nil || d.QueueRename == nil {
+		return RenameRefusedInvalidName, fmt.Errorf("enterworld: rename queue door is not wired")
+	}
+	return d.QueueRename(divisionID, character, name, nowMs)
+}
+
+// MutateMany routes a multi-character invariant through one atomic door.
+/*
+================
+MutateMany
+================
+*/
+func (d *Deps) MutateMany(characters []*Character, label string, mutate func()) {
+	if d.MutateCharacters != nil {
+		d.MutateCharacters(characters, label, mutate)
+		return
+	}
+	mutate()
+}
+
+// UpdateMany routes a conditional multi-character invariant through one
+// authority transaction.
+/*
+================
+bool
+================
+*/
+func (d *Deps) UpdateMany(characters []*Character, label string, update func() bool) bool {
+	if d.UpdateCharacters != nil {
+		return d.runCharacterUpdate(characters, label, update, func(fn func() bool) bool {
+			return d.UpdateCharacters(characters, label, fn)
+		})
+	}
+	if update == nil {
+		return false
+	}
+	if d.MutateCharacters != nil {
+		return d.runCharacterUpdate(characters, label, update, func(fn func() bool) bool {
+			changed := false
+			d.MutateCharacters(characters, label, func() {
+				changed = fn()
+			})
+			return changed
+		})
+	}
+	return d.runCharacterUpdate(characters, label, update, func(fn func() bool) bool {
+		return fn()
+	})
+}
+
+/*
+================
+MutateDeferred
+
+Mutate for a path only the simulation tick reaches: its commit joins the
+tick's batch (store tickbatch.go). A handler never calls it, since its
+answer must follow the commit.
+================
+*/
+func (d *Deps) MutateDeferred(character *Character, label string, mutate func()) {
+	if d.MutateCharacterDeferred != nil {
+		d.MutateCharacterDeferred(character, label, mutate)
+		return
+	}
+	d.Mutate(character, label, mutate)
+}
+
+/*
+================
+UpdateDeferred
+
+Update for a path only the simulation tick reaches (see MutateDeferred).
+================
+*/
+func (d *Deps) UpdateDeferred(character *Character, label string, update func() bool) bool {
+	if d.UpdateCharacterDeferred != nil {
+		return d.runCharacterUpdate([]*Character{character}, label, update, func(fn func() bool) bool {
+			return d.UpdateCharacterDeferred(character, label, fn)
+		})
+	}
+	return d.Update(character, label, update)
+}
+
+/*
+================
+MutateManyDeferred
+
+MutateMany for a path only the simulation tick reaches (see MutateDeferred).
+================
+*/
+func (d *Deps) MutateManyDeferred(characters []*Character, label string, mutate func()) {
+	if d.MutateCharactersDeferred != nil {
+		d.MutateCharactersDeferred(characters, label, mutate)
+		return
+	}
+	d.MutateMany(characters, label, mutate)
+}
+
+/*
+================
+UpdateManyDeferred
+
+UpdateMany for a path only the simulation tick reaches (see MutateDeferred).
+================
+*/
+func (d *Deps) UpdateManyDeferred(characters []*Character, label string, update func() bool) bool {
+	if d.UpdateCharactersDeferred != nil {
+		return d.runCharacterUpdate(characters, label, update, func(fn func() bool) bool {
+			return d.UpdateCharactersDeferred(characters, label, fn)
+		})
+	}
+	return d.UpdateMany(characters, label, update)
+}
+
+/*
+================
+trackedCharacterLevel
+================
+*/
+func trackedCharacterLevel(c *Character) int64 {
+	if c == nil || c.Level == nil || *c.Level < 1 {
+		return 1
+	}
+	return *c.Level
+}
+
+/*
+================
+runCharacterUpdate
+
+Runs a single- or multi-character conditional update through door and
+notifies OnCharacterLevelChanged after the door releases the authority lock
+for every character whose Level changed during the committed update.
+================
+*/
+func (d *Deps) runCharacterUpdate(
+	characters []*Character,
+	label string,
+	update func() bool,
+	door func(func() bool) bool,
+) bool {
+	var changed []*Character
+	wrapped := refusalAudited(label, characters, func() bool {
+		var before []int64
+		if d != nil && d.OnCharacterLevelChanged != nil {
+			before = make([]int64, len(characters))
+			for i, c := range characters {
+				before[i] = trackedCharacterLevel(c)
+			}
+		}
+		if !update() {
+			return false
+		}
+		if before != nil {
+			for i, c := range characters {
+				if c != nil && trackedCharacterLevel(c) != before[i] {
+					changed = append(changed, c)
+				}
+			}
+		}
+		return true
+	})
+	if !door(wrapped) {
+		return false
+	}
+	if d != nil && d.OnCharacterLevelChanged != nil {
+		for _, c := range changed {
+			d.OnCharacterLevelChanged(c)
+		}
+	}
+	return true
+}
+
+/*
+================
+SettleTrade
+
+Production supplies the shard pool transaction. The in-memory fallback is
+for isolated gameplay fixtures, which do not run a durable authority.
+================
+*/
+func (d *Deps) SettleTrade(characters []*Character, label string, update func(*domain.TradeRewardPool) bool) bool {
+	if d.UpdateTrade != nil {
+		return d.UpdateTrade(characters, label, update)
+	}
+	return d.UpdateMany(characters, label, func() bool {
+		pool := domain.TradeRewardPool{}
+		return update(&pool)
+	})
+}
+
+/*
+================
+CloseWeek
+
+Production closes the week in the authority. Isolated gameplay fixtures,
+which run no durable authority, close it over the fixture's characters
+and keep the snapshot in memory.
+================
+*/
+func (d *Deps) CloseWeek(divisionID string, week int64, label string) bool {
+	if d.CloseJobWeek != nil {
+		return d.CloseJobWeek(divisionID, week, label)
+	}
+	previous := d.fixtureJobRankings[divisionID]
+	if week <= previous.Week {
+		return false
+	}
+	if d.fixtureJobRankings == nil {
+		d.fixtureJobRankings = map[string]domain.JobRankings{}
+	}
+	if previous.Week == 0 {
+		previous.Week = week
+		d.fixtureJobRankings[divisionID] = previous
+		return true
+	}
+	pool := domain.TradeRewardPool{}
+	d.fixtureJobRankings[divisionID] = domain.CloseJobWeek(d.CharactersForDivision(divisionID), &pool, previous, week)
+	return true
+}
+
+/*
+================
+WeekRankings
+================
+*/
+func (d *Deps) WeekRankings(divisionID string) domain.JobRankings {
+	if d.JobRankings != nil {
+		return d.JobRankings(divisionID)
+	}
+	return d.fixtureJobRankings[divisionID]
+}
+
+// Read routes mutable character reads through the authority read door.
+/*
+================
+Read
+================
+*/
+func (d *Deps) Read(divisionID string, read func()) {
+	if d.ReadCharacter != nil {
+		d.ReadCharacter(divisionID, read)
+		return
+	}
+	read()
+}
+
+/*
+================
+WriteEpoch
+
+The record's write epoch and whether an authority reports one. A
+composition without the epoch wired (detached fixtures) reports
+unwired, and its readers never share a copy across calls.
+================
+*/
+func (d *Deps) WriteEpoch(character *Character) (uint64, bool) {
+	if d == nil || d.CharacterWriteEpoch == nil || character == nil {
+		return 0, false
+	}
+	return d.CharacterWriteEpoch(character), true
+}
+
+/*
+================
+ReadGuard
+
+The read door held as a value instead of a callback: a caller that
+reads a handful of scalars every tick (the pet judges, #2030) takes
+the door on the stack and releases it in line, instead of boxing a
+closure and its captures on every call. The guard holds the same
+store read lock the callback door runs between; a Deps without the
+lock pair reads unguarded, exactly as the callback does when
+ReadCharacter is unset.
+================
+*/
+type ReadGuard struct {
+	deps     *Deps
+	division string
+}
+
+/*
+================
+AcquireRead
+================
+*/
+func (d *Deps) AcquireRead(divisionID string) ReadGuard {
+	if d.ReadLock != nil {
+		d.ReadLock(divisionID)
+	}
+	return ReadGuard{deps: d, division: divisionID}
+}
+
+/*
+================
+Release
+
+Releasing twice is a no-op, so a guard released early and again on
+the way out cannot unlock a door it no longer holds.
+================
+*/
+func (g *ReadGuard) Release() {
+	if g.deps != nil && g.deps.ReadUnlock != nil {
+		g.deps.ReadUnlock(g.division)
+	}
+	g.deps = nil
+}
+
+// ReentryPackets rebuilds the native reset/character/object-list
+// sequence for an already-bound mission session. Teleport-style operations
+// use this after their authoritative world mutation so the client enters the
+// same loading transition as a retail region reset instead of receiving only
+// an in-world position correction.
+/*
+================
+ReentryPackets
+================
+*/
+func (d *Deps) ReentryPackets(divisionID, characterName string) ([]Packet, bool) {
+	projection := *d
+	projection.RestoreEntryEffects = nil // Caller already owns the live actor transaction.
+	projection.PrepareEntry = nil
+	projection.AdoptEntrySpawn = nil
+	// The bootstrap's own writes (the seed, the starter kit, the encoded
+	// inventory adoption below) ride the deferred door (#1820): a
+	// re-entry built on the tick joins the tick's one batched commit
+	// instead of committing per door under the division lock. A deferred
+	// door called with no batch open commits at once (store
+	// tickbatch.go), so a re-entry built by a handler behaves exactly as
+	// before. Login never passes through here and keeps its doors.
+	if d.MutateCharacterDeferred != nil {
+		projection.MutateCharacter = d.MutateCharacterDeferred
+	}
+	result := Build(&projection, BootstrapRequest{
+		DivisionID:    divisionID,
+		CharacterName: characterName,
+	})
+	return projection.encodeReentry(result)
+}
+
+// PreparedReentry couples the packets to the resolved placement they encode.
+// The action owner commits this placement only after preparation succeeds.
+/*
+================
+PreparedReentry
+================
+*/
+type PreparedReentry struct {
+	Packets []Packet
+	Spawn   simulation.Spawn
+	// InventorySize is the capacity the packets present; the committing
+	// owner adopts it on the live record (domain.AdoptInventorySize).
+	InventorySize uint8
+	// InventoryBase is the inventory-pages floor the packets present
+	// (zero native); the committing owner raises the live record to it.
+	InventoryBase uint8
+}
+
+/*
+================
+PrepareReentry
+================
+*/
+func (d *Deps) PrepareReentry(divisionID string, character *Character) (PreparedReentry, bool) {
+	if character == nil || character.DeletePending || character.MissionInventory == nil {
+		return PreparedReentry{}, false
+	}
+	snapshot := character.Snapshot()
+	if d.NormalizeEntryQuests != nil {
+		if err := d.NormalizeEntryQuests(snapshot); err != nil {
+			return PreparedReentry{}, false
+		}
+	}
+	projection := *d
+	// The caller holds the division lock and commits the returned stand only
+	// after preparation succeeds. Login adoption would re-enter that lock.
+	projection.AdoptEntrySpawn = nil
+	snapshot.PresentInventoryExpansion()
+	var inventoryBase uint8
+	if d.InventoryPages {
+		snapshot.RaiseInventoryFloor(domain.InventoryPagesBase)
+		inventoryBase = domain.InventoryPagesBase
+	}
+	result := buildCharacterProjection(&projection, divisionID, snapshot)
+	packets, ok := d.encodeReentry(result)
+	if !ok {
+		return PreparedReentry{}, false
+	}
+	spawn := result.LocalPlayerEntry.StartProfile
+	return PreparedReentry{Packets: packets, Spawn: simulation.Spawn{
+		RegionID: uint16(spawn.RegionID), X: spawn.X, Y: spawn.Y, Z: spawn.Z, Angle: uint16(spawn.Angle),
+	}, InventorySize: snapshot.InventoryCapacity(), InventoryBase: inventoryBase}, true
+}
+
+/*
+================
+entryPayload
+
+The one browser-entry-payload encode, shared by the enter handler and
+the re-entry prepares; EncodeEntryPayload replaces it in tests.
+================
+*/
+func (d *Deps) entryPayload(result *BootstrapResult) ([]byte, error) {
+	if d != nil && d.EncodeEntryPayload != nil {
+		return d.EncodeEntryPayload(result)
+	}
+	return browserEntryPayload(result, d.BrowserReferences)
+}
+
+/*
+================
+encodeReentry
+================
+*/
+func (d *Deps) encodeReentry(result *BootstrapResult) ([]Packet, bool) {
+	if result == nil || result.NativeResult != nativeResultSuccess {
+		return nil, false
+	}
+	if len(result.Packets) == 0 || result.Packets[0].NativeOpcode != OpcodeResetClient {
+		return nil, false
+	}
+	payload, err := d.entryPayload(result)
+	if err != nil {
+		return nil, false
+	}
+	// Reset opens the existing session's re-entry admission. Replace the browser
+	// projection before its GID latch: retaining the login DTO here resurrects
+	// stale HP and coordinates even though the native stream is already fresh.
+	packets := make([]Packet, 0, len(result.Packets)+1)
+	packets = append(packets, result.Packets[0], NewPacket(transport.OpEnterWorldResult, payload))
+	packets = append(packets, result.Packets[1:]...)
+	d.adoptEncodedInventory(result)
+	return packets, true
+}
+
+/*
+================
+adoptEncodedInventory
+
+Only the complete encoded entry can make pending slots usable. The authority
+door preserves any additional quest reward paid since preparation began.
+Prepared resurrection entries have no live owner and commit in their caller.
+================
+*/
+func (d *Deps) adoptEncodedInventory(result *BootstrapResult) {
+	if result.inventoryOwner == nil {
+		return
+	}
+	owner := result.inventoryOwner
+	presented := result.Character.InventoryCapacity()
+	d.Mutate(owner, "inventory-expansion", func() {
+		owner.AdoptInventorySize(presented)
+		if d.InventoryPages {
+			owner.RaiseInventoryFloor(domain.InventoryPagesBase)
+		}
+	})
+	result.inventoryOwner = nil
+}
+
+// Validate rejects incomplete production composition before gameplay starts.
+/*
+================
+error
+================
+*/
+func (d *Deps) Validate() error {
+	var missing []string
+	require := func(name string, absent bool) {
+		if absent {
+			missing = append(missing, name)
+		}
+	}
+
+	require("Roster", d.Roster == nil)
+	require("Characters", d.Characters == nil)
+	require("ResolveDivisionID", d.ResolveDivisionID == nil)
+	require("LockPublication", d.LockPublication == nil)
+	require("MutateCharacter", d.MutateCharacter == nil)
+	require("MutateCharacters", d.MutateCharacters == nil)
+	require("UpdateCharacter", d.UpdateCharacter == nil)
+	require("UpdateCharacters", d.UpdateCharacters == nil)
+	require("UpdateTrade", d.UpdateTrade == nil)
+	require("CloseJobWeek", d.CloseJobWeek == nil)
+	require("JobRankings", d.JobRankings == nil)
+	require("ReadCharacter", d.ReadCharacter == nil)
+	require("Letters", d.Letters == nil)
+	require("Guilds", d.Guilds == nil)
+	require("TrainingCamps", d.TrainingCamps == nil)
+	require("ObjectListRows", d.ObjectListRows == nil)
+	require("ExtraRefItemCodenames", d.ExtraRefItemCodenames == nil)
+	require("StaticRefItemCodenames", d.StaticRefItemCodenames == nil)
+	require("TrackTimedWindows", d.TrackTimedWindows == nil)
+	require("TrackMostWanted", d.TrackMostWanted == nil)
+	require("SpawnTerrainHeight", d.SpawnTerrainHeight == nil)
+	require("SpawnSurfaceHeight", d.SpawnSurfaceHeight == nil)
+	require("RelocateStrandedSpawn", d.RelocateStrandedSpawn == nil)
+	require("AdoptEntrySpawn", d.AdoptEntrySpawn == nil)
+	require("CanEnterWorldRegion", d.CanEnterWorldRegion == nil)
+	require("PlayerBaseStats", d.PlayerBaseStats == nil)
+	require("CommunitySeedFramesFor", d.CommunitySeedFramesFor == nil)
+	require("OnWorldBound", d.OnWorldBound == nil)
+	require("EntryCompanionSpawn", d.EntryCompanionSpawn == nil)
+	require("SceneReferenceFrames", d.SceneReferenceFrames == nil)
+	require("ReconcileSceneObjects", d.ReconcileSceneObjects == nil)
+
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"required field(s) nil before gameplay start: %s",
+			strings.Join(missing, ", "),
+		)
+	}
+	return nil
+}

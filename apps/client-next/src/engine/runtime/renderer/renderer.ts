@@ -1,0 +1,1111 @@
+/*
+===========================================================================
+
+renderer.ts - GPU resource lifetime and ordered scene, character and UI passes
+
+===========================================================================
+*/
+import { pickVolumeDepth } from "@/engine/foundation/rendering/pick-volume";
+import { defaultVideoOptions, videoOptions, backgroundDrawDistance } from "@/engine/foundation/rendering/video-options";
+import {
+	browserDisplayClass,
+	experimentalOptions,
+	experimentalVideo,
+	phoneDisplay,
+	sceneRenderScale
+} from "@/engine/foundation/ui/experimental-options";
+import { uiTextureResidency } from "@/engine/foundation/rendering/ui-texture-residency";
+import { cameraBasis } from "@/engine/foundation/rendering/world-math";
+import { createPortrait } from "./characters/portrait";
+import { createLabelProjection } from "@/engine/foundation/ui/character-labels";
+import { damageTextAssets, damageTextQuads } from "@/engine/foundation/ui/damage-text";
+import { pickDestination } from "@/engine/foundation/rendering/pick-destination";
+import type { PresentationRandom } from "@/engine/contracts/presentation-random";
+import { readPickAlpha } from "./readback/readback";
+import { pickRay, pickRayProjector } from "@/engine/foundation/rendering/picking";
+import { viewProjection } from "@/engine/foundation/rendering/world-math";
+import { prepareUi, createUiPreparation, DOLL2_TEXTURE } from "@/engine/foundation/ui/ui";
+import { dollBounds, DOLL_FRONT, viewerCamera } from "@/engine/foundation/rendering/viewer-camera";
+import { createCharacters } from "./characters/characters";
+import { createWorldRenderer } from "./world/world";
+import { copyGeometry } from "@/engine/foundation/rendering/geometry";
+import type { Geometry } from "@/engine/contracts/geometry";
+import { createDeviceRecovery, isOutOfMemoryRefusal } from "@/engine/foundation/rendering/device-recovery";
+import { createDevice } from "./device/device";
+import { createSurface } from "./surface/surface";
+import { createFrame } from "./frame/frame";
+import { createStaleDrawGuard } from "./frame/stale-draws";
+import type { Renderer } from "@/engine/contracts/runtime";
+import type { SurfaceOwner, FrameOwner, ImageDraw, GeometryDraw } from "./internal/gpu-contract";
+import { hypot3 } from "@/engine/foundation/math/hypot";
+import type { UiTexture } from "@/engine/contracts/texture";
+import { regionRelativeXZ, worldAudioPosition } from "@/engine/foundation/world/world-space";
+// The Environment uniform's diffuse and ambient vec4s (pipelines.ts struct
+// order: zenith, horizon, diffuse, ambient) and the sun-direction vec4 after
+// the native 336 bytes (environment-block.ts), as worldEnvironment packs them.
+const ENVIRONMENT_DIFFUSE = 8;
+const ENVIRONMENT_AMBIENT = 12;
+const ENVIRONMENT_SUN_DIRECTION = 84;
+const INVENTORY_DOLL_WIDTH = 176;
+const INVENTORY_DOLL_HEIGHT = 318;
+
+/*
+================
+createRenderer
+================
+*/
+export function createRenderer(
+	canvas: HTMLCanvasElement,
+	random?: PresentationRandom,
+	sound?: ( event: import("@/engine/contracts/audio").SoundEvent ) => void,
+	diagnostics: import("@/engine/contracts/runtime").RuntimeDiagnostics = {}
+): Renderer {
+	let video = defaultVideoOptions();
+	// Experimental > Video, all off (native) until the saved preference arrives.
+	let experimental = experimentalVideo( experimentalOptions() );
+	// #1806: a phone gets the Phone resolution cap. Read once, through the
+	// one display-class reader the UI runtime also uses: the display class
+	// does not change while the page lives.
+	const phone = phoneDisplay( browserDisplayClass() );
+	const portrait = createPortrait( createCharacters() );
+	// A released draw never reaches a submit; the report names who kept it.
+	const staleDraws = createStaleDrawGuard(
+		draw => device.geometry()?.releasedDraw?.( draw ),
+		stale =>
+			console.error(
+				`[SRO renderer] stale draw: list "${stale.list}" still held a released draw ` +
+					`(index ${stale.index} of ${stale.listLength}, released ${stale.releasedMsAgo} ms ago); ` +
+					"dropped it instead of submitting destroyed storage. Released by:\n" + stale.releaseStack
+			)
+	);
+	let portraitDepth: import("./internal/gpu-contract").DepthTarget | null = null;
+	const partyPortraits = Array.from(
+		{ length: 7 },
+		() => createPortrait( createCharacters() )
+	);
+	const doll = createPortrait( createCharacters() );
+	let dollWidth = 0, dollHeight = 0;
+	let dollDepth: import("./internal/gpu-contract").DepthTarget | null = null;
+	// The second doll (the pet window's wolf beside the bag's player).
+	const doll2 = createPortrait( createCharacters() );
+	let doll2Width = 0, doll2Height = 0;
+	let doll2Depth: import("./internal/gpu-contract").DepthTarget | null = null;
+	/*
+	================
+	dollCamera
+
+	A doll's camera: its own, or framed from the actor's bind bounds when it
+	asks to fit (undefined until the model is loaded, then the fixed camera).
+	================
+	*/
+	function dollCamera( input: NonNullable<import("@/engine/contracts/ui").UiQuad["doll"]>, aspect: number ) {
+		if ( input.camera || !input.fit ) return input.camera;
+		const bounds = characters.bindBounds( input.gid );
+		return bounds ? viewerCamera( dollBounds( bounds ), DOLL_FRONT, aspect ) : undefined;
+	}
+	const uiPreparation = createUiPreparation();
+	// Last frame's placed labels: a still label keeps its packed GPU records.
+	const labelProjection = createLabelProjection();
+	let uiProduct: ReturnType<typeof prepareUi> | null = null;
+	const uiTextures = new Map<string, UiTexture>(), dirtyUi = new Set<string>();
+	let residentUi = new Set<string>(), residentUiProduct: ReturnType<typeof prepareUi> | null = null;
+	// The damage text a scene's world annotations show (setDamageText), drawn
+	// each frame; its glyphs stay resident while such a scene is.
+	let damageRows: readonly import("@/engine/contracts/damage-text").DamageText[] = [];
+	const damageTextures = damageTextAssets();
+	const world = createWorldRenderer( undefined, readPickAlpha, random, sound ),
+		characters = createCharacters( random );
+	let device = createDevice( diagnostics.gpuTiming, diagnostics.gpuAnimation !== false );
+	const deviceRecovery = createDeviceRecovery();
+	// The texture features of the first device that learns them; the variant
+	// is chosen once per page. A device lost before it learned them hands over
+	// to its replacement (followFeatures); once no device will, they are empty,
+	// so native texture reads never wait on a renderer that gave up.
+	let settleFeatures: ( features: readonly string[] ) => void = () => {};
+	const textureFeatures = new Promise<readonly string[]>( resolve => {
+		settleFeatures = resolve;
+	} );
+	const followFeatures = ( owner: ReturnType<typeof createDevice> ) =>
+		void owner.textureFeatures().then( settleFeatures );
+	followFeatures( device );
+	let surface: SurfaceOwner | null = null, frame: FrameOwner | null = null;
+	let transformDirty = false, instancesDirty = false;
+	let mesh: Geometry | null = null, meshDraw: GeometryDraw | null = null;
+	let source: ImageBitmap | null = null, draw: ImageDraw | null = null;
+	let presentationCamera: import("@/engine/foundation/animation/entity-lod").LodPoint | null = null;
+	let soundListener: import("@/engine/contracts/audio").SoundListener | null = null;
+	let pickView: Float32Array | null = null, pickOrigin = 0, pickWidth = 1, pickHeight = 1;
+	let preview: import("@/engine/contracts/scene").WorldCamera | null = null;
+	let gates: readonly import("@/engine/contracts/world").EntityState[] = [];
+	let disposed = false, failure: string | null = null;
+	// A memory refusal the frame met (a readback the GPU could not stage,
+	// a target it could not allocate) is the device's to cure: hand it
+	// down so the paced replacement runs instead of ending here (#2866).
+	const frameFailed = ( error: unknown ) => {
+		if ( isOutOfMemoryRefusal( error ) ) {
+			device.fail( error );
+			return;
+		}
+		failure = String( error );
+	};
+	// Port-only (the 3D viewer): the studio light written over the frame
+	// environment, or null for the environment's own.
+	let viewerLight: import("@/engine/contracts/runtime").ViewerLight | null = null;
+	return {
+		/*
+		================
+		worldView
+
+		Diagnostics borrow no mutable renderer storage and perform no GPU work.
+		The picking view already contains camera collision and viewport aspect.
+		================
+		*/
+		worldView() {
+			if ( disposed || failure || !pickView || device.phase() !== "running" ) return null;
+			return { matrix: pickView.slice(), originRegion: pickOrigin, width: pickWidth, height: pickHeight };
+		},
+		/*
+		================
+		setFrameWork
+		================
+		*/
+		setFrameWork( value ) {
+			world.frameWork( value );
+			characters.frameWork( value );
+		},
+		/*
+		================
+		setTeleportGates
+		================
+		*/
+		setTeleportGates( entities ) {
+			gates = entities.filter( e => e.kind === "teleport" ).map( e => ({
+				...e,
+				teleport: e.teleport ? { ...e.teleport } : undefined
+			}) );
+		},
+		/*
+		================
+		maintenance
+
+		The release half of a frame for a tab that cannot display one: a
+		hidden page still adopts scenes and retires actors, and without this
+		drain their scenes, draws and texture sources wait for the next
+		visible frame (BUG-070). Outside a frame the device destroys at once.
+		================
+		*/
+		maintenance() {
+			if ( disposed || failure || device.phase() !== "running" ) return;
+			const geometry = device.geometry(), images = device.images();
+			if ( !geometry || !images ) return;
+			world.releaseRetired( geometry, images );
+			characters.releaseRetired( geometry );
+		},
+		scenery: world.scenery,
+		/*
+		================
+		videoOptions
+		================
+		*/
+		videoOptions( value ) {
+			const next = videoOptions( value ), before = video.records[video.active], after = next.records[next.active];
+			video = next;
+			if ( before[8] !== after[8] || before[9] !== after[9] ) {
+				device.textureOptions( after[8] === 1, after[9]! );
+				frame = null;
+			}
+		},
+		/*
+		================
+		enchantSparks
+
+		Read by the character presenter when it assembles an appearance.
+		================
+		*/
+		enchantSparks() {
+			return experimental.enchantSparks;
+		},
+		/*
+		================
+		sharedActorRoom
+
+		Read by the character presenter each frame.
+		================
+		*/
+		sharedActorRoom() {
+			return experimental.sharedActorRoom;
+		},
+		/*
+		================
+		vHidesCompanions
+
+		Read by the character presenter when V is held.
+		================
+		*/
+		vHidesCompanions() {
+			return experimental.vHidesCompanions;
+		},
+		/*
+		================
+		silentWingFlight
+
+		Read by the character presenter as it advances an actor's sounds.
+		================
+		*/
+		silentWingFlight() {
+			return experimental.silentWingFlight;
+		},
+		/*
+		================
+		dungeonCharacterPvs
+		================
+		*/
+		dungeonCharacterPvs() {
+			return experimental.dungeonCharacterPvs;
+		},
+		/*
+		================
+		dungeonBlockHides
+
+		Port-only, not native (Experimental "Dungeon character PVS", on by
+		default): a character whose navmesh room the local player's room does
+		not draw is neither drawn nor picked, as that room's scenery is not
+		drawn. `activeBlock` is the same frame's navigation block, so a
+		character and its room switch on the frame the viewer crosses.
+		================
+		*/
+		dungeonBlockHides( block, activeBlock ) {
+			return experimental.dungeonCharacterPvs && world.blockHides( block, activeBlock );
+		},
+		/*
+		================
+		experimentalVideo
+		================
+		*/
+		experimentalVideo( value ) {
+			const sceneTargetChanged = value.hdrToneMap !== experimental.hdrToneMap ||
+				value.msaa !== experimental.msaa;
+			experimental = value;
+			device.experimentalVideo( value );
+			world.smoothCamera( value.smoothCamera );
+			if ( sceneTargetChanged && draw ) {
+				// The fullscreen image draw carries its pipeline; re-upload
+				// it for the new scene format and sample count.
+				device.images()?.release( draw );
+				draw = null;
+			}
+			frame = null;
+		},
+		setFootprints: world.footprints,
+		setSunDropMarkers: world.sunDropMarkers,
+		setSelectionDecal: world.selectionDecal,
+		/*
+		================
+		pickGround
+		================
+		*/
+		pickGround( x, y ) {
+			if ( disposed || failure || !pickView || device.phase() !== "running" || !pickOrigin ) return null;
+			const raw = pickRay( pickView, x, y );
+			if ( !raw ) return null;
+			const length = hypot3( raw.delta[0]!, raw.delta[1]!, raw.delta[2]! );
+			if ( !length ) return null;
+			const ray = { start: raw.start, delta: raw.delta.map( v => v / length * 1000 ) };
+			return { originRegion: pickOrigin, ray, terrainDepth: world.pickGround( ray ) };
+		},
+		/*
+		================
+		pickDestination
+		================
+		*/
+		pickDestination( x, y ) {
+			if ( disposed || failure || !pickView || device.phase() !== "running" ) return null;
+			const ray = pickRay( pickView, x, y );
+			if ( !ray ) return null;
+			const depth = world.pick( ray, 1, true );
+			return depth === null ? null : pickDestination( ray, depth, pickOrigin );
+		},
+		/*
+		================
+		pickFrontendCharacter
+		================
+		*/
+		pickFrontendCharacter( x, y, ids ) {
+			if ( disposed || failure || !pickView || device.phase() !== "running" ) return null;
+			const ray = pickRay( pickView, x, y );
+			return ray ? characters.pickFrontend( ray, ids ) : null;
+		},
+		frontendRaceCenters: world.interfaceCenters,
+		/*
+		================
+		pickFrontendRace
+		================
+		*/
+		pickFrontendRace( x, y ) {
+			const ray = pickView ? pickRay( pickView, x, y ) : null;
+			return ray ? world.pickInterface( ray ) : null;
+		},
+		/*
+		================
+		readDoll
+
+		The doll target's last rendered frame (port-only: the 3D viewer's
+		still). Rejects when no doll has been drawn.
+		================
+		*/
+		readDoll() {
+			return device.readPortrait( "__doll" );
+		},
+		/*
+		================
+		characterBounds
+
+		Port-only (the 3D viewer's framing): an actor's scaled bind-pose bounds.
+		================
+		*/
+		characterBounds( gid ) {
+			return characters.bindBounds( gid );
+		},
+		/*
+		================
+		setViewerLight
+
+		Port-only (the 3D viewer's page, which draws no world): replaces the
+		environment's diffuse and ambient colours and the light's direction
+		for every following frame.
+		The game never calls it, so its portraits keep the native light.
+		================
+		*/
+		setViewerLight( light ) {
+			viewerLight = light ?
+				{ diffuse: [ ...light.diffuse ], ambient: [ ...light.ambient ], direction: [ ...light.direction ] } :
+				null;
+		},
+		/*
+		================
+		setCharacterPreview
+		================
+		*/
+		setCharacterPreview( camera ) {
+			preview = camera ? structuredClone( camera ) : null;
+		},
+		/*
+		================
+		pickEntity
+		================
+		*/
+		pickEntity( x, y, excluded, blindHeld = false, filtered = false ) {
+			if ( disposed || failure || !pickView || device.phase() !== "running" ) return null;
+			const project = pickRayProjector( pickView );
+			if ( !project ) return null;
+			const rays = [];
+			for ( let row = 0; row < 3; row++ ) {
+				for ( let col = 0; col < 3; col++ ) {
+					const ray = project(
+						Math.trunc( x * pickWidth + (col - 1) * pickWidth * .016 ) / pickWidth,
+						Math.trunc( y * pickHeight + (row - 1) * pickHeight * .016 ) / pickHeight
+					);
+					if ( !ray ) return null;
+					rays.push( ray );
+				}
+			}
+			let hit = characters.pick( rays, excluded, blindHeld, filtered ),
+				best = hit ?
+					hit.depth * hypot3( rays[hit.ray]!.delta[0]!, rays[hit.ray]!.delta[1]!, rays[hit.ray]!.delta[2]! ) :
+					Infinity;
+			// CITeleportGate 8764C0: translation-only box, independent of map meshes.
+			for ( const gate of gates ) {
+				const b = gate.teleport;
+				if ( !b ) throw Error( "Missing gate pick bounds" );
+				const [gx, gz] = regionRelativeXZ( pickOrigin, gate );
+				const matrix = new Float32Array( [
+					1,
+					0,
+					0,
+					0,
+					0,
+					1,
+					0,
+					0,
+					0,
+					0,
+					1,
+					0,
+					gx,
+					gate.y,
+					gz,
+					1
+				] );
+				for ( let r = 0; r < rays.length; r++ ) {
+					const depth = pickVolumeDepth( rays[r]!, [
+						-b.radius,
+						-b.height,
+						-b.radius,
+						b.radius,
+						b.height,
+						b.radius
+					], matrix );
+					if ( depth === null ) continue;
+					const distance = depth * hypot3( rays[r]!.delta[0]!, rays[r]!.delta[1]!, rays[r]!.delta[2]! );
+					if ( distance < best || (hit?.ray !== 4 && r === 4) ) {
+						hit = { gid: gate.gid, depth, ray: r };
+						best = distance;
+					}
+				}
+			}
+			// 692680 returns the winning entity virtual pick directly. Map scenery
+			// is not a second veto (698740 consumes that same winner).
+			return hit?.gid ?? null;
+		},
+		setUi: scene => {
+			if ( disposed ) throw new Error( "Renderer disposed" );
+			uiProduct = uiPreparation.prepare( scene );
+		},
+		/*
+		================
+		setDamageText
+		================
+		*/
+		setDamageText( rows ) {
+			damageRows = rows;
+		},
+		/*
+		================
+		setUiTexture
+		================
+		*/
+		setUiTexture( id, image ) {
+			const old = uiTextures.get( id );
+			if ( old !== image && old instanceof ImageBitmap ) old.close();
+			if ( image ) uiTextures.set( id, image );
+			else uiTextures.delete( id );
+			dirtyUi.add( id );
+		},
+		characterParticleSnapshot: characters.particleSnapshot,
+		characterParticleTime: characters.particleTime,
+		presentationNight: () => world.night(),
+		characterLocalMatrix: characters.localMatrix,
+		characterMatrix: characters.matrix,
+		characterSocket: characters.socket,
+		retainCharacterModels: characters.retain,
+		setCharacterAssembly: characters.assembly,
+		characterStats: characters.stats,
+		/*
+		================
+		takeDegradations
+
+		Every character snapshot owner's held-clock reports since the last
+		take: the world's rows and each portrait preview's.
+		================
+		*/
+		takeDegradations() {
+			return [
+				...characters.takeDegradations(),
+				...portrait.takeDegradations(),
+				...partyPortraits.flatMap( child => child.takeDegradations() ),
+				...doll.takeDegradations(),
+				...doll2.takeDegradations()
+			];
+		},
+		presentationCamera: () => presentationCamera,
+		audioListener: () => soundListener,
+		setWeather: value => world.weather( value ),
+		setWorldLayers: value => world.worldLayers( value ),
+		setWorldClock: value => world.clock( value ),
+		setCharacterModel: characters.model,
+		setCharacterAnimation: characters.animation,
+		setCharacterActors: characters.actors,
+		characterActors: characters.currentActors,
+		cancelWorldUpdate: () => world.cancelPending(),
+		textureFeatures: () => textureFeatures,
+		settleWorld: sceneId => world.settle( sceneId ),
+		setWorld: scene => world.scene( scene ),
+		setWorldRenderMode: ( mode, enabled ) => {
+			world.setRenderMode( mode, enabled );
+			characters.setRenderMode( mode, enabled );
+		},
+		adoptWorld: ( lease, detail, terrain ) => world.adopt( lease, detail, terrain ),
+		setWorldCamera: camera => world.camera( camera ),
+		setWorldCameraCollision: enabled => world.setCameraCollision( enabled ),
+		setWorldTexture: ( path, image, alpha ) => world.texture( path, image, alpha ),
+		neededWorldTextures: () => world.neededTextures(),
+		worldStats: () => world.stats(),
+		/*
+		================
+		setGeometryInstances
+		================
+		*/
+		setGeometryInstances( instances ) {
+			if ( disposed || !mesh ) throw new Error( "No owned geometry" );
+			if (
+				!(instances instanceof Float32Array) || instances.length % 16 || instances.length > 4096 * 16 ||
+				!instances.every( Number.isFinite )
+			) throw new Error( "Invalid instance matrices" );
+			if (
+				mesh.instances?.length === instances.length &&
+				mesh.instances.every( ( value, index ) => value === instances[index] )
+			) return;
+			mesh = { ...mesh, instances: instances.slice() };
+			instancesDirty = true;
+		},
+		/*
+		================
+		setGeometryTransform
+		================
+		*/
+		setGeometryTransform( transform ) {
+			if ( disposed || !mesh ) throw new Error( "No owned geometry" );
+			if (
+				!(transform instanceof Float32Array) || transform.length !== 16 || !transform.every( Number.isFinite )
+			) throw new Error( "Invalid geometry transform" );
+			for ( let i = 0; i < 16; i++ ) {
+				if ( mesh.transform[i] !== transform[i] ) {
+					mesh.transform.set( transform );
+					transformDirty = true;
+					break;
+				}
+			}
+		},
+		/*
+		================
+		setGeometry
+		================
+		*/
+		setGeometry( data ) {
+			if ( disposed ) throw new Error( "Renderer disposed" );
+			const replacement = data ? copyGeometry( data ) : null;
+			if ( meshDraw ) device.geometry()?.release( meshDraw );
+			meshDraw = null;
+			transformDirty = false;
+			instancesDirty = false;
+			mesh = replacement;
+		},
+		/*
+		================
+		setImage
+		================
+		*/
+		setImage( image ) {
+			if ( disposed ) {
+				image?.close();
+				throw new Error( "Renderer disposed" );
+			}
+			if ( image === source ) return;
+			if ( draw ) device.images()?.release( draw );
+			draw = null;
+			source?.close();
+			source = image;
+		},
+		adapterFacts: () => device.adapterFacts(),
+		gpuTiming: () => ({
+			enabled: diagnostics.gpuTiming === true,
+			...(device.gpuTiming() ??
+				{ supported: false, skipped: 0, failed: 0, attempted: 0, completed: 0, omittedPasses: 0, samples: [] })
+		}),
+		// A failure with attempts left is a device still starting: the runtime
+		// ends the session on "failed", and the simulation is fine (#2337).
+		phase: () =>
+			disposed ?
+				"disposed" :
+				failure ?
+				"failed" :
+				device.phase() === "failed" && device.recoverable() && deviceRecovery.pending() ?
+				"starting" :
+				device.phase(),
+		error: () => failure ?? device.error(),
+		/*
+		================
+		frame
+		================
+		*/
+		frame( viewport, timeSeconds = 0, frameId, probe ) {
+			probe?.renderBegin();
+			characters.profile( probe );
+			world.profile( probe );
+			if ( disposed || failure ) {
+				return;
+			}
+			// The device whose frame is open. Everything below prepares, records and
+			// submits inside that bracket, so a resource an owner releases on the way
+			// outlives the command buffers that name it (device/retirement.ts).
+			let open: ReturnType<typeof createDevice> | null = null;
+			try {
+				const nowMs = performance.now();
+				if ( device.phase() === "failed" && device.recoverable() && deviceRecovery.due( nowMs ) ) {
+					// Only renderer state restarts. The runtime's simulation and assets remain owned and live.
+					portraitDepth?.dispose();
+					portraitDepth = null;
+					portrait.invalidate();
+					for ( const child of partyPortraits ) child.invalidate();
+					dollDepth?.dispose();
+					dollDepth = null;
+					doll.invalidate();
+					doll2Depth?.dispose();
+					doll2Depth = null;
+					doll2.invalidate();
+					surface?.dispose();
+					surface = null;
+					frame = null;
+					draw = null;
+					meshDraw = null;
+					characters.invalidate();
+					world.invalidate();
+					device.dispose();
+					deviceRecovery.began();
+					residentUi.clear();
+					residentUiProduct = null;
+					device = createDevice( diagnostics.gpuTiming, diagnostics.gpuAnimation !== false, true );
+					followFeatures( device );
+					device.textureOptions( video.records[video.active][8] === 1, video.records[video.active][9]! );
+					device.experimentalVideo( experimental );
+					for ( const id of uiTextures.keys() ) dirtyUi.add( id );
+				}
+				if ( device.phase() === "failed" && !(device.recoverable() && deviceRecovery.pending()) ) {
+					settleFeatures( [] );
+				}
+				if ( device.phase() !== "running" ) {
+					return;
+				}
+				deviceRecovery.running( nowMs );
+				open = device;
+				open.beginFrame();
+				if ( !surface ) {
+					surface = createSurface( canvas, device.surfaceCommands()!, device.format() );
+					frame = createFrame( device.commands()! );
+				}
+				if ( !frame ) frame = createFrame( device.commands()! );
+				if ( residentUiProduct !== uiProduct || dirtyUi.size ) {
+					const demand = uiTextureResidency(
+						uiProduct?.scene ?? null,
+						uiTextures,
+						residentUi,
+						dirtyUi,
+						uiProduct?.scene.damageText ? damageTextures : []
+					);
+					// Release first so window replacement cannot transiently
+					// exceed the device budget. CPU bitmaps stay warm for reopen.
+					for ( const id of demand.release ) device.uiTexture( id, null );
+					for ( const id of demand.upload ) device.uiTexture( id, uiTextures.get( id )! );
+					residentUi = demand.needed;
+					residentUiProduct = uiProduct;
+					dirtyUi.clear();
+				}
+				if ( source && !draw ) draw = device.images()!.upload( source );
+				if ( mesh && !meshDraw ) {
+					meshDraw = device.geometry()!.upload( mesh );
+					transformDirty = false;
+					instancesDirty = false;
+				} else if ( mesh && meshDraw && transformDirty ) {
+					device.geometry()!.updateTransform( meshDraw, mesh.transform );
+					transformDirty = false;
+				}
+				if ( mesh?.instances && meshDraw && instancesDirty ) {
+					meshDraw = device.geometry()!.updateInstances( meshDraw, mesh.instances );
+					instancesDirty = false;
+				}
+				probe?.renderMark( "renderer-setup" );
+				const scene = world.prepare(
+					device.geometry()!,
+					device.images()!,
+					viewport.width / Math.max( 1, viewport.height ),
+					timeSeconds,
+					viewport.width,
+					viewport.height,
+					backgroundDrawDistance( video ),
+					!preview && video.records[video.active][4] === 1,
+					video.records[video.active][12] === 1
+				);
+				scene.environment[83] = video.records[video.active][6] === 1 ? 1 : 0;
+				if ( viewerLight ) {
+					scene.environment.set( viewerLight.diffuse, ENVIRONMENT_DIFFUSE );
+					scene.environment.set( viewerLight.ambient, ENVIRONMENT_AMBIENT );
+					scene.environment.set( viewerLight.direction, ENVIRONMENT_SUN_DIRECTION );
+				}
+				const shadowOn = experimental.sunShadow && !preview;
+				characters.dungeonLights( preview ? undefined : world.dungeonLights() );
+				device.worldView( scene.matrix, scene.environment, shadowOn, viewerLight !== null );
+				presentationCamera = {
+					regionId: scene.originRegion,
+					x: scene.camera.eye[0],
+					y: scene.camera.eye[1],
+					z: scene.camera.eye[2]
+				};
+				probe?.renderMark( "world-prepare" );
+				pickView = scene.matrix;
+				pickOrigin = scene.originRegion;
+				pickWidth = viewport.width;
+				pickHeight = viewport.height;
+				const basis = cameraBasis( scene.camera );
+				soundListener = {
+					position: worldAudioPosition( {
+						regionId: scene.originRegion,
+						x: scene.camera.eye[0],
+						y: scene.camera.eye[1],
+						z: scene.camera.eye[2]
+					} ),
+					forward: basis.forward,
+					up: basis.up
+				};
+				const characterFrame = characters.prepare(
+					device.geometry()!,
+					device.images()!,
+					preview ? 0 : scene.originRegion,
+					preview ? viewProjection( preview, viewport.width / Math.max( 1, viewport.height ) ) : scene.matrix,
+					!!preview,
+					timeSeconds,
+					video.records[video.active][7] === 1,
+					world.night(),
+					video.records[video.active][12] === 1,
+					scene.reflectionMatrix
+				);
+				// The light effects behind a query draw after the world, in the
+				// deferred pass; the rest with the characters.
+				const characterDraws = characterFrame.filter( draw => !draw.deferredParticle ),
+					deferredCharacterDraws = characterFrame.filter( draw => draw.deferredParticle );
+				const shadowDraws = world.characterShadows(
+					preview ?
+						[] :
+						characters.shadowCandidates(
+							characterDraws,
+							scene.camera.eye,
+							video.records[video.active][1]!
+						),
+					device.geometry()!,
+					device.images()!
+				);
+				probe?.renderMark( "character-prepare" );
+				const uiScene = uiProduct?.scene ?? null, anchored = uiProduct?.anchors;
+				// Damage text rises and fades with the frame's clock, the same clock
+				// the interface used when it drew it into its own product.
+				const damage = uiScene?.damageText && damageRows.length && !preview ?
+					damageTextQuads( damageRows, timeSeconds, uiScene.width, uiScene.height ) :
+					[];
+				// Anchors use the UI scene's coordinate system, like the world
+				// annotations beside them. Runtime supplies logical UI extents;
+				// using that same extent keeps actor and label projections together.
+				const projectedUi = uiScene && (anchored?.size || uiProduct?.worldAnchors || damage.length) ?
+					labelProjection.project(
+						uiScene,
+						preview || !anchored?.size ?
+							new Map() :
+							characters.labelAnchors(
+								scene.originRegion,
+								scene.matrix,
+								uiScene.width,
+								uiScene.height,
+								anchored!
+							),
+						preview ? undefined : { origin: scene.originRegion, matrix: scene.matrix },
+						damage
+					) :
+					uiScene;
+				const portraitGid = uiProduct?.portraitGid;
+				const portraitDraws = portrait.prepare(
+					portraitGid === undefined ? null : characters.portraitSource( portraitGid ),
+					device.geometry()!,
+					device.images()!
+				);
+				const portraitTarget = portraitGid === undefined ? undefined : device.portraitTarget();
+				if ( portraitTarget && !portraitDepth ) {
+					portraitDepth = device.surfaceCommands()!.createDepth( 128, 128 );
+				}
+				const partyDraws = partyPortraits.map( ( child, i ) => {
+					const gid = uiProduct?.portraits[i + 1],
+						draws = child.prepare(
+							gid === undefined ? null : characters.portraitSource( gid ),
+							device.geometry()!,
+							device.images()!
+						);
+					// Checked before empty slots drop, so a report names the real slot.
+					return gid === undefined ?
+						null :
+						{
+							target: device.portraitTarget( "__portrait" + (i + 1) ),
+							depth: portraitDepth!.view,
+							draws: device.geometry()!.singleSampled(
+								staleDraws.live( "party-portrait-" + (i + 1), draws )
+							)
+						};
+				} ).filter( ( r ): r is NonNullable<typeof r> => r !== null );
+				const dollInput = uiProduct?.doll;
+				// A hidden doll stays borrowed and warm for the local character, so
+				// the inventory's first open does not prepare a model (portrait.warm).
+				if ( !dollInput ) doll.pause();
+				if ( !dollInput && portraitGid !== undefined ) {
+					doll.warm( characters.portraitSource( portraitGid ), device.geometry()!, device.images()! );
+				}
+				const dollRect = uiProduct?.scene.quads.find( quad => quad.doll && quad.texture !== DOLL2_TEXTURE )
+					?.rect;
+				const width = Math.max( 1, Math.ceil( dollRect?.[2] ?? INVENTORY_DOLL_WIDTH ) );
+				const height = Math.max( 1, Math.ceil( dollRect?.[3] ?? INVENTORY_DOLL_HEIGHT ) );
+				const dollDraws = dollInput ?
+					doll.prepare(
+						characters.portraitSource( dollInput.gid, dollInput.mount === true ),
+						device.geometry()!,
+						device.images()!,
+						{
+							yaw: dollInput.yaw,
+							seconds: timeSeconds,
+							aspect: width / height,
+							camera: dollCamera( dollInput, width / height )
+						}
+					) :
+					[];
+				const dollTarget = dollInput ? device.portraitTarget( "__doll", width, height ) : undefined;
+				const doll2Input = uiProduct?.doll2;
+				// The pet window's doll pauses as the inventory's does: without it,
+				// reopening the window advanced its glows through the whole closed
+				// interval in one frame.
+				if ( !doll2Input ) doll2.pause();
+				if ( doll2Input ) {
+					const r = uiProduct!.scene.quads.find( quad => quad.texture === DOLL2_TEXTURE )!.rect,
+						w2 = Math.max( 1, Math.ceil( r[2] ) ),
+						h2 = Math.max( 1, Math.ceil( r[3] ) );
+					const draws = doll2.prepare(
+						characters.portraitSource( doll2Input.gid ),
+						device.geometry()!,
+						device.images()!,
+						{
+							yaw: doll2Input.yaw,
+							seconds: timeSeconds,
+							aspect: w2 / h2,
+							camera: dollCamera( doll2Input, w2 / h2 )
+						}
+					);
+					if ( !doll2Depth || doll2Width !== w2 || doll2Height !== h2 ) {
+						doll2Depth?.dispose();
+						doll2Depth = device.surfaceCommands()!.createDepth( w2, h2 );
+						doll2Width = w2;
+						doll2Height = h2;
+					}
+					// The device draws every portrait pass alike; the wolf rides that list.
+					partyDraws.push( {
+						target: device.portraitTarget( DOLL2_TEXTURE, w2, h2 ),
+						depth: doll2Depth.view,
+						draws: device.geometry()!.singleSampled( staleDraws.live( "doll2", draws ) )
+					} );
+				}
+				if ( dollTarget && (!dollDepth || dollWidth !== width || dollHeight !== height) ) {
+					dollDepth?.dispose();
+					dollDepth = device.surfaceCommands()!.createDepth( width, height );
+					dollWidth = width;
+					dollHeight = height;
+				}
+				probe?.renderMark( "labels-portraits" );
+				const deferredPlan = preview ?
+						null :
+						characters.deferredPlan( scene.camera.eye ),
+					targetSurface = surface;
+				// Port-only, not native. Experimental owns the opt-in; 100 keeps
+				// the native surface and pass order. UI keeps its full resolution.
+				const renderScale = sceneRenderScale( experimental, viewport, phone ),
+					scaled = renderScale < 100,
+					// Port-only, not native: Experimental > FXAA renders the scene
+					// apart and resolves it through the edge walk before the UI.
+					separate = scaled || experimental.sceneFxaa,
+					sceneWidth = Math.max( 1, Math.round( viewport.width * renderScale / 100 ) ),
+					sceneHeight = Math.max( 1, Math.round( viewport.height * renderScale / 100 ) ),
+					color = surface.acquire(
+						viewport,
+						experimental.postProcessing || !!deferredPlan?.query,
+						renderScale,
+						experimental.sceneFxaa
+					);
+				const finishDeferred = () => {
+					if ( disposed ) throw Error( "Renderer disposed during particle query" );
+					// The deferred pass's draws reach the second submit: same rule.
+					return device.geometry()!.singleSampled(
+						staleDraws.live( "deferred-particles", deferredCharacterDraws )
+					);
+				};
+				const deferredPass = deferredPlan ?
+					{
+						asynchronous: deferredPlan.query,
+						prepare: () => {
+							if ( deferredPlan.query ) {
+								// The answer lands between frames (deliverDeferred):
+								// the frame never waits for the queue to drain (#2573).
+								device.particleQuery(
+									deferredPlan.points,
+									scene.matrix,
+									color,
+									targetSurface.depth()
+								).then( results => {
+									if ( !disposed ) characters.deliverDeferred( results );
+								} ).catch( error => {
+									if ( !disposed ) frameFailed( error );
+								} );
+							}
+							return finishDeferred();
+						}
+					} :
+					undefined;
+				// Each owner's list is checked under its own name.
+				// Slices keep the scene's terrain/transparent boundaries exact.
+				const terrainDraws = staleDraws.live( "world-terrain", scene.draws.slice( 0, scene.terrainEnd ?? 0 ) ),
+					opaqueDraws = staleDraws.live(
+						"world-opaque",
+						scene.draws.slice( scene.terrainEnd ?? 0, scene.transparentStart )
+					),
+					transparentDraws = staleDraws.live(
+						"world-transparent",
+						scene.draws.slice( scene.transparentStart )
+					),
+					liveCharacters = staleDraws.live( "characters", characterDraws ),
+					liveShadows = staleDraws.live( "character-shadows", shadowDraws );
+				// Experimental > Lighting > Sun shadows: the cascade follows the
+				// same light the shader shades with (the pinned diagonal, or the
+				// packed arc direction under Moving sunlight), centred on the
+				// eye. Opaque world objects and characters cast; terrain, water
+				// and everything blended stays out, and the silhouette
+				// projections stand beside it.
+				const sunShadow = device.sunShadow(),
+					shadowLight = experimental.dynamicSun ?
+						[ scene.environment[84]!, scene.environment[85]!, scene.environment[86]! ] :
+						[ 0.70710678, 0.70710678, 0 ];
+				sunShadow.prepare( shadowOn, scene.camera.eye, shadowLight );
+				const opaqueWorld = [
+						...terrainDraws,
+						...staleDraws.live( "ground-decals", scene.groundDecalDraws ?? [] ),
+						...staleDraws.live( "sun-markers", scene.sunMarkerDraws ?? [] ),
+						...liveShadows,
+						...opaqueDraws,
+						...(preview ? [] : liveCharacters.filter( draw => !draw.blended ))
+					],
+					transparentWorld = [
+						...transparentDraws,
+						...staleDraws.live( "decals", scene.decalDraws ?? [] ),
+						...(preview ? [] : liveCharacters.filter( draw => draw.blended )),
+						...(preview ? [] : staleDraws.live( "weather", scene.weatherDraws ?? [] ))
+					];
+				const pending = frame!.draw(
+					separate ? targetSurface.frameView() : color,
+					draw ?? (scene.sky ? device.sky() ?? undefined : undefined),
+					staleDraws.single( "mesh", meshDraw ?? undefined ),
+					surface.depth(),
+					[ ...opaqueWorld, ...transparentWorld ],
+					device.ui( projectedUi, viewport.width ),
+					preview ? device.geometry()!.hdrPreview( liveCharacters ) : [],
+					scene.flares && video.records[video.active][10] === 1 ?
+						device.flares( scene.flares, surface.depth() ) :
+						undefined,
+					scene.thunder ? device.thunder( scene.thunder ) : undefined,
+					portraitTarget ?
+						{
+							target: portraitTarget,
+							depth: portraitDepth!.view,
+							draws: device.geometry()!.singleSampled( staleDraws.live( "portrait", portraitDraws ) )
+						} :
+						undefined,
+					dollTarget ?
+						{
+							target: dollTarget,
+							depth: dollDepth!.view,
+							draws: device.geometry()!.singleSampled( staleDraws.live( "doll", dollDraws ) )
+						} :
+						undefined,
+					partyDraws,
+					frameId,
+					deferredPass,
+					device.bloom( sceneWidth, sceneHeight, !preview && video.records[video.active][11] === 1 ),
+					device.geometry()!.waterReflection( {
+						matrix: scene.reflectionMatrix,
+						height: scene.waterHeight ?? 0,
+						above: scene.camera.eye[1] >= (scene.waterHeight ?? 0),
+						seconds: timeSeconds
+					}, [ ...scene.draws, ...(preview ? [] : liveCharacters) ] ),
+					{
+						hdr: device.hdr( sceneWidth, sceneHeight, experimental.hdrToneMap ),
+						msaa: device.msaa( sceneWidth, sceneHeight, experimental.msaa ),
+						sceneScale: separate ?
+							{
+								view: color,
+								frameDepth: targetSurface.frameDepth(),
+								resolve: ( encoder, target ) =>
+									device.upscale().encodeUpscale( encoder, color, target, experimental.sceneFxaa ),
+								// At full size the scene's depth is the frame's: nothing to upscale.
+								resolveDepth: encoder => {
+									if ( !scaled ) return;
+									device.upscale().encodeDepthUpscale(
+										encoder,
+										targetSurface.depth(),
+										targetSurface.frameDepth()
+									);
+								}
+							} :
+							undefined,
+						sunShadow,
+						casters: shadowOn ?
+							[ ...opaqueDraws, ...(preview ? [] : liveCharacters.filter( draw => !draw.blended )) ] :
+							[],
+						// Ambient occlusion (experimental, port-only; #2094):
+						// prepared against the scene and camera like the
+						// bloom stage; preview frames never arm it.
+						ao: device.ambientOcclusion(
+							sceneWidth,
+							sceneHeight,
+							!preview && experimental.ambientOcclusion,
+							scene.camera
+						)
+					},
+					targetSurface
+				);
+				probe?.renderMark( "submit" );
+				if ( pending ) {
+					// The deferred pass records its second command buffer after the
+					// visibility query: the frame stays open until that one is submitted.
+					const frameDevice = open;
+					open = null;
+					return pending.catch( error => {
+						if ( !disposed ) frameFailed( error );
+					} ).finally( () => frameDevice.endFrame() );
+				}
+			} catch ( error ) {
+				frameFailed( error );
+			} finally {
+				open?.endFrame();
+			}
+		},
+		/*
+		================
+		dispose
+		================
+		*/
+		dispose() {
+			if ( disposed ) {
+				return;
+			}
+			disposed = true;
+			portraitDepth?.dispose();
+			portraitDepth = null;
+			portrait.invalidate();
+			for ( const child of partyPortraits ) child.invalidate();
+			dollDepth?.dispose();
+			dollDepth = null;
+			doll.invalidate();
+			doll2Depth?.dispose();
+			doll2Depth = null;
+			doll2.invalidate();
+			surface?.dispose();
+			surface = null;
+			frame = null;
+			for ( const image of uiTextures.values() ) if ( image instanceof ImageBitmap ) image.close();
+			uiTextures.clear();
+			dirtyUi.clear();
+			uiProduct = null;
+			uiPreparation.reset();
+			source?.close();
+			source = null;
+			draw = null;
+			mesh = null;
+			meshDraw = null;
+			portrait.dispose( device.geometry(), device.images() );
+			for ( const child of partyPortraits ) child.dispose( device.geometry(), device.images() );
+			doll.dispose( device.geometry(), device.images() );
+			doll2.dispose( device.geometry(), device.images() );
+			characters.dispose( device.geometry(), device.images() );
+			world.dispose( device.geometry(), device.images() );
+			device.dispose();
+		}
+	};
+}

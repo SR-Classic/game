@@ -1,0 +1,179 @@
+/*
+===========================================================================
+
+petai_test.go - independent COS motion and session retirement
+
+===========================================================================
+*/
+package action
+
+import (
+	"reflect"
+	"testing"
+
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+/*
+================
+TestPetSessionDrivesIndependentMotionAndCleansUp
+================
+*/
+func TestPetSessionDrivesIndependentMotionAndCleansUp(t *testing.T) {
+	c := testCharacter()
+	refs := testCosSource(testItems())
+	refs.characters["PET"] = &enterworld.CharacterRef{Codename: "PET", RefObjID: 9, TidWord: 0x21c6, RunSpeed: 80}
+	rt, _ := newTestRuntime(c, refs)
+	// The spawn sampler places the pet around its owner. About one secure
+	// sample in sixteen (24056..26675) spawns it where the 1100 ms follow
+	// leaves it short, so it legitimately moves again at 1200 ms; pin the
+	// sample so the duplicate bind below is the only thing under test.
+	rt.CompanionRoll = func() (uint32, error) { return 0, nil }
+	gid, _ := enterworld.CosObjectIDForCharacter(c)
+	c.ActiveCOS = &enterworld.CharacterCOS{GID: gid, RefObjID: 9, Codename: "PET", CurrentHP: 100, Summoned: true}
+	rt.CompanionSurfaceHeight = func(_ uint16, _ float64, y float64, _ float64) (float64, bool) { return y, true }
+	rt.ConstrainMovement = func(_ string, from, to simulation.Spawn) (simulation.Spawn, *simulation.MoveError) { return to, nil }
+	if f := rt.TickHook()(1000); len(f) != 0 {
+		t.Fatal("offline pet ticked")
+	}
+	rt.BindPetSession(testDivision, c, 101)
+	if f := rt.TickHook()(1000); len(f) != 0 {
+		t.Fatal("new pet moved")
+	}
+	key := simulation.WorldKey(testDivision, c.Name)
+	world := rt.Worlds.Update(key, func() simulation.WorldState { return simulation.SeedWorldState(c) }, func(w *simulation.WorldState) { w.Spawn.X += 200 })
+	before := c.Snapshot()
+	// The pet's viewers get its move by the pet's own scope, without the
+	// owner (#804); the owner gets it in its private batch.
+	if f := rt.TickHook()(1100); len(f) != 2 || f[0].SourceGID != gid || f[0].ExceptCharacterID != c.ID ||
+		len(f[1].Frames) != 3 || f[1].OnlyCharacterID != c.ID {
+		t.Fatal("live pet did not follow", f)
+	}
+	before.ActiveCOS.FollowRunFactor, before.ActiveCOS.FollowRunSet = c.ActiveCOS.FollowRunFactor, c.ActiveCOS.FollowRunSet
+	if after := rt.Worlds.Snapshot(key, func() simulation.WorldState { return world }); !reflect.DeepEqual(world, after) || !reflect.DeepEqual(before, c.Snapshot()) {
+		t.Fatal("pet moved player or mutated durable state")
+	}
+	presentation := rt.PetPresentation(testDivision, c.Name)
+	if presentation == nil || presentation.Row.Gid != gid || presentation.World.MoveSegment == nil {
+		t.Fatal("missing live public pet snapshot")
+	}
+	presentation.World.MoveSegment.From.X += 999
+	if reflect.DeepEqual(presentation.World, rt.PetPresentation(testDivision, c.Name).World) {
+		t.Fatal("public snapshot aliases pet motion")
+	}
+	rt.BindPetSession(testDivision, c, 101)
+	if f := rt.TickHook()(1200); len(f) != 0 {
+		t.Fatal("duplicate session reset motion", f)
+	}
+	c.ActiveCOS.CurrentHP = 0
+	if f := rt.TickHook()(1300); len(f) != 1 || len(f[0].Frames) != 1 {
+		t.Fatal("death failed to stop pet", f)
+	}
+	if f := rt.TickHook()(1400); len(f) != 0 {
+		t.Fatal("dead pet kept updating")
+	}
+	rt.ForgetCharacter(testDivision, c.Name)
+	if len(rt.petSessions) != 0 {
+		t.Fatal("session retained AI owner")
+	}
+}
+
+/*
+================
+TestOrderedPetSessionKeysTrackMembership
+
+advancePets' walk list is cached on the runtime and rebuilt only
+when a membership writer drops it (#2033): the sorted gid-bearing
+keys track binds and forgets, owner sessions (gid 0) never walk,
+and readiness - which flips without a map write - leaves the
+cached list standing for the walk's live read at each visit.
+================
+*/
+func TestOrderedPetSessionKeysTrackMembership(t *testing.T) {
+	c := testCharacter()
+	rt, _ := newTestRuntime(c, testItems())
+	seed := func(division, name string, gid uint32) petOwnerKey {
+		key := petOwnerKey{division: division, name: name, gid: gid}
+		rt.petMu.Lock()
+		if rt.petSessions == nil {
+			rt.petSessions = make(map[petOwnerKey]*petSession)
+		}
+		rt.petSessions[key] = &petSession{character: c, ready: true}
+		rt.petMu.Unlock()
+		return key
+	}
+	late := seed("zeta", "asd2", 9)
+	seed(testDivision, "asd2", 0)
+	second := seed(testDivision, "asd2", 7)
+	first := seed(testDivision, "asd2", 3)
+	keys := rt.orderedPetSessionKeys()
+	if want := []petOwnerKey{first, second, late}; !reflect.DeepEqual(keys, want) {
+		t.Fatalf("walk list %v, want %v", keys, want)
+	}
+	if again := rt.orderedPetSessionKeys(); &again[0] != &keys[0] {
+		t.Fatal("second read rebuilt the cached list")
+	}
+	// Readiness flips without a map write: the cached list stands,
+	// and the flip is the walk's live read to judge.
+	rt.petMu.Lock()
+	rt.petSessions[first].ready = false
+	rt.petMu.Unlock()
+	if again := rt.orderedPetSessionKeys(); &again[0] != &keys[0] {
+		t.Fatal("a readiness flip rebuilt the cached list")
+	}
+	// A forget is a membership writer: the next read drops its keys.
+	rt.forgetPetSession(testDivision, "asd2")
+	if keys := rt.orderedPetSessionKeys(); !reflect.DeepEqual(keys, []petOwnerKey{late}) {
+		t.Fatalf("walk list after forget %v, want [%v]", keys, late)
+	}
+}
+
+/*
+================
+TestAdvancePetInDivisionJudgesTheLiveSession
+
+The sweep captures a pet's session before the division lock, and a
+forget with a rebind in that gap moves the entry to a fresh session.
+The division step must judge the session the map holds once the lock
+lands, never the captured generation: a forgotten entry answers 0,
+and a rebound entry is the one judged.
+================
+*/
+func TestAdvancePetInDivisionJudgesTheLiveSession(t *testing.T) {
+	rig := func(t *testing.T) (*Runtime, *fakeClock, petOwnerKey, *petSession) {
+		rt, clock, c, _ := newPetCombatRuntime(t, 100000, attackPetBand)
+		makeTrainedPet(rt, c, "COS_P_BEAR_090", 90)
+		pet := c.ActiveCOS
+		key := petOwnerKey{division: testDivision, name: c.Name, gid: pet.GID}
+		captured := rt.petSessionFor(testDivision, c.Name, pet.GID)
+		if captured == nil {
+			t.Fatal("missing session")
+		}
+		return rt, clock, key, captured
+	}
+
+	// Forgotten between capture and lock: nothing is judged.
+	rt, clock, key, captured := rig(t)
+	rt.petMu.Lock()
+	delete(rt.petSessions, key)
+	rt.petMu.Unlock()
+	if characterID, _, _, _, _, _, _ := rt.advancePetInDivision(key, captured, clock.NowMs()); characterID != 0 {
+		t.Fatalf("forgotten session judged as character %d, want 0", characterID)
+	}
+
+	// Rebound between capture and lock: the fresh session is judged.
+	// Its owner record carries a different id, and the step answers
+	// with the id of the session it actually judged.
+	rt, clock, key, captured = rig(t)
+	owner := *captured.character
+	owner.ID = captured.character.ID + 777
+	live := *captured
+	live.character = &owner
+	rt.petMu.Lock()
+	rt.petSessions[key] = &live
+	rt.petMu.Unlock()
+	if characterID, _, _, _, _, _, _ := rt.advancePetInDivision(key, captured, clock.NowMs()); characterID != owner.ID {
+		t.Fatalf("judged character %d, want the rebound session's owner %d", characterID, owner.ID)
+	}
+}

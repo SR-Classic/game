@@ -1,0 +1,171 @@
+/*
+===========================================================================
+
+inventory-item.ts - reference-directed native item record decoding
+
+Container readers share this boundary so a variable-length companion record
+cannot shift the following item. Unknown states and known wrong families
+fail atomically; a reference the snapshot does not carry is measured by
+the summoner item's subtype, the way the writer laid the record out.
+
+===========================================================================
+*/
+import type { InventoryItem } from "@/engine/contracts/gameplay";
+
+// The port-only pet gear rows (scripts/build/shared/portItemRows.mjs); the
+// server's item/wire PetGearRefFirst..PetGearRefLast.
+export const PET_GEAR_REF_FIRST = 30100;
+export const PET_GEAR_REF_LAST = 30399;
+
+/*
+================
+isPetGearRef
+================
+*/
+export function isPetGearRef( refObjId: number ): boolean {
+	return refObjId >= PET_GEAR_REF_FIRST && refObjId <= PET_GEAR_REF_LAST;
+}
+
+/*
+================
+etcCarriesPlusByte
+
+The ETC rows whose record carries a Plus byte: magic and attribute stones
+(TID 3.3.11.1 and 3.3.11.2), where it is the stone's assimilation value.
+================
+*/
+export function etcCarriesPlusByte( typeFlags: number ): boolean {
+	return (typeFlags & 0x60) === 0x60 && (typeFlags & 0x780) === 0x580 &&
+		((typeFlags & 0xf800) === 0x800 || (typeFlags & 0xf800) === 0x1000);
+}
+
+// CSOItem::Deserialize 78c830; magic list 78b1b0. Returns the next byte so
+// container owners can compose rows without guessing a reference-dependent size.
+/*
+================
+decodeInventoryItem
+================
+*/
+export function decodeInventoryItem(
+	p: Uint8Array,
+	offset: number,
+	refs: ReadonlyMap<number, number>,
+	objRefs: ReadonlyMap<number, number> = new Map()
+): { item: InventoryItem | null; next: number; } {
+	const v = new DataView( p.buffer, p.byteOffset, p.byteLength );
+	let o = offset;
+	/*
+================
+take
+================
+	*/
+	function take( n: number ) {
+		if ( o < 0 || o + n > p.length ) throw new Error( "Truncated inventory item" );
+		const at = o;
+		o += n;
+		return at;
+	}
+	const u8 = () => v.getUint8( take( 1 ) ),
+		u16 = () => v.getUint16( take( 2 ), true ),
+		u32 = () => v.getUint32( take( 4 ), true ),
+		u64 = () => v.getBigUint64( take( 8 ), true ).toString();
+	const refObjId = u32();
+	if ( refObjId === 0 ) return { item: null, next: o };
+	const typeFlags = refs.get( refObjId );
+	if ( typeFlags === undefined ) throw new Error( "Unknown inventory reference" );
+	if ( (typeFlags & 2) || (typeFlags & 0x1c) !== 0xc ) throw new Error( "Unsupported inventory item class" );
+	let quantity = 1,
+		plus = 0,
+		durability = 0,
+		variance = "0",
+		label: string | undefined,
+		summon: InventoryItem["summon"],
+		transformRefObjId: number | undefined;
+	const magic: string[] = [];
+	/*
+================
+options
+================
+	*/
+	function options() {
+		const count = u8();
+		if ( count > 12 ) throw new Error( "Invalid inventory magic count" );
+		for ( let i = 0; i < count; i++ ) magic.push( u64() );
+	}
+	const band = typeFlags & 0x60, group = typeFlags & 0x780, sub = typeFlags & 0xf800;
+	if ( band === 0x20 ) {
+		plus = u8();
+		variance = u64();
+		durability = u32();
+		options();
+	} else if ( band === 0x60 ) {
+		if ( group === 0x280 ) quantity = u32();
+		else {
+			quantity = u16();
+			if ( group === 0x400 ) {
+				const n = u16(), at = take( n );
+				label = new TextDecoder( "utf-8", { fatal: true } ).decode( p.subarray( at, at + n ) );
+			} else {
+				if ( etcCarriesPlusByte( typeFlags ) ) plus = u8();
+				// Port-only pet gear (server item/wire IsPetGearRef) carries blues too.
+				if ( group === 0x700 && sub === 0x1000 || isPetGearRef( refObjId ) ) options();
+			}
+		}
+	} else if ( band === 0x40 ) {
+		if ( group === 0x100 ) transformRefObjId = u32();
+		else if ( group === 0x80 ) {
+			const state = u8();
+			if ( state < 1 || state > 4 ) throw Error( "Invalid summon state" );
+			const rentals: { kind: 0 | 5; id: number; seconds: number; tag?: number; flag?: number; }[] = [];
+			if ( state === 1 ) summon = { state, rentals };
+			else {
+				const refObjId = u32(), tid = objRefs.get( refObjId );
+				if ( tid !== undefined && ((tid & 0x7fe) !== 0x1c6 || ![ 3, 4 ].includes( tid >>> 11 )) ) {
+					throw Error( "Invalid summoned object family" );
+				}
+				// A known character's family owns the rental clock (a
+				// pickup companion, band 4); the item's subtype never
+				// classifies the pet. The record layout itself follows
+				// the summoned character's class word — an attack pet
+				// is name only, a pickup pet is name plus the clock —
+				// the same discriminator the known-reference path uses.
+				// A reference the snapshot does not carry still cannot
+				// end the session inside an unrelated bag answer: a
+				// summoner item's subtype fixes the class of pet it
+				// summons, so measure an unknown reference by the item
+				// subtype and the record is measured identically.
+				let pickup: boolean;
+				if ( tid !== undefined ) pickup = tid >>> 11 === 4;
+				else if ( sub === 0x800 ) pickup = false;
+				else if ( sub === 0x1000 ) pickup = true;
+				else throw Error( "Unsupported summoner subtype" );
+				const n = u16(), at = take( n );
+				const name = new TextDecoder( "utf-8", { fatal: true } ).decode( p.subarray( at, at + n ) );
+				const remainingSeconds = pickup ? v.getInt32( take( 4 ), true ) : undefined;
+				const count = u8();
+				for ( let i = 0; i < count; i++ ) {
+					const kind = u8(), id = u32(), seconds = v.getInt32( take( 4 ), true );
+					if ( kind !== 0 && kind !== 5 ) throw new Error( "Unsupported summon rental variant" );
+					rentals.push( { kind, id, seconds, ...(kind === 5 ? { tag: u32(), flag: u8() } : {}) } );
+				}
+				summon = { state, refObjId, name, remainingSeconds, rentals };
+			}
+		}
+	} else throw new Error( "Unsupported inventory item class" );
+	return {
+		item: {
+			slot: 0,
+			refObjId,
+			typeFlags,
+			quantity,
+			plus,
+			durability,
+			variance,
+			magic,
+			...(summon ? { summon } : {}),
+			...(transformRefObjId === undefined ? {} : { transformRefObjId }),
+			...(label === undefined ? {} : { label })
+		},
+		next: o
+	};
+}

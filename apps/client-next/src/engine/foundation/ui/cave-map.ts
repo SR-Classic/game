@@ -1,0 +1,328 @@
+/*
+===========================================================================
+
+cave-map.ts - the M window's dungeon pages
+
+The later client's Dungeonmap pages (import_vsro_dungeon_maps.py): one image
+per floor, its room names and gate signs at their authored positions.
+Pure layout; the map HUD owns the window state. A floor without a page keeps
+the world map.
+
+===========================================================================
+*/
+import type { Pose } from "@/engine/contracts/gameplay";
+import type { UiQuad, UiRect } from "@/engine/contracts/ui";
+import { planeKindOf } from "@/engine/foundation/world/plane";
+import { REGION_SIZE } from "@/engine/foundation/world/world-space";
+import { minimapRotation } from "./hud-readouts";
+import { MAP_LOCAL_MARKER, TOMB_FIRST_DUNGEON, worldMapDungeonOf } from "./world-map";
+
+const CATALOG_FORMAT = "sro-later-dungeon-map";
+const CATALOG_VERSION = 2;
+// The offset in a dungeon tile's name, as the minimap's (minimapTiles).
+const CAVE_TILE_ORIGIN = 128;
+const CAVE_MARKER_SIZE = 16;
+const COLOR_RANGE = 255;
+// The picked species' sign on a dungeon page, the minimap's monster
+// sign the hunting guide uses outdoors.
+const CAVE_MONSTER_MARKER = "/assets/images/Media_extracted/interface/minimap/mm_sign_monster.png";
+
+export interface CaveMapLabel {
+	readonly text: string;
+	readonly x: number;
+	readonly y: number;
+	readonly font: number;
+	readonly color: readonly [number, number, number];
+}
+
+export interface CaveMapSign {
+	readonly name: string;
+	readonly x: number;
+	readonly y: number;
+	readonly width: number;
+	readonly height: number;
+}
+
+export interface CaveMapPage {
+	readonly regionId: number;
+	readonly floorIndex: number;
+	readonly layer: number;
+	readonly floorLabel: string;
+	readonly columns: number;
+	readonly rows: number;
+	readonly width: number;
+	readonly height: number;
+	readonly left: number;
+	readonly top: number;
+	readonly image: string;
+	// The page title: the later client's zone name of the floor's region.
+	readonly caption: string;
+	readonly labels: readonly CaveMapLabel[];
+	readonly signs: readonly CaveMapSign[];
+}
+
+export interface CaveMapCatalog {
+	readonly imageRoot: string;
+	readonly signIcon: string;
+	// The page foot's note on the level filter, in the later client's words.
+	readonly monsterLevelNote: string;
+	readonly maps: readonly CaveMapPage[];
+}
+
+/*
+================
+caveMapCatalog
+
+The published catalogue, refused whole when its shape is wrong. A
+catalogue of another version is a tree built before the importer
+changed: the refusal names the rebuild that replaces it.
+================
+*/
+export function caveMapCatalog( value: unknown ): CaveMapCatalog {
+	const data = value as Partial<CaveMapCatalog> & { format?: unknown; version?: unknown; };
+	if ( data?.format === CATALOG_FORMAT && data.version !== CATALOG_VERSION ) {
+		throw Error(
+			`dungeon map catalog is version ${String( data.version )}, this client reads ${CATALOG_VERSION}: ` +
+				"rerun the asset build with SRO_VSRO_ROOT naming the pinned v1.188 client"
+		);
+	}
+	if (
+		data?.format !== CATALOG_FORMAT || !Array.isArray( data.maps ) ||
+		typeof data.imageRoot !== "string" || typeof data.signIcon !== "string" ||
+		typeof data.monsterLevelNote !== "string" || !data.monsterLevelNote
+	) throw Error( "Invalid dungeon map catalog" );
+	for ( const map of data.maps ) {
+		if (
+			!Number.isInteger( map.regionId ) || !Number.isInteger( map.floorIndex ) ||
+			!Number.isInteger( map.layer ) || !(map.columns > 0) ||
+			!(map.rows > 0) || !(map.width > 0) || !(map.height > 0) || typeof map.image !== "string" ||
+			typeof map.caption !== "string" || !map.caption ||
+			!Array.isArray( map.labels ) || !Array.isArray( map.signs )
+		) throw Error( "Invalid dungeon map page" );
+	}
+	return data as CaveMapCatalog;
+}
+
+/*
+================
+caveMapPage
+
+The page of a floor, or undefined when the client has none.
+================
+*/
+export function caveMapPage( catalog: CaveMapCatalog | undefined, regionId: number, floor: number | undefined ) {
+	return catalog?.maps.find( map => map.regionId === regionId && map.floorIndex === floor );
+}
+
+/*
+================
+caveDungeonFloors
+
+The pages of the dungeon a region belongs to, in floor order (issue
+#3167's floor selector). Ch'in Tomb spreads its floors over six
+regions, ordered by their authored layer; Donwhang's cave, and any
+other dungeon, is one region whose pages differ by floorIndex.
+================
+*/
+export function caveDungeonFloors(
+	catalog: CaveMapCatalog | undefined,
+	regionId: number
+): readonly CaveMapPage[] {
+	if ( !catalog ) return [];
+	if ( worldMapDungeonOf( regionId ) === TOMB_FIRST_DUNGEON ) {
+		return catalog.maps
+			.filter( map => worldMapDungeonOf( map.regionId ) === TOMB_FIRST_DUNGEON )
+			.sort( ( a, b ) => a.layer - b.layer );
+	}
+	return catalog.maps
+		.filter( map => map.regionId === regionId )
+		.sort( ( a, b ) => a.floorIndex - b.floorIndex );
+}
+
+/*
+================
+cavePageCenter
+
+The world position a page's centre shows, for viewing a dungeon the
+player is not standing in (issue #3167): the inverse of caveMapView's
+projection at the page's middle tile.
+================
+*/
+export function cavePageCenter( page: CaveMapPage ): Pose {
+	return {
+		regionId: page.regionId,
+		x: (page.left - CAVE_TILE_ORIGIN + page.columns / 2) * REGION_SIZE,
+		y: 0,
+		z: (page.top + 1 - CAVE_TILE_ORIGIN - page.rows / 2) * REGION_SIZE,
+		angle: 0
+	};
+}
+
+/*
+================
+caveMapImage
+
+A page's one published image, so a closed window can demand it.
+================
+*/
+export function caveMapImage( catalog: CaveMapCatalog, page: CaveMapPage ) {
+	return catalog.imageRoot + page.image + ".png";
+}
+
+/*
+================
+axisOffset
+
+Where a page axis starts on screen: the point centred, clamped so the view
+stays on the page, or the whole page centred when it is smaller than the view.
+================
+*/
+function axisOffset( view: number, size: number, point: number, pan: number ) {
+	if ( size <= view ) return (view - size) / 2;
+	return Math.min( 0, Math.max( view - size, view / 2 - point + pan ) );
+}
+
+export interface CaveMapInput {
+	readonly pose: Pose;
+	readonly center: Pose;
+	readonly page: CaveMapPage;
+	readonly catalog: CaveMapCatalog;
+	readonly clip: UiRect;
+	readonly pan: readonly [number, number];
+	// Whether the pose stands on this page's floor (cavePageLocal):
+	// the player's sign is a "you are here" only there (issue #3239).
+	readonly local: boolean;
+	// A picked species' anchor on this page, in region-local
+	// coordinates; drawn as the monster sign (issue #3239).
+	readonly mark?: { readonly x: number; readonly z: number; } | null;
+}
+
+/*
+================
+cavePageLocal
+
+Whether the page shown is the floor the pose stands on (issue
+#3239): the pose's region must be a floor region of the page's
+dungeon, and in Donwhang's one shared region the resolved floor
+must be the page's own. A dungeon viewed from above ground is
+never local, so its page carries no "you are here" sign.
+================
+*/
+export function cavePageLocal(
+	catalog: CaveMapCatalog | undefined,
+	page: CaveMapPage,
+	pose: Pose,
+	navigationFloor: number | undefined
+): boolean {
+	const floors = caveDungeonFloors( catalog, page.regionId );
+	if ( !floors.some( floor => floor.regionId === pose.regionId ) ) return false;
+	if ( planeKindOf( pose.regionId ) === "cave" && (pose.regionId & 0x7fff) === 1 ) {
+		return navigationFloor === page.floorIndex;
+	}
+	return pose.regionId === page.regionId;
+}
+
+/*
+================
+caveMapView
+
+The page image, gate signs, a picked species' sign and the player's
+sign (only on their own floor) in paint order, its room names at
+screen positions, the pan after clamping, and the inverse pick from a
+screen pixel back to the floor region's coordinates.
+================
+*/
+export function caveMapView( input: CaveMapInput ) {
+	const { pose, center, page, catalog, clip, pan, local, mark } = input;
+	const unitX = page.width / page.columns, unitY = page.height / page.rows;
+	const mapX = ( x: number ) => (x / REGION_SIZE + CAVE_TILE_ORIGIN - page.left) * unitX,
+		mapY = ( z: number ) => (page.top + 1 - CAVE_TILE_ORIGIN - z / REGION_SIZE) * unitY;
+	const offsetX = axisOffset( clip[2], page.width, mapX( center.x ), pan[0] ),
+		offsetY = axisOffset( clip[3], page.height, mapY( center.z ), pan[1] );
+	const left = clip[0] + offsetX, top = clip[1] + offsetY;
+	const quads: UiQuad[] = [];
+	const white = [ 1, 1, 1, 1 ] as const;
+	quads.push( {
+		texture: caveMapImage( catalog, page ),
+		rect: [ left, top, page.width, page.height ],
+		uv: [ 0, 0, 1, 1 ],
+		color: white,
+		clip
+	} );
+	const signs = page.signs.map( sign => ({
+		name: sign.name,
+		rect: [ left + sign.x, top + sign.y, sign.width, sign.height ] as UiRect
+	}) );
+	for ( const sign of signs ) {
+		quads.push( {
+			texture: catalog.imageRoot + catalog.signIcon + ".png",
+			rect: sign.rect,
+			uv: [ 0, 0, 1, 1 ],
+			color: white,
+			clip
+		} );
+	}
+	if ( mark ) {
+		quads.push( {
+			texture: CAVE_MONSTER_MARKER,
+			rect: [
+				left + mapX( mark.x ) - CAVE_MARKER_SIZE / 2,
+				top + mapY( mark.z ) - CAVE_MARKER_SIZE / 2,
+				CAVE_MARKER_SIZE,
+				CAVE_MARKER_SIZE
+			],
+			uv: [ 0, 0, 1, 1 ],
+			color: white,
+			clip
+		} );
+	}
+	// The player's sign only on the floor they stand on (issue
+	// #3239): a page viewed from outside the dungeon is a chart,
+	// not a "you are here".
+	if ( local ) {
+		quads.push( {
+			texture: MAP_LOCAL_MARKER,
+			rect: [
+				left + mapX( pose.x ) - CAVE_MARKER_SIZE / 2,
+				top + mapY( pose.z ) - CAVE_MARKER_SIZE / 2,
+				CAVE_MARKER_SIZE,
+				CAVE_MARKER_SIZE
+			],
+			uv: [ 0, 0, 1, 1 ],
+			color: white,
+			clip,
+			rotation: minimapRotation( pose.angle )
+		} );
+	}
+	const labels = page.labels.map( label => ({
+		text: label.text,
+		x: left + label.x,
+		y: top + label.y,
+		font: label.font,
+		color: [
+			label.color[0] / COLOR_RANGE,
+			label.color[1] / COLOR_RANGE,
+			label.color[2] / COLOR_RANGE,
+			1
+		] as const
+	}) );
+	// The pan a clamped view really holds, so reversing a drag never unwinds
+	// an overshoot first (579920 on the world map).
+	const clampedPan: [number, number] = [
+		page.width <= clip[2] ? 0 : offsetX - (clip[2] / 2 - mapX( center.x )),
+		page.height <= clip[3] ? 0 : offsetY - (clip[3] / 2 - mapY( center.z ))
+	];
+	// The inverse of mapX / mapY: the page point under a screen pixel,
+	// in the floor region's own coordinates; null off the page or the
+	// view (the GM double-click warp, map-teleport.ts).
+	const point = ( sx: number, sy: number ) => {
+		if ( sx < Math.max( left, clip[0] ) || sx >= Math.min( left + page.width, clip[0] + clip[2] ) ) return null;
+		if ( sy < Math.max( top, clip[1] ) || sy >= Math.min( top + page.height, clip[1] + clip[3] ) ) return null;
+		return {
+			regionId: page.regionId,
+			x: ((sx - left) / unitX + page.left - CAVE_TILE_ORIGIN) * REGION_SIZE,
+			z: (page.top + 1 - CAVE_TILE_ORIGIN - (sy - top) / unitY) * REGION_SIZE
+		};
+	};
+	return { quads, labels, signs, pan: clampedPan, point };
+}

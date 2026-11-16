@@ -1,0 +1,241 @@
+/*
+===========================================================================
+
+published-characters.test.mjs - published models pass the production decoder
+
+Reads the generated client-public tree: NPC models, item drops and every
+character attachment the item catalog publishes must be packed with their
+recorded hashes and accepted by the production model decoder.
+
+===========================================================================
+*/
+import { CLIENT_PUBLIC_ROOT } from "../../../../scripts/lib/generatedRoot.mjs";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import path from "node:path";
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { build } from "esbuild";
+import { readPublishedAssetBytesSync, readPublishedAssetJsonSync } from "../../../../scripts/lib/publishedAsset.mjs";
+import {
+	decodeStoredMember,
+	parsePackHeader,
+	storedMemberBytes
+} from "../../../../scripts/build/shared/packFormat.mjs";
+import { CROW_EGG_REF } from "../../../../scripts/build/char/crowEgg.mjs";
+import { PORT_PET_DROP_MODEL } from "../../../../scripts/build/shared/portItemRows.mjs";
+import { equipmentModelFiles, hwanModelFiles } from "../../../../scripts/build/assetPackOwnership.mjs";
+import { joinedNpcManifest } from "../../../../scripts/build/shared/npcManifest.mjs";
+import { EXPANDED_BUILD } from "../helpers/expanded-build.mjs";
+
+const entry = "src/engine/runtime/assets/worker/model/model.ts";
+const publicRoot = CLIENT_PUBLIC_ROOT;
+const createModelDecoder = await loadModelDecoder( [] );
+
+/*
+================
+loadModelDecoder
+
+Bundles the production model worker with optional esbuild plugins and
+returns its decoder factory.
+================
+*/
+async function loadModelDecoder( plugins ) {
+	const built = await build( {
+		entryPoints: [ entry ],
+		bundle: true,
+		platform: "node",
+		format: "esm",
+		write: false,
+		plugins,
+		footer: { js: `//# sourceURL=${entry}` }
+	} );
+	const source = Buffer.from( built.outputFiles[0].contents ).toString( "base64" );
+	return (await import( "data:text/javascript;base64," + source )).createModelDecoder;
+}
+
+/*
+================
+sha256
+================
+*/
+function sha256( bytes ) {
+	return createHash( "sha256" ).update( bytes ).digest( "hex" );
+}
+
+// The same model bytes are decoded by several tests below (loose in one,
+// packed in another). Decode each distinct byte string once per file and
+// assert on the shared result: a changed model hashes differently and
+// decodes again, so the assertions still break on the same changes.
+const decodedCharacters = new Map();
+
+/*
+================
+decodeCharacterOnce
+================
+*/
+function decodeCharacterOnce( decoder, bytes, label ) {
+	const key = sha256( bytes );
+	if ( !decodedCharacters.has( key ) ) {
+		let character;
+		assert.doesNotThrow( () => {
+			character = decoder.character( decoder.decode( bytes ) );
+		}, label );
+		decodedCharacters.set( key, character );
+	}
+	return decodedCharacters.get( key );
+}
+
+test("every published NPC model passes the production character decoder", () => {
+	const manifest = joinedNpcManifest( readPublishedAssetJsonSync( "/assets/npc/manifest.json", publicRoot ) );
+	const paths = new Set( Object.values( manifest.models ).map( model => model.glb ) );
+	assert.ok( paths.size > 0, "NPC manifest must contain models" );
+	const decoder = createModelDecoder();
+	for ( const resource of paths ) {
+		assert.equal( typeof resource, "string" );
+		decodeCharacterOnce( decoder, readPublishedAssetBytesSync( resource, publicRoot ), resource );
+	}
+});
+
+test("packed NPC models match their published authority and pass the production decoder", () => {
+	const index = JSON.parse( readFileSync( path.join( publicRoot, "assets/packs/manifest.json" ), "utf8" ) );
+	const manifest = joinedNpcManifest( readPublishedAssetJsonSync( "/assets/npc/manifest.json", publicRoot ) );
+	const paths = new Set( Object.values( manifest.models ).map( model => model.glb ) );
+	const grouped = new Map();
+	for ( const resource of paths ) {
+		const member = index.assets.find( asset => asset.path === resource );
+		assert.ok( member, `Unpacked NPC ${resource}` );
+		if ( !grouped.has( member.packPath ) ) grouped.set( member.packPath, [] );
+		grouped.get( member.packPath ).push( member );
+	}
+	const decoder = createModelDecoder();
+	for ( const [packPath, members] of grouped ) {
+		const pack = index.groups.flatMap( group => group.packs ).find( pack => pack.path === packPath );
+		const identity = path.join( publicRoot, packPath );
+		const bytes = readFileSync( identity );
+		assert.equal( sha256( bytes ), pack.sha256 );
+		const { dataStart } = parsePackHeader( bytes, packPath );
+		for ( const member of members ) {
+			// decodeStoredMember checks the decoded length and SHA-256 itself.
+			const model = decodeStoredMember( storedMemberBytes( bytes, dataStart, member, packPath ), member );
+			assert.deepEqual(
+				model,
+				readPublishedAssetBytesSync( member.path, publicRoot ),
+				`Stale packed NPC ${member.path}`
+			);
+			decodeCharacterOnce( decoder, model, member.path );
+		}
+	}
+});
+
+test("special COS references share authored state-50 models and matching VAT clips", () => {
+	const manifest = joinedNpcManifest( readPublishedAssetJsonSync( "/assets/npc/manifest.json", publicRoot ) );
+	const cos = Object.values( manifest.models ).filter( row => row.kind === "cos" && row.refObjId !== CROW_EGG_REF );
+	const egg = Object.values( manifest.models ).find( row => row.refObjId === CROW_EGG_REF );
+	assert.ok( egg?.staticPose && egg.clips.length === 0, "owned egg has no retail emote or VAT requirement" );
+	// Reviewed 2026-10-02: every COS band whose BSR ships. Riding mounts,
+	// transports and quest companions author no state-50 emote; 582110's
+	// action-1 route plays one for the growth pets, which all author it.
+	// 1218 rows and 44 models since the tomb's MOB_QT_TQ_THIEF_01_COS ships
+	// with its own model (#2024). Those counts are the native census: an
+	// expanded build adds the later client's companions (1360 rows on
+	// 2026-11-14). Four of its pick pets (TypeID4 4, admitted by 582110 like
+	// growth pets) reuse monster models that author no state 50: 8E7150 then
+	// finds the motion in neither set and returns 0, so the pet keeps its
+	// motion, as presentation-state.ts does when the clip is absent. Wherever
+	// the emote is authored, its clip and VAT clip ship with it.
+	const rows = cos.filter( row => row.codename.startsWith( "COS_P_" ) );
+	if ( !EXPANDED_BUILD ) {
+		assert.equal( cos.length, 1218 );
+		assert.equal( new Set( cos.map( row => row.glb ) ).size, 44 );
+		assert.equal( rows.length, 1130 );
+		assert.equal( new Set( rows.map( row => row.glb ) ).size, 22 );
+	}
+	assert.ok( rows.length > 0, "the build publishes growth pets" );
+	const authored = rows.filter( row => row.animationStates?.emote0 );
+	if ( !EXPANDED_BUILD ) assert.equal( authored.length, rows.length, "every native growth pet authors the emote" );
+	for ( const row of authored ) {
+		assert.equal( row.animationStates.emote0.stateId, 50 );
+		assert.ok( row.clips.includes( "emote0" ) );
+		assert.ok( row.vat.clips.includes( "emote0" ), row.codename );
+	}
+	for ( const row of rows.filter( row => !row.animationStates?.emote0 ) ) {
+		assert.ok( !row.clips.includes( "emote0" ), row.codename + " ships an emote it does not author" );
+	}
+	assert.ok( authored.length > rows.length / 2, "the emote is the growth-pet norm" );
+});
+
+test("every authored item drop passes the production model decoder", () => {
+	const manifest = readPublishedAssetJsonSync( "/assets/itemdrop/manifest.json", publicRoot );
+	const decoder = createModelDecoder();
+	const entries = Object.values( manifest.models );
+	assert.equal( Object.keys( manifest.models ).filter( key => key !== PORT_PET_DROP_MODEL ).length, 38 );
+	assert.ok( manifest.models[PORT_PET_DROP_MODEL], "owned pet prop published beside native drops" );
+	for ( const row of entries ) {
+		const model = decodeCharacterOnce( decoder, readPublishedAssetBytesSync( row.glb, publicRoot ), row.glb );
+		assert.ok( model.primitives.length, row.glb );
+		for ( const clip of row.clips ) assert.ok( model.clips.some( c => c.name === clip ), row.glb + ": " + clip );
+	}
+});
+
+test("every catalog attachment is packed once and accepted by the production decoder", () => {
+	const roster = readPublishedAssetJsonSync( "/assets/char/roster.json", publicRoot );
+	const index = readPublishedAssetJsonSync( "/assets/packs/manifest.json", publicRoot );
+	const decoder = createModelDecoder();
+	const owners = new Map();
+	for ( const asset of index.assets ) owners.set( asset.path, [ ...(owners.get( asset.path ) ?? []), asset ] );
+	const avatarBodies = Object.values( roster.dress.equipment )
+		.filter( row => row.avatarSlot !== undefined )
+		.flatMap( row => Object.values( row.bodies ).filter( Boolean ) );
+	assert.ok( avatarBodies.length > 0, "the item catalog must publish avatar bodies" );
+	const files = [ ...equipmentModelFiles( roster.dress ), ...hwanModelFiles( roster.dress ) ];
+	for ( const body of avatarBodies ) assert.ok( files.includes( body.glb ), `Unowned avatar body ${body.glb}` );
+	for ( const glb of files ) {
+		const bytes = readPublishedAssetBytesSync( glb, publicRoot );
+		const members = owners.get( glb ) ?? [];
+		assert.equal( members.length, 1, glb );
+		assert.equal( sha256( bytes ), members[0].sha256, glb );
+		assert.ok( decodeCharacterOnce( decoder, bytes, glb ).primitives.length, glb );
+	}
+});
+
+for ( const enabled of [ false, true ] ) {
+	test(`ordinary clothing ambient uses ${enabled ? "native actor" : "compatibility BMT"} input`, async () => {
+		const plugins = enabled ?
+			[ {
+				name: "native-lighting-test",
+				setup( build ) {
+					build.onLoad( { filter: /video-options\.ts$/ }, args => ({
+						contents: readFileSync( args.path, "utf8" ).replace(
+							"NATIVE_CHARACTER_LIGHTING = false",
+							"NATIVE_CHARACTER_LIGHTING = true"
+						),
+						loader: "ts"
+					}) );
+				}
+			} ] :
+			[];
+		// The plain bundle is already loaded at module scope; only the
+		// plugin variant pays a second esbuild run.
+		const createVariantDecoder = enabled ? await loadModelDecoder( plugins ) : createModelDecoder;
+		const roster = readPublishedAssetJsonSync( "/assets/char/roster.json", publicRoot );
+		const garment = Object.entries( roster.dress.defaultWear ).find( ( [key] ) => key.startsWith( "CH_M_" ) );
+		assert.ok( garment, "the catalog must publish Chinese male default wear" );
+		const decoder = createVariantDecoder();
+		const doc = decoder.decode( readPublishedAssetBytesSync( garment[1].glb, publicRoot ) );
+		assert.ok( decoder.character( doc ).primitives.length );
+		const altered = structuredClone( doc );
+		for ( const m of altered.json.materials ) {
+			m.extras = { sroAmbientFactor: [ .13, .29, .47, 1 ] };
+			m.pbrMetallicRoughness.baseColorFactor = [ .71, .83, .97, 1 ];
+		}
+		for ( const p of decoder.character( altered ).primitives ) {
+			assert.equal( p.geometry.material.stageFactor, 2 );
+			assert.equal( p.geometry.material.objectLight, 1 );
+			assert.deepEqual( p.geometry.material.ambient, enabled ? [ .6, .6, .6 ] : [ .13, .29, .47 ] );
+			assert.deepEqual( p.geometry.material.color, [ .71, .83, .97, 1 ] );
+		}
+		altered.json.materials[0].extras.sroAmbientFactor = [ 1, 2 ];
+		assert.throws( () => decoder.character( altered ), /ambient/ );
+	});
+}

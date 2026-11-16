@@ -1,0 +1,990 @@
+/*
+===========================================================================
+
+hub.go - transport admission, routing and lifecycle ownership
+
+===========================================================================
+*/
+package transport
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+)
+
+// HandlerFunc handles one inbound game frame. Handlers for the same session
+// run serially on that session's read loop; handlers for different sessions
+// run concurrently. A panic is recovered and logged, and the offending
+// session is closed.
+type HandlerFunc func(s *Session, opcode uint16, payload []byte)
+
+// Hub owns every live session and the opcode dispatch table the game lanes
+// register into. One Hub serves both the WebTransport and the
+// WebSocket listeners.
+/*
+================
+Hub
+================
+*/
+type Hub struct {
+	// History is installed before admission opens; its queue never calls gameplay.
+	History HistoryObserver
+	// Census, when installed, receives the same lifecycle events as
+	// History (history.go): the connection journal behind the
+	// SRO_CONNECTION_JOURNAL flag (#2716, port-only, not native). Nil
+	// is the native posture: nothing is recorded.
+	Census CensusObserver
+	cfg    Config
+
+	// now and newTicker are the hub's one clock. Production reads the
+	// wall clock (newHub's defaults); a test installs a manual clock so
+	// the keepalive watchdogs prove their bounds as ordering, never as
+	// scheduler speed (#2445). Only the stamps the keepalive loop
+	// compares (lastRecv, lastSent, lastStreamAck, sceneLoadingSince)
+	// read this clock.
+	now       func() time.Time
+	newTicker func(time.Duration) ticker
+
+	// activity is the one subscriber told about every dispatched game frame
+	// (OnSessionActivity); an atomic pointer, so the hot path takes no lock.
+	activity atomic.Pointer[func(account string)]
+
+	// emptyFrames throttles the opcode-0 refusal warning (emptyframe.go).
+	emptyFrames emptyFrameLog
+
+	mu       sync.RWMutex
+	sessions map[uint64]*Session
+	byToken  map[[ResumeTokenLen]byte]*Session
+	// ended remembers the tokens of evicted sessions after teardown, for
+	// endedTokenGraces grace periods (endedResume).
+	ended  map[[ResumeTokenLen]byte]endedToken
+	closed bool
+
+	// Single-session bind: one live session per bind key
+	// (division:character). bindingKeys is the reverse index for cleanup.
+	bindings    map[string]*Session
+	bindingKeys map[uint64]string
+	controls    map[string]uint64
+
+	// Account index: admission account -> its live sessions, and the
+	// reverse for cleanup. Bounds what one account can hold
+	// (Config.MaxSessionsPerAccount).
+	accountSessions map[string]map[uint64]*Session
+	sessionAccount  map[uint64]string
+
+	// Account world seat: the account whose character stands in the
+	// world, and the claim that holds it (ClaimAccountWorld). One
+	// character of an account is in the world at a time.
+	accountWorld map[string]*AccountWorldClaim
+
+	// Division index: EFFECTIVE division -> live member sessions, so a
+	// division push touches only its members instead of scanning every
+	// session (O(sessions) per push was the scaling ceiling). sessionDiv
+	// is the reverse index for cleanup. Maintained on every path that can
+	// change membership: Session.Set of a division key (reindexDivision)
+	// and final teardown (closeSession). Eviction deliberately does NOT
+	// remove the lame duck here — delivery to it is already refused at
+	// the Session level, matching the pre-index behaviour.
+	divisions  map[string]map[uint64]*Session
+	sessionDiv map[uint64]string
+
+	// Character command restrictions by character (the bind-key spelling,
+	// division:lower(name)), recorded from the session restriction choke
+	// point so a restriction outlives its session: by-character readers
+	// (the site chat feed) must not see a mute end at logoff. Guarded by
+	// its own lock, held only for a map read or write.
+	restrictionMu sync.RWMutex
+	restrictions  map[string]*characterRestrictions
+
+	nextID        atomic.Uint64
+	nextControlID atomic.Uint64
+
+	auth      enterWorldGate
+	admission helloAdmissionGate
+	handlers  handlerRegistry
+	hooks     sessionHooks
+	// closeHooks reserves one completion per admitted session under mu.
+	// Retirement releases it only after all synchronous or async hooks finish.
+	closeHooks sync.WaitGroup
+
+	// handshakeSlots bounds connections waiting for their first HELLO.
+	// Admission is non-blocking: a full server rejects new work instead of
+	// accumulating goroutines until HelloTimeout.
+	handshakeSlots chan struct{}
+
+	// Transport observability, including simulation-tick duration, has its own
+	// synchronization and lifecycle.
+	metrics hubMetrics
+	// metricsProviders holds who supplies each published metrics block
+	// (metrics.go); embedded so the setters keep naming the provider.
+	metricsProviders
+}
+
+/*
+================
+newHub
+================
+*/
+func newHub(cfg Config) *Hub {
+	return &Hub{
+		cfg:             cfg,
+		now:             time.Now,
+		newTicker:       newRealTicker,
+		sessions:        make(map[uint64]*Session),
+		byToken:         make(map[[ResumeTokenLen]byte]*Session),
+		ended:           make(map[[ResumeTokenLen]byte]endedToken),
+		bindings:        make(map[string]*Session),
+		bindingKeys:     make(map[uint64]string),
+		controls:        make(map[string]uint64),
+		accountSessions: make(map[string]map[uint64]*Session),
+		sessionAccount:  make(map[uint64]string),
+		accountWorld:    make(map[string]*AccountWorldClaim),
+		divisions:       make(map[string]map[uint64]*Session),
+		sessionDiv:      make(map[uint64]string),
+		restrictions:    make(map[string]*characterRestrictions),
+		handlers:        newHandlerRegistry(),
+		handshakeSlots:  make(chan struct{}, cfg.MaxPendingHandshakes),
+	}
+}
+
+// BindExclusive claims a bind key (division:character) for a session. If a
+// DIFFERENT live session already holds the key it is evicted: it is marked
+// lame-duck IMMEDIATELY (inbound game frames dropped, outbound game frames
+// refused, invisible to the simulation tick), gets a reliable
+// BYE(Replaced), and is torn down, which also kills its resume token — the
+// replaced client cannot silently reattach. Rebinding the same session to
+// the same key is a no-op; binding it to a new key releases the old one.
+// Returns the evicted session when a replacement happened.
+//
+// A session that has itself been evicted can never bind again: an in-flight
+// EnterWorld handler of the loser must not steal the key back from the
+// winner. Callers detect that refusal via s.Evicted() (the latch is one-way
+// and set before the winning BindExclusive returns, so the check is exact).
+/*
+================
+BindExclusive
+================
+*/
+func (h *Hub) BindExclusive(key string, s *Session) (*Session, bool) {
+	var evict *Session
+	h.mu.Lock()
+	if s.evicted.Load() {
+		h.mu.Unlock()
+		log.WithFields(log.Fields{"key": key, "session": s.ID}).
+			Warn("transport: bind refused for evicted session")
+		return nil, false
+	}
+	if _, controlled := h.controls[key]; controlled {
+		s.markEvicted(ByeReasonReplaced)
+		h.mu.Unlock()
+		log.WithFields(log.Fields{"key": key, "session": s.ID}).
+			Warn("transport: bind refused during character control transaction")
+		s.CloseWhenDrained(ByeReasonReplaced)
+		return nil, false
+	}
+	cur := h.bindings[key]
+	if cur == s {
+		h.mu.Unlock()
+		return nil, false
+	}
+	if prevKey, ok := h.bindingKeys[s.ID]; ok && prevKey != key && h.bindings[prevKey] == s {
+		delete(h.bindings, prevKey)
+	}
+	h.bindings[key] = s
+	h.bindingKeys[s.ID] = key
+	evict = cur
+	if evict != nil {
+		// Latch the loser while the registry swap is still atomic: any
+		// tick snapshot or dispatch racing this bind either sees the old
+		// binding with a live victim or the new binding with a lame duck,
+		// never a bound-out victim that can still drive the character.
+		// Atomic store only — h.mu never nests session.mu here.
+		evict.markEvicted(ByeReasonReplaced)
+	}
+	h.mu.Unlock()
+
+	if evict == nil {
+		return nil, false
+	}
+	log.WithFields(log.Fields{"key": key, "old": evict.ID, "new": s.ID}).
+		Info("transport: single-bind eviction, replacing session")
+	evict.CloseWhenDrained(ByeReasonReplaced)
+	return evict, true
+}
+
+// BindingControlLease serializes one host-side character mutation against
+// gameplay binding. Its generation prevents a stale Release from deleting a
+// newer lease for the same key.
+/*
+================
+BindingControlLease
+================
+*/
+type BindingControlLease struct {
+	hub        *Hub
+	key        string
+	generation uint64
+	once       sync.Once
+}
+
+// AcquireBindingControl obtains exclusive control of a character binding. A
+// currently bound session is evicted and reported busy; the caller retries
+// only after final teardown removes that exact session. While a lease is held,
+// BindExclusive refuses new world admission for the key.
+/*
+================
+AcquireBindingControl
+================
+*/
+func (h *Hub) AcquireBindingControl(key string) (*BindingControlLease, bool) {
+	h.mu.Lock()
+	if _, controlled := h.controls[key]; controlled {
+		h.mu.Unlock()
+		return nil, false
+	}
+	if bound := h.bindings[key]; bound != nil {
+		bound.markEvicted(ByeReasonReplaced)
+		h.mu.Unlock()
+		bound.CloseWhenDrained(ByeReasonReplaced)
+		return nil, false
+	}
+	generation := h.nextControlID.Add(1)
+	h.controls[key] = generation
+	h.mu.Unlock()
+	return &BindingControlLease{
+		hub:        h,
+		key:        key,
+		generation: generation,
+	}, true
+}
+
+// Release relinquishes only this lease generation and is idempotent.
+/*
+================
+Release
+================
+*/
+func (lease *BindingControlLease) Release() {
+	if lease == nil || lease.hub == nil {
+		return
+	}
+	lease.once.Do(func() {
+		lease.hub.mu.Lock()
+		if lease.hub.controls[lease.key] == lease.generation {
+			delete(lease.hub.controls, lease.key)
+		}
+		lease.hub.mu.Unlock()
+	})
+}
+
+// BoundSession returns the live session holding a bind key.
+/*
+================
+BoundSession
+================
+*/
+func (h *Hub) BoundSession(key string) (*Session, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	s, ok := h.bindings[key]
+	return s, ok
+}
+
+// HandleErr registers the handler for one native opcode or
+// control-extension opcode (OpEnterWorld and up) and reports a refused
+// registration as an error. The session-internal opcodes (HELLO..BYE,
+// 0x0001-0x0005) cannot be registered. Registering during live traffic is
+// safe; last write wins. Callers MUST NOT drop the error: an unregistered
+// opcode is a silent gameplay outage, so refuse to boot (or at minimum
+// log at Error) when it is non-nil.
+/*
+================
+HandleErr
+================
+*/
+func (h *Hub) HandleErr(opcode uint16, fn HandlerFunc) error {
+	if opcode <= maxReservedOpcode {
+		return fmt.Errorf("transport: opcode 0x%04X is session-internal, not registrable", opcode)
+	}
+	h.handlers.register(opcode, fn)
+	return nil
+}
+
+// Handle is HandleErr for BOOT-TIME registration only: it panics on a
+// refused registration. That is deliberate fail-fast at process start —
+// a mis-registered lane must not come up half-wired — but it is the wrong
+// tool anywhere a panic would take live players down; register from
+// runtime code through HandleErr instead.
+/*
+================
+Handle
+================
+*/
+func (h *Hub) Handle(opcode uint16, fn HandlerFunc) {
+	if err := h.HandleErr(opcode, fn); err != nil {
+		panic(err.Error())
+	}
+}
+
+// HandleDefault registers the catch-all for opcodes with no specific
+// handler; without it unhandled frames are logged and dropped.
+/*
+================
+HandleDefault
+================
+*/
+func (h *Hub) HandleDefault(fn HandlerFunc) {
+	h.handlers.setDefault(fn)
+}
+
+// OnSessionOpen runs after a brand-new session completes its handshake.
+/*
+================
+OnSessionOpen
+================
+*/
+func (h *Hub) OnSessionOpen(fn func(*Session)) {
+	h.hooks.addOpen(fn)
+}
+
+// OnSessionResumed runs after a client reattaches to a detached session.
+// Game lanes re-push authoritative state here.
+/*
+================
+OnSessionResumed
+================
+*/
+func (h *Hub) OnSessionResumed(fn func(*Session)) {
+	h.hooks.addResumed(fn)
+}
+
+// OnSessionClose runs exactly once per session at final teardown. err is
+// nil on a clean close (client BYE, drained shutdown).
+/*
+================
+OnSessionClose
+================
+*/
+func (h *Hub) OnSessionClose(fn func(*Session, error)) {
+	h.hooks.addClose(fn)
+}
+
+// OnSessionActivity installs the one function told the account behind every
+// game frame dispatch admits to a handler: any player-sent command. PING,
+// PONG and BYE are handled in readLoop and never reach it, so a heartbeat is
+// never activity. A second call replaces the first.
+/*
+================
+OnSessionActivity
+================
+*/
+func (h *Hub) OnSessionActivity(fn func(account string)) {
+	h.activity.Store(&fn)
+}
+
+// Session returns a live session by ID.
+/*
+================
+Session
+================
+*/
+func (h *Hub) Session(id uint64) (*Session, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	s, ok := h.sessions[id]
+	return s, ok
+}
+
+// Sessions snapshots the live sessions.
+/*
+================
+Sessions
+================
+*/
+func (h *Hub) Sessions() []*Session {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]*Session, 0, len(h.sessions))
+	for _, s := range h.sessions {
+		out = append(out, s)
+	}
+	return out
+}
+
+// Broadcast queues a frame to every live session.
+/*
+================
+Broadcast
+================
+*/
+func (h *Hub) Broadcast(opcode uint16, payload []byte) {
+	for _, s := range h.Sessions() {
+		_ = s.Send(opcode, payload)
+	}
+}
+
+// BroadcastFunc queues a frame to every live session the predicate accepts.
+// The game lanes can filter by the explicit player identity:
+//
+//	hub.BroadcastFunc(func(s *transport.Session) bool {
+//	    div, _ := s.DivisionID()
+//	    return div == wantedDiv && s.ID != exceptID
+//	}, opcode, payload)
+/*
+================
+BroadcastFunc
+================
+*/
+func (h *Hub) BroadcastFunc(accept func(*Session) bool, opcode uint16, payload []byte) {
+	for _, s := range h.Sessions() {
+		if accept(s) {
+			_ = s.Send(opcode, payload)
+		}
+	}
+}
+
+// AcceptConn performs the HELLO/WELCOME handshake on a fresh transport
+// connection, then hands the connection to a new or resumed session. Run it
+// on its own goroutine per connection.
+/*
+================
+AcceptConn
+================
+*/
+func (h *Hub) AcceptConn(conn Conn) {
+	startedAt := time.Now()
+	select {
+	case h.handshakeSlots <- struct{}{}:
+		defer func() { <-h.handshakeSlots }()
+	default:
+		h.metrics.handshakeBusy.Add(1)
+		_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{ByeReasonServerBusy}})
+		_ = conn.Close("server handshake capacity reached")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), h.cfg.HelloTimeout)
+	f, err := conn.ReadFrame(ctx)
+	cancel()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			h.metrics.handshakeHelloTimeout.Add(1)
+		} else {
+			h.metrics.handshakeReadFailed.Add(1)
+		}
+		_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{ByeReasonHelloTimeout}})
+		_ = conn.Close("no HELLO before deadline")
+		return
+	}
+	helloAt := time.Now()
+	if f.EncodedLen() > MaxInboundFrameBytes {
+		h.metrics.handshakeProtocolRejected.Add(1)
+		_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{ByeReasonProtocolErr}})
+		_ = conn.Close(ErrInboundFrameTooLarge.Error())
+		return
+	}
+	if f.Opcode != OpHello {
+		h.metrics.handshakeProtocolRejected.Add(1)
+		_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{ByeReasonProtocolErr}})
+		_ = conn.Close("first frame was not HELLO")
+		return
+	}
+	hello, err := DecodeHello(f.Payload)
+	if err != nil {
+		h.metrics.handshakeProtocolRejected.Add(1)
+		_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{ByeReasonProtocolErr}})
+		_ = conn.Close(err.Error())
+		return
+	}
+	admissionIdentity, admissionCommit, verifierInstalled, verifyErr := h.verifyHelloAdmission(hello.AdmissionToken)
+	if !verifierInstalled {
+		h.metrics.helloAdmissionRefused.Add(1)
+		_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{ByeReasonUnauthorized}})
+		_ = conn.Close("HELLO admission verifier unavailable")
+		return
+	}
+	if verifyErr != nil || admissionIdentity.AccountID == "" || admissionIdentity.ShardID == "" {
+		h.metrics.helloAdmissionRefused.Add(1)
+		log.WithFields(log.Fields{"kind": conn.Kind(), "remote": conn.RemoteAddr(), "error": verifyErr}).
+			Warn("transport: HELLO admission refused")
+		_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{ByeReasonUnauthorized}})
+		_ = conn.Close("HELLO admission refused")
+		return
+	}
+	verifiedAt := time.Now()
+
+	resumePresented := len(hello.ResumeToken) == ResumeTokenLen
+	if resumePresented {
+		h.metrics.resumeAttempted.Add(1)
+		var token [ResumeTokenLen]byte
+		copy(token[:], hello.ResumeToken)
+		if sess := h.lookupByToken(token); sess != nil {
+			if !sess.BindAdmissionIdentity(
+				admissionIdentity.AccountID,
+				admissionIdentity.ShardID,
+			) {
+				h.metrics.helloAdmissionRefused.Add(1)
+				_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{ByeReasonUnauthorized}})
+				_ = conn.Close("resume admission identity mismatch")
+				return
+			}
+			// No stream position: the frames this client is missing are
+			// unknowable, so the old session ends and a fresh one starts
+			// (#1466) - never a silent gap. The admission commit is armed
+			// only on a session that attaches; a refused resume's fresh
+			// session below arms its own.
+			attachErr := errResumeGap
+			if hello.HasPosition {
+				sess.armAdmissionCommit(admissionCommit)
+				attachErr = sess.attach(conn, true, hello.LastApplied)
+			}
+			if attachErr == nil {
+				h.metrics.helloAdmissionAccepted.Add(1)
+				h.metrics.resumeAccepted.Add(1)
+				h.metrics.handshakes.record(time.Since(startedAt))
+				h.countAttach(conn.Kind())
+				h.logSlowHandshake(conn, true, startedAt, helloAt, verifiedAt)
+				h.fireResumed(sess)
+				return
+			}
+			if errors.Is(attachErr, errResumeGap) {
+				if hello.HasPosition {
+					h.metrics.resumeGap.Add(1)
+					// The refusal line (#2146): what the client reported
+					// against the ring that refused it. Without it the
+					// resume_gap metric counts a cause nobody can name.
+					d := sess.ResumeRefusal(hello.LastApplied)
+					log.WithFields(log.Fields{
+						"session": sess.ID, "kind": conn.Kind(), "remote": conn.RemoteAddr(),
+						"reason": d.Reason, "reported": d.Reported, "floor": d.Floor,
+						"oldest": d.Oldest, "head": d.Head, "ringFrames": d.RingFrames,
+						"queuedFrames": d.QueuedFrames, "queuedBytes": d.QueuedBytes,
+					}).Info("transport: resume refused; reported position not covered")
+				} else {
+					h.metrics.resumeNoPosition.Add(1)
+				}
+				h.closeSession(sess, attachErr)
+			}
+			// The session closed between lookup and attach, or its stream
+			// could not be resumed; fall through to a fresh session so the
+			// client still gets in.
+		} else if reason, ok := h.endedResume(token, time.Now()); ok {
+			// The session was evicted (see endedResume): tell the client
+			// why instead of handing it a fresh session that would evict
+			// the login that replaced it.
+			h.metrics.resumeEnded.Add(1)
+			log.WithFields(log.Fields{"kind": conn.Kind(), "remote": conn.RemoteAddr(), "reason": reason}).
+				Info("transport: resume refused; the session was evicted")
+			_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{reason}})
+			_ = conn.Close("resume of an evicted session")
+			return
+		} else {
+			// Detection only: without this line a failed resume and a fresh
+			// token-less connect are indistinguishable in the log. The token
+			// was already deleted before this point, so the cause is not
+			// knowable here; known causes include grace expiry, single-bind
+			// eviction and process restart (an OPEN set, not a taxonomy) and
+			// are attributed by joining on the surrounding detach / eviction
+			// / boot lines. The message deliberately names no cause.
+			log.WithFields(log.Fields{"kind": conn.Kind(), "remote": conn.RemoteAddr()}).
+				Info("transport: resume token presented but unknown; issuing fresh session (see surrounding detach/eviction/boot lines for cause)")
+		}
+	}
+	if resumePresented {
+		h.metrics.resumeFresh.Add(1)
+	}
+
+	if !h.clientSlotOpen(conn.RemoteAddr()) {
+		h.metrics.clientSessionRefusals.Add(1)
+		log.WithFields(log.Fields{"kind": conn.Kind(), "remote": conn.RemoteAddr(), "limit": h.cfg.MaxSessionsPerClient}).
+			Warn("transport: client session limit reached, refusing the new session")
+		_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{ByeReasonServerBusy}})
+		_ = conn.Close("client session limit reached")
+		return
+	}
+
+	sess, err := h.createSession()
+	if err != nil {
+		reason := ByeReasonShutdown
+		if errors.Is(err, ErrSessionCapacity) {
+			reason = ByeReasonServerBusy
+		}
+		_ = conn.WriteFrame(Frame{Opcode: OpBye, Payload: []byte{reason}})
+		_ = conn.Close(err.Error())
+		return
+	}
+	if !sess.BindAdmissionIdentity(
+		admissionIdentity.AccountID,
+		admissionIdentity.ShardID,
+	) {
+		h.closeSession(sess, errors.New("transport: admission identity install failed"))
+		_ = conn.Close("admission identity install failed")
+		return
+	}
+	h.admitAccountSession(admissionIdentity.AccountID, sess)
+	sess.armAdmissionCommit(admissionCommit)
+	if err := sess.attach(conn, false, 0); err != nil {
+		h.closeSession(sess, err)
+		_ = conn.Close(err.Error())
+		return
+	}
+	h.metrics.helloAdmissionAccepted.Add(1)
+	h.metrics.handshakes.record(time.Since(startedAt))
+	h.countAttach(conn.Kind())
+	h.logSlowHandshake(conn, false, startedAt, helloAt, verifiedAt)
+	h.fireOpen(sess)
+}
+
+// slowHandshakeLogThreshold is the total HELLO-to-attach time past which
+// the handshake's phases are worth a log line. Healthy handshakes finish
+// in milliseconds; the field reports behind #1453 sat near 8 s.
+const slowHandshakeLogThreshold = time.Second
+
+// logSlowHandshake names which AcceptConn phase ate the time when a
+// handshake (fresh or resume) runs long: waiting for the HELLO frame,
+// admission-ticket verification, or session allocation plus attach. The
+// attach phase includes the zombie path's old-connection close, the one
+// phase that used to wait out a parked write's whole deadline.
+/*
+================
+logSlowHandshake
+================
+*/
+func (h *Hub) logSlowHandshake(conn Conn, resumed bool, startedAt, helloAt, verifiedAt time.Time) {
+	total := time.Since(startedAt)
+	if total < slowHandshakeLogThreshold {
+		return
+	}
+	log.WithFields(log.Fields{
+		"kind":      conn.Kind(),
+		"remote":    conn.RemoteAddr(),
+		"resumed":   resumed,
+		"total_ms":  total.Milliseconds(),
+		"hello_ms":  helloAt.Sub(startedAt).Milliseconds(),
+		"verify_ms": verifiedAt.Sub(helloAt).Milliseconds(),
+		"attach_ms": time.Since(verifiedAt).Milliseconds(),
+	}).Warn("transport: slow HELLO handshake (phase durations in ms)")
+}
+
+// lookupByToken resolves a presented resume token by EXACT map lookup —
+// membership is O(1), not a scan of every live token (the old
+// ConstantTimeCompare-over-all-entries loop cost O(sessions) per HELLO).
+// The constant-time comparison is kept where it guards the secret: the
+// presented token against the matched entry's stored token. What the map
+// lookup does NOT hide is existence timing (hit vs miss), but a resume
+// token is a bearer credential — 16 bytes from crypto/rand, presented
+// whole, never compared byte-by-byte against an attacker-controlled
+// prefix oracle — so learning "some token exists" faster than "none does"
+// yields nothing guessable; this is the standard shape for token tables.
+/*
+================
+lookupByToken
+================
+*/
+func (h *Hub) lookupByToken(token [ResumeTokenLen]byte) *Session {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	sess, ok := h.byToken[token]
+	if !ok || sess.evicted.Load() {
+		return nil
+	}
+	if subtle.ConstantTimeCompare(sess.resumeToken[:], token[:]) != 1 {
+		return nil
+	}
+	return sess
+}
+
+// ErrSessionCapacity reports that the bounded live-session registry is full.
+// Callers may retry after another session reaches final teardown.
+var ErrSessionCapacity = errors.New("transport: live session capacity reached")
+
+/*
+================
+createSession
+================
+*/
+func (h *Hub) createSession() (*Session, error) {
+	var token [ResumeTokenLen]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return nil, fmt.Errorf("transport: generating resume token: %w", err)
+	}
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil, errors.New("transport: hub shutting down")
+	}
+	if len(h.sessions) >= h.cfg.MaxSessions {
+		h.mu.Unlock()
+		return nil, ErrSessionCapacity
+	}
+	// Reserve before publication; shutdown closes admission under this lock
+	// before waiting, so no new Add can race a zero-count Wait.
+	h.closeHooks.Add(1)
+	id := h.nextID.Add(1)
+	sess := newSession(h, id, token)
+	h.sessions[id] = sess
+	h.byToken[token] = sess
+	h.mu.Unlock()
+	h.metrics.sessOpened.Add(1)
+	return sess, nil
+}
+
+// SessionsInDivision snapshots the live sessions whose effective division
+// (Session.Set under "mission.divisionId", falling back to "divisionId")
+// equals division. Division pushes iterate this instead of every session.
+/*
+================
+SessionsInDivision
+================
+*/
+func (h *Hub) SessionsInDivision(division string) []*Session {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	set := h.divisions[division]
+	out := make([]*Session, 0, len(set))
+	for _, s := range set {
+		out = append(out, s)
+	}
+	return out
+}
+
+// CharacterSessions returns the sessions in division bound to characterName
+// (ASCII case-insensitive, as character names compare). It reads only the hub
+// index and each session's binding, never game state, so a producer may call
+// it while holding any game lock.
+/*
+================
+CharacterSessions
+================
+*/
+func (h *Hub) CharacterSessions(division, characterName string) []*Session {
+	var out []*Session
+	for _, s := range h.SessionsInDivision(division) {
+		if _, bound, ok := s.CharacterBinding(); ok && strings.EqualFold(bound, characterName) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// Population returns the number of live sessions indexed into one shard.
+// It does not allocate a session snapshot, so heartbeat reporting stays
+// constant-work apart from the map lookup.
+/*
+================
+Population
+================
+*/
+func (h *Hub) Population(division string) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.divisions[division])
+}
+
+// reindexDivision recomputes one session's effective division and moves it
+// between division sets. Called by Session.Set whenever a division key
+// changes; a session no longer in the registry (racing its own close) is
+// left out so the index can never resurrect a closed session.
+/*
+================
+reindexDivision
+================
+*/
+func (h *Hub) reindexDivision(s *Session) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, live := h.sessions[s.ID]; !live {
+		return
+	}
+	div := s.effectiveDivision()
+	old, had := h.sessionDiv[s.ID]
+	if had && old == div {
+		return
+	}
+	if had {
+		h.dropFromDivisionLocked(old, s.ID)
+	}
+	if div == "" {
+		delete(h.sessionDiv, s.ID)
+		return
+	}
+	h.sessionDiv[s.ID] = div
+	set := h.divisions[div]
+	if set == nil {
+		set = make(map[uint64]*Session)
+		h.divisions[div] = set
+	}
+	set[s.ID] = s
+}
+
+// dropFromDivisionLocked removes one member from a division set. Caller
+// holds h.mu.
+/*
+================
+dropFromDivisionLocked
+================
+*/
+func (h *Hub) dropFromDivisionLocked(division string, id uint64) {
+	set := h.divisions[division]
+	if set == nil {
+		return
+	}
+	delete(set, id)
+	if len(set) == 0 {
+		delete(h.divisions, division)
+	}
+}
+
+/*
+================
+admitAccountSession
+
+Records a fresh session under its admission account and, when the account
+now holds more than MaxSessionsPerAccount, evicts its oldest sessions the
+way single-bind replacement does: lame duck first, then BYE Replaced and
+teardown once drained. Sessions are ordered by ID, which only increases.
+================
+*/
+func (h *Hub) admitAccountSession(account string, s *Session) {
+	var evict []*Session
+	h.mu.Lock()
+	owned := h.accountSessions[account]
+	if owned == nil {
+		owned = make(map[uint64]*Session)
+		h.accountSessions[account] = owned
+	}
+	owned[s.ID] = s
+	h.sessionAccount[s.ID] = account
+	s.account.Store(&account)
+	// Sessions already evicted stay indexed until their drain finishes; only
+	// the ones still live count against the limit.
+	live := 0
+	for _, candidate := range owned {
+		if !candidate.evicted.Load() {
+			live++
+		}
+	}
+	for ; live > h.cfg.MaxSessionsPerAccount; live-- {
+		var oldest *Session
+		for id, candidate := range owned {
+			if id == s.ID || candidate.evicted.Load() {
+				continue
+			}
+			if oldest == nil || id < oldest.ID {
+				oldest = candidate
+			}
+		}
+		if oldest == nil {
+			break
+		}
+		oldest.markEvicted(ByeReasonReplaced)
+		evict = append(evict, oldest)
+	}
+	h.mu.Unlock()
+	for _, victim := range evict {
+		h.metrics.accountSessionEvictions.Add(1)
+		log.WithFields(log.Fields{"account": account, "old": victim.ID, "new": s.ID, "limit": h.cfg.MaxSessionsPerAccount}).
+			Warn("transport: account session limit reached, evicting its oldest session")
+		victim.CloseWhenDrained(ByeReasonReplaced)
+	}
+}
+
+/*
+================
+EvictAccount
+
+Marks every live session owned by account as evicted, removes its resume
+token immediately so it cannot reattach, and closes it with
+ByeReasonUnauthorized. Exclusive character bindings remain registered until
+BindExclusive replaces them or retireSession finishes teardown.
+================
+*/
+func (h *Hub) EvictAccount(account string) int {
+	if account == "" {
+		return 0
+	}
+	var evict []*Session
+	h.mu.Lock()
+	for _, candidate := range h.accountSessions[account] {
+		delete(h.byToken, candidate.resumeToken)
+		if candidate.evicted.Load() {
+			continue
+		}
+		candidate.markEvicted(ByeReasonUnauthorized)
+		evict = append(evict, candidate)
+	}
+	h.mu.Unlock()
+	for _, victim := range evict {
+		victim.CloseWhenDrained(ByeReasonUnauthorized)
+	}
+	return len(evict)
+}
+
+/*
+================
+fireOpen
+================
+*/
+func (h *Hub) fireOpen(s *Session) {
+	for _, fn := range h.hooks.openSnapshot() {
+		func() {
+			defer recoverHookPanic(s, "OnSessionOpen")
+			fn(s)
+		}()
+	}
+}
+
+/*
+================
+fireResumed
+================
+*/
+func (h *Hub) fireResumed(s *Session) {
+	for _, fn := range h.hooks.resumedSnapshot() {
+		func() {
+			defer recoverHookPanic(s, "OnSessionResumed")
+			fn(s)
+		}()
+	}
+}
+
+// shutdown caps network draining by ctx, then joins every admitted session
+// through hook completion before callers can release shared gameplay resources.
+/*
+================
+shutdown
+================
+*/
+func (h *Hub) shutdown(ctx context.Context) {
+	if journal := h.metrics.spikes; journal != nil {
+		journal.Close()
+	}
+	h.mu.Lock()
+	h.closed = true
+	sessions := make([]*Session, 0, len(h.sessions))
+	for _, s := range h.sessions {
+		sessions = append(sessions, s)
+	}
+	h.mu.Unlock()
+
+	for _, s := range sessions {
+		s.CloseWhenDrained(ByeReasonShutdown)
+	}
+	for _, s := range sessions {
+		select {
+		case <-s.Done():
+		case <-ctx.Done():
+			h.closeSession(s, errors.New("transport: shutdown deadline"))
+		}
+	}
+	h.closeHooks.Wait()
+}

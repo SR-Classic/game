@@ -1,0 +1,245 @@
+/*
+===========================================================================
+
+critical.go - actor-owned critical and block history for every impact
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"strings"
+	"sync"
+
+	"opensro.online/server/internal/game/combat"
+	"opensro.online/server/internal/game/enterworld"
+)
+
+// ignoreDefenseProbabilityPrefix is the reference server's probability-history
+// key namespace for MATTR_AVATAR_MDIA (0x4D000000 | (skillID & 0xFFFFFF)).
+const ignoreDefenseProbabilityPrefix uint32 = 0x4D000000
+
+/*
+================
+criticalActor
+================
+*/
+type criticalActor struct {
+	division, character string
+	monster             uint32
+}
+
+/*
+================
+criticalHistory
+================
+*/
+type criticalHistory struct {
+	mu     sync.Mutex
+	actors map[criticalActor]map[uint32]combat.Probability
+}
+
+// Action owns native ParamKeeper's probability history. All production attack
+// paths use this door; formula helpers alone intentionally have no actor state.
+// Targets do not enter the key: changing victims must not reset critical odds.
+/*
+================
+resolveCombat
+================
+*/
+func (rt *Runtime) resolveCombat(actor criticalActor, skill enterworld.SkillRow, attacker, defender combat.Stats) (combat.Result, error) {
+	out, err := rt.resolveCombatBehindWall(actor, skill, attacker, defender, nil)
+	return out.Defender, err
+}
+
+// resolveCombatBehindWall splits the hit when the defender stands behind a
+// Force wall; the one critical decision serves both records.
+/*
+================
+resolveCombatBehindWall
+================
+*/
+func (rt *Runtime) resolveCombatBehindWall(actor criticalActor, skill enterworld.SkillRow, attacker, defender combat.Stats, wall *enterworld.SkillWall) (combat.WallOutcome, error) {
+	return rt.resolveCombatRequest(combatRequest{
+		actor: actor, skill: skill, attacker: attacker, defender: defender,
+		wall: wall, lanes: skill.Attack.Flags & 0xc,
+	})
+}
+
+/*
+================
+combatRequest
+
+Lane selection is impact state, never a mutation of the authored att flags.
+================
+*/
+type combatRequest struct {
+	actor    criticalActor
+	skill    enterworld.SkillRow
+	attacker combat.Stats
+	defender combat.Stats
+	wall     *enterworld.SkillWall
+	lanes    uint32
+}
+
+/*
+================
+resolveCombatRequest
+================
+*/
+func (rt *Runtime) resolveCombatRequest(request combatRequest) (combat.WallOutcome, error) {
+	actor, skill := request.actor, request.skill
+	attacker, defender, wall := request.attacker, request.defender, request.wall
+	rt.criticals.mu.Lock()
+	defer rt.criticals.mu.Unlock()
+	actor.character = strings.ToLower(actor.character)
+	key := skill.ID & 0xffffff // key is 0x43000000 | skill ID.
+	previous := rt.criticals.actors[actor][key]
+	critical, next := false, previous
+	if request.lanes&4 != 0 {
+		rate, err := combat.EffectiveCriticalRate(attacker.CriticalRate, skill.CriticalModifier)
+		if err != nil {
+			return combat.WallOutcome{}, err
+		}
+		// The defender's evade critical (0x39) cuts the chance.
+		rate = combat.EvadedCriticalRate(rate, defender)
+		critical, next, err = combat.CriticalOutcome(float64(rate), previous, rt.CombatRoll)
+		if err != nil {
+			return combat.WallOutcome{}, err
+		}
+	}
+	// In the reference server's hit-outcome routine, MATTR_AVATAR_MDIA rolls
+	// after critical and before the damage lanes so the random stream order matches.
+	ignoreDefense := false
+	if actor.monster == 0 {
+		if chance := combat.IgnoreDefenseChance(attacker, defender); chance > 0 {
+			mdiaKey := ignoreDefenseProbabilityPrefix | skill.ID&0xffffff
+			procced, mdiaNext, err := combat.CriticalOutcome(chance, rt.criticals.actors[actor][mdiaKey], rt.CombatRoll)
+			if err != nil {
+				return combat.WallOutcome{}, err
+			}
+			rt.rememberProbability(actor, mdiaKey, mdiaNext)
+			ignoreDefense = procced
+		}
+	}
+	var out combat.WallOutcome
+	var err error
+	calculation := combat.AttackCalculation{
+		Attack: skill.Attack, OriginalFlags: skill.Attack.Flags, Lanes: request.lanes,
+		Player: actor.monster == 0, Critical: critical, IgnoreDefense: ignoreDefense,
+	}
+	if wall != nil {
+		out, err = combat.ResolveCalculationAgainstWall(attacker, defender, combat.WallCalculation{Attack: calculation, Wall: *wall}, rt.CombatRoll)
+	} else {
+		out.Defender, err = combat.ResolveCalculation(attacker, defender, calculation, rt.CombatRoll)
+	}
+	if err != nil {
+		return combat.WallOutcome{}, err
+	}
+	// After the wall's share, every impact of an attack
+	// skill rolls the target's block chance on the attacker's history
+	// (key 0x42000000 | skill); a block drops the defender's damage.
+	if skill.Attack.Present {
+		chance := combat.BlockChance(attacker, defender, skill.Attack.Flags, skill.Ck)
+		blockKey := 0x42000000 | skill.ID&0xffffff
+		blocked, blockNext, err := combat.CriticalOutcome(float64(chance), rt.criticals.actors[actor][blockKey], rt.CombatRoll)
+		if err != nil {
+			return combat.WallOutcome{}, err
+		}
+		rt.rememberProbability(actor, blockKey, blockNext)
+		if blocked {
+			out.Defender = combat.Result{ResultFlags: out.Defender.ResultFlags, Blocked: true}
+		} else if skill.CkChance != 0 {
+			// An unblocked ck impact rolls its kill chance (key
+			// 0x48000000 | skill). A kill is record 0x86 with no damage,
+			// and the target group is marked dead. Only
+			// the anti-bot stone's MSKILL_AUTOMOB_ATTACK01 carries ck.
+			killKey := 0x48000000 | skill.ID&0xffffff
+			slain, killNext, err := combat.CriticalOutcome(float64(skill.CkChance), rt.criticals.actors[actor][killKey], rt.CombatRoll)
+			if err != nil {
+				return combat.WallOutcome{}, err
+			}
+			rt.rememberProbability(actor, killKey, killNext)
+			if slain {
+				out.Defender = combat.Result{ResultFlags: out.Defender.ResultFlags, Slain: true}
+			}
+		}
+	}
+	rt.rememberProbability(actor, key, next)
+	return out, nil
+}
+
+/*
+================
+rememberProbability
+
+Stores an actor's roll history under its key once the roll initialized
+it. The caller holds rt.criticals.mu.
+================
+*/
+func (rt *Runtime) rememberProbability(actor criticalActor, key uint32, next combat.Probability) {
+	if !next.Initialized {
+		return
+	}
+	if rt.criticals.actors == nil {
+		rt.criticals.actors = make(map[criticalActor]map[uint32]combat.Probability)
+	}
+	if rt.criticals.actors[actor] == nil {
+		rt.criticals.actors[actor] = make(map[uint32]combat.Probability)
+	}
+	rt.criticals.actors[actor][key] = next
+}
+
+/*
+================
+forgetCriticalCharacter
+================
+*/
+func (rt *Runtime) forgetCriticalCharacter(division, name string) {
+	rt.criticals.mu.Lock()
+	defer rt.criticals.mu.Unlock()
+	delete(rt.criticals.actors, criticalActor{division: division, character: strings.ToLower(name)})
+}
+
+/*
+================
+retireMonsterCriticals
+
+Runs every tick over every monster that has rolled and still lives (#1820),
+so it reads only HP: a full Get snapshot copied the catalogue rows per
+actor and made the sweep 12.5% of server CPU while retiring almost nothing.
+================
+*/
+func (rt *Runtime) retireMonsterCriticals() {
+	rt.criticals.mu.Lock()
+	defer rt.criticals.mu.Unlock()
+	for key := range rt.criticals.actors {
+		if key.monster == 0 {
+			continue
+		}
+		if rt.Monsters == nil {
+			delete(rt.criticals.actors, key)
+			continue
+		}
+		if hp, ok := rt.Monsters.CurrentHP(key.division, key.monster); !ok || hp == 0 {
+			delete(rt.criticals.actors, key)
+		}
+	}
+}
+
+/*
+================
+effectOutcome
+================
+*/
+func (rt *Runtime) effectOutcome(actor criticalActor, key, chance uint32) (bool, error) {
+	rt.criticals.mu.Lock()
+	defer rt.criticals.mu.Unlock()
+	actor.character = strings.ToLower(actor.character)
+	proc, next, err := combat.CriticalOutcome(float64(chance), rt.criticals.actors[actor][key], rt.CombatRoll)
+	if err == nil {
+		rt.rememberProbability(actor, key, next)
+	}
+	return proc, err
+}

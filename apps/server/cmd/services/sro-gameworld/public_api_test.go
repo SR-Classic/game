@@ -1,0 +1,323 @@
+/*
+===========================================================================
+
+public_api_test.go - the privacy write against a real authority store
+
+===========================================================================
+*/
+package main
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	agentapi "opensro.online/server/internal/agent/api"
+	"opensro.online/server/internal/agent/publicstats"
+	"opensro.online/server/internal/data/store"
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/siege"
+	"opensro.online/server/internal/game/social/chatfeed"
+	"opensro.online/server/internal/game/world/fortress"
+	"opensro.online/server/internal/game/world/monster"
+	"opensro.online/server/internal/game/world/simulation"
+	"opensro.online/server/internal/testsupport/wait"
+	"opensro.online/server/internal/transport"
+)
+
+/*
+================
+TestSetPublicHiddenChecksTheOwnerAndPersists
+
+Only the owning account can hide a character, a character reserved for
+deletion is refused, and the flag survives a reopen.
+================
+*/
+func TestSetPublicHiddenChecksTheOwnerAndPersists(t *testing.T) {
+	const shard = "test"
+	dir := t.TempDir()
+	// Creation requires racial base skills; any one id satisfies the store.
+	options := store.Options{DefaultSkills: func(string, []uint32) ([]uint32, error) { return []uint32{1}, nil }}
+	authority, err := store.Open(dir, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := true
+	t.Cleanup(func() {
+		if open {
+			authority.Close()
+		}
+	})
+	kekw := &domain.Character{Name: "Kekw", ModelCodename: "CHAR_CH_MAN_ADVENTURER"}
+	gone := &domain.Character{Name: "Gone", ModelCodename: "CHAR_CH_MAN_ADVENTURER"}
+	for _, c := range []*domain.Character{kekw, gone} {
+		if err := authority.CreateCharacter(shard, "alpha", c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	authority.MutateCharacter(gone, "test-delete", func() { gone.DeletePending = true })
+	setPublicHidden := func(authority *store.Store, shard, account, name string, hidden bool) error {
+		return setPrivacyFlag(authority, shard, account, name, "public-hidden", hidden,
+			func(c *domain.Character) *bool { return &c.PublicHidden })
+	}
+
+	if err := setPublicHidden(authority, shard, "beta", "Kekw", true); !errors.Is(err, publicstats.ErrNotOwned) {
+		t.Fatalf("another account's write = %v, want ErrNotOwned", err)
+	}
+	if err := setPublicHidden(authority, shard, "alpha", "Gone", true); !errors.Is(err, publicstats.ErrNotOwned) {
+		t.Fatalf("deleted character's write = %v, want ErrNotOwned", err)
+	}
+	if err := setPublicHidden(authority, shard, "alpha", "nobody", true); !errors.Is(err, publicstats.ErrNotOwned) {
+		t.Fatalf("unknown name = %v, want ErrNotOwned", err)
+	}
+	if err := setPublicHidden(authority, shard, "alpha", "kekw", true); err != nil {
+		t.Fatal(err)
+	}
+	// Writing the value it already holds is still a success.
+	if err := setPublicHidden(authority, shard, "alpha", "Kekw", true); err != nil {
+		t.Fatal(err)
+	}
+	// The gear flag is its own field through the same owner-checked write.
+	gear := func(c *domain.Character) *bool { return &c.PublicGearHidden }
+	if err := setPrivacyFlag(authority, shard, "beta", "Kekw", "public-gear-hidden", true, gear); !errors.Is(err, publicstats.ErrNotOwned) {
+		t.Fatalf("another account's gear write = %v, want ErrNotOwned", err)
+	}
+	if err := setPrivacyFlag(authority, shard, "alpha", "Kekw", "public-gear-hidden", true, gear); err != nil {
+		t.Fatal(err)
+	}
+	authority.Close()
+	open = false
+
+	reopened, err := store.Open(dir, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(reopened.Close)
+	hidden, gearHidden := false, false
+	reopened.ReadCharacters(shard, func(characters []*domain.Character) {
+		for _, c := range characters {
+			if c.Name == "Kekw" {
+				hidden, gearHidden = c.PublicHidden, c.PublicGearHidden
+			}
+		}
+	})
+	if !hidden || !gearHidden {
+		t.Fatalf("the privacy flags did not survive a reopen: hidden %v, gear %v", hidden, gearHidden)
+	}
+}
+
+/*
+================
+TestKillAfterCloseIsDroppedNotPanicking
+
+A kill that reaches the hook after Close is dropped: the recorder never
+sends on its closed queue, whatever order shutdown runs in.
+================
+*/
+func TestKillAfterCloseIsDroppedNotPanicking(t *testing.T) {
+	api := &publicAPI{kills: make(chan domain.UniqueKill, 1), done: make(chan struct{})}
+	close(api.done)
+	if err := api.Close(); err != nil {
+		t.Fatal(err)
+	}
+	api.enqueue(domain.UniqueKill{RefObjID: 1954})
+}
+
+/*
+================
+TestABadTokenRenderLeavesTheWriteOff
+
+A secret template that rendered its missing-key placeholder, or any short
+token, disables the privacy write instead of guarding it with a guessable
+value; a full-length token is read back trimmed.
+================
+*/
+func TestABadTokenRenderLeavesTheWriteOff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "public-api-token")
+	t.Setenv(publicstats.EnvTokenPath, path)
+	for _, payload := range []string{"<no value>\n", "", "short"} {
+		if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if token := readPublicWriteToken(); token != "" {
+			t.Fatalf("payload %q gave token %q, want the write disabled", payload, token)
+		}
+	}
+	full := strings.Repeat("c", publicstats.MinWriteTokenBytes)
+	if err := os.WriteFile(path, []byte(full+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if token := readPublicWriteToken(); token != full {
+		t.Fatalf("full token read as %q", token)
+	}
+}
+
+/*
+================
+TestPublicScheduleShowsMaintenanceWhileTheGateExists
+
+The gate file marks a running, open-ended maintenance; without it, or
+without a fortress lane, nothing is invented.
+================
+*/
+func TestPublicScheduleShowsMaintenanceWhileTheGateExists(t *testing.T) {
+	gate := filepath.Join(t.TempDir(), "maintenance-gate.json")
+	t.Setenv(agentapi.EnvMaintenanceGate, gate)
+	if events := publicSchedule(scheduleSources{flagWarOff: true}, time.Now()); len(events) != 0 {
+		t.Fatalf("no gate and no lane listed %+v", events)
+	}
+	if err := os.WriteFile(gate, []byte(`{"accounts":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	events := publicSchedule(scheduleSources{flagWarOff: true}, time.Now())
+	if len(events) != 1 || events[0].Kind != "maintenance" || !events[0].Running || !events[0].End.IsZero() {
+		t.Fatalf("gate present listed %+v, want one running open-ended maintenance", events)
+	}
+}
+
+/*
+================
+TestUniqueNamesAreTheRetailNames
+
+The site printed MOB_OA_URUCHI because the API's name source was never
+wired. The source answers the display name, and "" for an unknown id so
+the API's own fallback decides.
+================
+*/
+func TestUniqueNamesAreTheRetailNames(t *testing.T) {
+	monsters := simulation.NewMonsterState(monster.TemplateFromParts(map[uint32]monster.MonsterRef{
+		1954: {RefObjID: 1954, Codename: "MOB_OA_URUCHI", Name: "Uruchi"},
+	}, nil))
+	// The API's sources as the GameWorld builds them: the wiring itself is
+	// what went missing.
+	game := &gameplayPlane{deps: &enterworld.Deps{MonsterState: monsters}}
+	sources := publicSources(game, nil, nil, "test", nil, nil)
+	if sources.UniqueName == nil {
+		t.Fatal("the public API's unique names are not wired")
+	}
+	if got := sources.UniqueName(1954); got != "Uruchi" {
+		t.Fatalf("wired name(1954) = %q, want Uruchi", got)
+	}
+	name := uniqueNameSource(monsters)
+	if got := name(1954); got != "Uruchi" {
+		t.Fatalf("name(1954) = %q, want Uruchi", got)
+	}
+	if got := name(7); got != "" {
+		t.Fatalf("name(unknown) = %q, want empty", got)
+	}
+	if got := uniqueNameSource(nil)(1954); got != "" {
+		t.Fatalf("no monster state answered %q", got)
+	}
+}
+
+/*
+================
+TestPublicChatHidesMutedAuthorAfterLogoff
+
+The site chat feed leaves a muted author's lines out while the mute
+holds. That used to end at logoff: the hide test scanned the author's
+live sessions, so the retained lines came back once they left. The mute
+is recorded against the character now, so the lines stay hidden with
+nobody online; an unmuted author's lines are untouched. The record
+semantics are pinned in internal/transport
+(TestCharacterRestrictionOutlivesItsSession).
+================
+*/
+func TestPublicChatHidesMutedAuthorAfterLogoff(t *testing.T) {
+	// A short resume grace, so the muted author's session retires inside
+	// the test's wait instead of a minute later.
+	server, err := transport.NewServer(transport.Config{
+		CertDir: t.TempDir(), GracePeriod: 100 * time.Millisecond,
+		KeepaliveInterval: time.Hour, IdleTimeout: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Hub.SetHelloAuth(func(token []byte) (transport.AdmissionIdentity, error) {
+		return transport.AdmissionIdentity{AccountID: string(token), ShardID: wiringPublicationDivision}, nil
+	})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), wiringPublicationTimeout)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	session, conn := wiringPublicationSession(t, server, "alpha")
+
+	feed := chatfeed.New()
+	feed.Record(wiringPublicationDivision, chatfeed.KindChat, "Alice", "Alice", "spoken before the mute")
+	feed.Record(wiringPublicationDivision, chatfeed.KindChat, "Bob", "Bob", "never muted")
+	game := &gameplayPlane{chatFeed: feed, deps: &enterworld.Deps{}}
+	sources := publicSources(game, server.Hub, nil, wiringPublicationDivision, nil, nil)
+	if lines := sources.Chat(); len(lines) != 2 {
+		t.Fatalf("unmuted chat = %d lines, want 2", len(lines))
+	}
+
+	if !session.SetCommandRestriction(transport.CommandRestrictionChat, [8]uint16{2027, 1, 0, 1, 0, 0, 0, 0}) {
+		t.Fatal("mute refused")
+	}
+	_ = conn.Close("muted author logs off")
+	wait.Eventually(t, wiringPublicationTimeout, "the muted author's session to end", func() bool {
+		return len(server.Hub.CharacterSessions(wiringPublicationDivision, "Alice")) == 0
+	})
+
+	lines := sources.Chat()
+	if len(lines) != 1 || lines[0].Author != "Bob" {
+		t.Fatalf("chat after the muted author left = %+v, want only Bob's line", lines)
+	}
+}
+
+/*
+================
+TestPublicFortressesNameTheOccupyingGuild
+
+P11's wiring: every fortress of the lane by town, the occupier named from
+the guild store, and a guild the store no longer holds read as unclaimed.
+================
+*/
+func TestPublicFortressesNameTheOccupyingGuild(t *testing.T) {
+	const shard = "test"
+	options := store.Options{DefaultSkills: func(string, []uint32) ([]uint32, error) { return []uint32{1}, nil }}
+	authority, err := store.Open(t.TempDir(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { authority.Close() })
+	master := &domain.Character{Name: "Kekw", ModelCodename: "CHAR_CH_MAN_ADVENTURER"}
+	if err := authority.CreateCharacter(shard, "alpha", master); err != nil {
+		t.Fatal(err)
+	}
+	guildID, err := authority.Guilds().CreateGuild(shard, enterworld.GuildRecord{Name: "Silk", Level: 2},
+		enterworld.GuildMemberRecord{CharID: master.ID, JID: 1, Name: master.Name, PermMask: 0xffffffff}, master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fortresses := fortress.New([]fortress.Catalog{{ID: 1, CodeName: "FORTRESS_JANGAN"}, {ID: 3, CodeName: "FORTRESS_HOTAN"},
+		{ID: 6, CodeName: "FORTRESS_BANDIT"}})
+	lane, err := siege.NewLane(siege.LaneConfig{Division: shard, Fortresses: fortresses})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fortresses.Occupy(shard, 1, guildID) || !fortresses.Occupy(shard, 3, 999) {
+		t.Fatal("occupy refused")
+	}
+	got := publicFortresses(lane, authority, shard)
+	want := []publicstats.FortressEntry{{Town: "jangan", Owner: "Silk"}, {Town: "hotan"}, {Town: "bandit"}}
+	if len(got) != len(want) {
+		t.Fatalf("fortresses %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("fortress %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if rows := publicFortresses(nil, authority, shard); len(rows) != 0 {
+		t.Fatalf("no lane served %+v", rows)
+	}
+}

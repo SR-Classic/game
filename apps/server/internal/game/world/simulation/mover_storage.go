@@ -1,0 +1,953 @@
+/*
+===========================================================================
+
+mover_storage.go - compact mover records and their spatial candidate owner
+
+===========================================================================
+*/
+
+package simulation
+
+import (
+	"iter"
+	"math"
+	worldgeom "opensro.online/server/internal/game/world"
+	"opensro.online/server/internal/game/world/monster"
+	"sort"
+	"unique"
+)
+
+// Only the population owner writes these records. Pending values discard only
+// completed navigation caches; expanding a snapshot never creates a new actor.
+/*
+================
+moverRecord
+================
+*/
+type moverRecord struct {
+	live    *monster.MoverState
+	pending *residentPendingMover
+}
+
+// Positions, activity clocks and the spawning and stuck bits remain per
+// actor (the bits are the schedule, stuck and recheck reads' per-leg needs,
+// read off the record instead of expanding the interned row for them). All
+// other immutable pending fields
+// commonly repeat across thousands of actors; handles share those values
+// without sharing mutable state. Float speed bits preserve signed zero exactly.
+/*
+================
+pendingMoverShared
+================
+*/
+type pendingMoverShared struct {
+	row       monster.PendingMover
+	speedBits uint64
+}
+
+/*
+================
+residentPendingMover
+================
+*/
+type residentPendingMover struct {
+	pose     monster.Pose
+	activity monster.ActivityCadence
+	spawning bool
+	stuck    bool
+	shared   unique.Handle[pendingMoverShared]
+	// cachedRow is the shared row copied out of its handle once
+	// per set (sharedRow), with the navigation speed restored:
+	// the snapshot fill expands every due pending actor every
+	// leg, and copying the interned row out per fill was the
+	// pending expansion's flat cost (#3027). Nil after each set
+	// until the first read rebuilds it; pose and activity are
+	// not in it, they are read live from the fields above.
+	cachedRow *monster.PendingMover
+}
+
+/*
+================
+set
+================
+*/
+func (p *residentPendingMover) set(row monster.PendingMover) {
+	p.pose, p.activity = row.Pose, row.Activity
+	p.spawning = row.Spawning
+	p.stuck = row.Stuck
+	p.cachedRow = nil
+	shared := pendingMoverShared{row: row, speedBits: math.Float64bits(row.NavigationSpeed)}
+	shared.row.Pose = monster.Pose{}
+	shared.row.Activity = monster.ActivityCadence{}
+	shared.row.NavigationSpeed = 0
+	if p.shared == (unique.Handle[pendingMoverShared]{}) || p.shared.Value() != shared {
+		p.shared = unique.Make(shared)
+	}
+}
+
+/*
+================
+value
+================
+*/
+func (p *residentPendingMover) value() monster.MoverState {
+	var m monster.MoverState
+	p.fill(&m)
+	return m
+}
+
+/*
+================
+residentPendingMover.sharedRow
+
+The interned shared row as a PendingMover, copied out of its
+handle once per set and then read in place: the handle's value
+cannot change while the row stands (set is its only writer and
+drops this copy), so the per-leg reads that need the whole row -
+the snapshot fill, the retaliation guard - take the copy instead of
+paying the handle's whole-row copy on every read (#3027). The
+row's pose and activity stay zero in it (the interned form
+excludes them); its navigation speed is restored from the
+shared bits, signed zero included.
+================
+*/
+func (p *residentPendingMover) sharedRow() *monster.PendingMover {
+	if p.cachedRow == nil {
+		shared := p.shared.Value()
+		shared.row.NavigationSpeed = math.Float64frombits(shared.speedBits)
+		p.cachedRow = &shared.row
+	}
+	return p.cachedRow
+}
+
+/*
+================
+residentPendingMover.fill
+
+value written in place (#2985): the cached shared row expands
+straight into dst, with the per-actor pose and cadence read live
+off the record.
+================
+*/
+func (p *residentPendingMover) fill(dst *monster.MoverState) {
+	p.sharedRow().ExpandIntoWith(dst, p.pose, p.activity)
+}
+
+/*
+================
+moverSlot
+
+One mover row in dense slot order. The slot is the row's index in
+moverStorage.slots; byGID is the only map left, and it maps a gid to
+its slot. Slot order is insertion order except that remove swaps the
+last row into the hole, so a walk sees an order that is stable only
+within one mutation-free span: consumers that need an order sort or
+count (monstersquad does both), they never inherit one.
+================
+*/
+type moverSlot struct {
+	gid uint32
+	rec moverRecord
+	// gen counts whole-value sets of this row (moverStorage.set). A
+	// plan taken from the row at one generation must not commit over
+	// a newer one: the leg snapshot carries the generation it read,
+	// and CommitMoverGen drops a commit whose base has moved (#2137
+	// slice 1). Cadence-only stamps (setActivity, catchUpActivity)
+	// deliberately do not advance it: they merge into an in-flight
+	// plan by design, and commitActivity already value-guards them.
+	gen uint64
+}
+
+/*
+================
+moverStorage
+================
+*/
+type moverStorage struct {
+	slots   []moverSlot
+	byGID   map[uint32]uint32
+	spatial moverInterestIndex
+
+	// blocks keeps interest-block membership between scans
+	// (mover_block_index.go).
+	blocks moverBlockIndex
+}
+
+/*
+================
+slotOf
+
+The dense slot of gid, when the storage holds one.
+================
+*/
+func (s *moverStorage) slotOf(gid uint32) (uint32, bool) {
+	if s == nil {
+		return 0, false
+	}
+	slot, ok := s.byGID[gid]
+	return slot, ok
+}
+
+/*
+================
+newMoverStorage
+
+Seeds in ascending gid order, so a fresh storage's slot order is the
+same on every build; runtime additions append in arrival order.
+================
+*/
+func newMoverStorage(rows map[uint32]monster.MoverState) *moverStorage {
+	gids := make([]uint32, 0, len(rows))
+	for gid := range rows {
+		gids = append(gids, gid)
+	}
+	sort.Slice(gids, func(i, j int) bool { return gids[i] < gids[j] })
+	s := &moverStorage{byGID: make(map[uint32]uint32, len(rows))}
+	for _, gid := range gids {
+		s.set(gid, rows[gid])
+	}
+	return s
+}
+
+/*
+================
+set
+================
+*/
+func (s *moverStorage) set(gid uint32, row monster.MoverState) {
+	if s.byGID == nil {
+		s.byGID = make(map[uint32]uint32)
+	}
+	slot, exists := s.slotOf(gid)
+	if !exists {
+		s.blocks.rosterGeneration++
+		slot = uint32(len(s.slots))
+		s.slots = append(s.slots, moverSlot{gid: gid})
+		s.byGID[gid] = slot
+	}
+	s.blocks.note(slot, gid)
+	s.setRow(slot, gid, row, exists)
+}
+
+/*
+================
+setAt
+
+set through a slot carried from the step's read, verified against
+the gid before use: when the slot still names gid the write lands
+on that row with no gid resolve; when it does not (the row moved,
+or the hint is the no-slot sentinel), set resolves or creates the
+row exactly as before. The one hot caller (commitActivityAt) has
+just read the row through the same slot, so the verified path is
+the one it takes (#2133).
+================
+*/
+func (s *moverStorage) setAt(slot uint32, gid uint32, row monster.MoverState) {
+	if s == nil {
+		return
+	}
+	if int(slot) >= len(s.slots) || s.slots[slot].gid != gid {
+		s.set(gid, row)
+		return
+	}
+	if s.byGID == nil {
+		s.byGID = make(map[uint32]uint32)
+	}
+	s.blocks.note(slot, gid)
+	s.setRow(slot, gid, row, true)
+}
+
+/*
+================
+setRow
+
+The write set and setAt share once the row's slot is known: bump
+the commit generation, maintain the interest index against the
+bounds the value moves, and fold the value into the slot's record.
+================
+*/
+func (s *moverStorage) setRow(slot uint32, gid uint32, row monster.MoverState, exists bool) {
+	s.slots[slot].gen++
+	old := s.slots[slot].rec
+	after := moverInterestBoundsFor(row)
+	if !exists {
+		s.spatial.add(gid, after)
+	} else if before := old.interestBounds(); before != after {
+		s.spatial.remove(gid, before)
+		s.spatial.add(gid, after)
+	}
+	if p, ok := row.PendingSnapshot(); ok {
+		if old.pending != nil {
+			old.pending.set(p)
+			return
+		}
+		resident := &residentPendingMover{}
+		resident.set(p)
+		s.slots[slot].rec = moverRecord{pending: resident}
+		return
+	}
+	if old.live != nil {
+		*old.live = row
+		return
+	}
+	live := new(monster.MoverState)
+	*live = row
+	s.slots[slot].rec = moverRecord{live: live}
+}
+
+/*
+================
+generation
+
+The row's commit generation (see moverSlot.gen); zero when the
+storage holds no row for gid - a not-yet-created row reads as
+generation zero, so a commit planned from a synthesized spawn mover
+drops if a slower lane created the row first.
+================
+*/
+func (s *moverStorage) generation(gid uint32) uint64 {
+	if s == nil {
+		return 0
+	}
+	slot, ok := s.slotOf(gid)
+	if !ok {
+		return 0
+	}
+	return s.slots[slot].gen
+}
+
+/*
+================
+generationAt
+
+generation through a slot carried from the step's read, verified
+against the gid before use; a slot that no longer names gid
+delegates to generation, so the answer is the row's either way -
+zero for a row that does not exist yet, exactly as generation
+(#2133).
+================
+*/
+func (s *moverStorage) generationAt(slot uint32, gid uint32) uint64 {
+	if s == nil || int(slot) >= len(s.slots) || s.slots[slot].gid != gid {
+		return s.generation(gid)
+	}
+	return s.slots[slot].gen
+}
+
+/*
+================
+moverRecord.interestBounds
+
+moverInterestBoundsFor(r.value()) without expanding a pending row:
+PendingSnapshot admits only DepartMs == ArriveMs == 0, so a pending row is
+never in flight and its bounds are its pose region alone.
+================
+*/
+func (r moverRecord) interestBounds() moverInterestBounds {
+	if r.live != nil {
+		return moverInterestBoundsFor(*r.live)
+	}
+	if r.pending != nil {
+		pose := moverInterestRegionAt(worldgeom.RegionXZ{
+			RegionID: r.pending.pose.RegionID,
+			X:        r.pending.pose.X,
+			Z:        r.pending.pose.Z,
+		})
+		return moverInterestBounds{pose: pose, low: pose, high: pose}
+	}
+	return moverInterestBoundsFor(monster.MoverState{})
+}
+
+/*
+================
+value
+================
+*/
+func (r moverRecord) value() monster.MoverState {
+	var m monster.MoverState
+	r.fill(&m)
+	return m
+}
+
+/*
+================
+moverRecord.fill
+
+value written in place (#2985).
+================
+*/
+func (r moverRecord) fill(dst *monster.MoverState) {
+	switch {
+	case r.live != nil:
+		*dst = *r.live
+	case r.pending != nil:
+		r.pending.fill(dst)
+	default:
+		*dst = monster.MoverState{}
+	}
+}
+
+/*
+================
+lookup
+================
+*/
+func (s *moverStorage) lookup(gid uint32) (monster.MoverState, bool) {
+	if s == nil {
+		return monster.MoverState{}, false
+	}
+	slot, ok := s.slotOf(gid)
+	if !ok {
+		return monster.MoverState{}, false
+	}
+	return s.slots[slot].rec.value(), true
+}
+
+/*
+================
+setActivity
+
+Stamps only the activity cadence of an existing row, in place. The
+interest bounds never read the cadence (moverInterestBoundsFor) and
+a pending row's shared handle excludes it, so the stored value
+afterwards equals a full set of a row that differs only there.
+commitActivity's cadence-only commits (#2136) still arm from the new
+stamp; the row is not rebuilt for a clock tick. No-op when the row
+is gone: the caller's guard has just seen it.
+================
+*/
+func (s *moverStorage) setActivity(gid uint32, activity monster.ActivityCadence) {
+	if s == nil {
+		return
+	}
+	slot, ok := s.slotOf(gid)
+	if !ok {
+		return
+	}
+	s.slots[slot].stampActivity(activity)
+}
+
+/*
+================
+setActivityAt
+
+setActivity through a slot carried from the step's read, verified
+against the gid before use; a slot that no longer names gid
+delegates to setActivity, so the stamp lands on gid's row either
+way (#2133).
+================
+*/
+func (s *moverStorage) setActivityAt(slot uint32, gid uint32, activity monster.ActivityCadence) {
+	if s == nil {
+		return
+	}
+	if int(slot) >= len(s.slots) || s.slots[slot].gid != gid {
+		s.setActivity(gid, activity)
+		return
+	}
+	s.slots[slot].stampActivity(activity)
+}
+
+/*
+================
+moverSlot.stampActivity
+
+The cadence write setActivity makes once the row's slot is known:
+the live value in place, or the pending record's own field; a row
+in neither form has no cadence to stamp.
+================
+*/
+func (slot *moverSlot) stampActivity(activity monster.ActivityCadence) {
+	rec := &slot.rec
+	if rec.live != nil {
+		rec.live.Activity = activity
+		return
+	}
+	if rec.pending != nil {
+		rec.pending.activity = activity
+	}
+}
+
+/*
+================
+lookupAt
+
+lookup through a slot carried from the schedule read, verified
+against the gid before use. remove swaps the last row into the
+hole, so a carried slot can name another actor by dispatch time;
+the caller falls back to lookup on a miss (#2135). No fallback
+here: the miss is the signal.
+================
+*/
+func (s *moverStorage) lookupAt(slot uint32, gid uint32) (monster.MoverState, bool) {
+	var m monster.MoverState
+	ok := s.lookupAtInto(&m, slot, gid)
+	return m, ok
+}
+
+/*
+================
+moverStorage.lookupAtInto
+
+lookupAt written in place (#2985); dst is untouched on a miss.
+================
+*/
+func (s *moverStorage) lookupAtInto(dst *monster.MoverState, slot uint32, gid uint32) bool {
+	if s == nil || int(slot) >= len(s.slots) || s.slots[slot].gid != gid {
+		return false
+	}
+	s.slots[slot].rec.fill(dst)
+	return true
+}
+
+/*
+================
+stuckAt
+
+lookup(gid).Stuck() through a carried slot, without expanding the row:
+the step's stuck probe runs for every actor every leg and almost always
+answers no (#2133). A miss on the carried slot falls back to the gid
+map, so the answer is the storage's either way. found is false when gid
+has no row.
+================
+*/
+func (s *moverStorage) stuckAt(slot uint32, gid uint32) (stuck, found bool) {
+	if s == nil {
+		return false, false
+	}
+	if int(slot) >= len(s.slots) || s.slots[slot].gid != gid {
+		var ok bool
+		if slot, ok = s.slotOf(gid); !ok {
+			return false, false
+		}
+	}
+	rec := s.slots[slot].rec
+	switch {
+	case rec.live != nil:
+		return rec.live.Stuck(), true
+	case rec.pending != nil:
+		return rec.pending.stuck, true
+	}
+	return false, true
+}
+
+/*
+================
+retaliationAt
+
+lookup(gid)'s retaliation revision and mode, without expanding
+the row: the mover commit's stale-plan guard reads the pair for
+every commit and compares two scalars (#3027). The slot is
+verified against the gid before use and delegates to the gid
+resolve on a miss, as every carried read does (#2133); found is
+false only when the storage holds no row for gid - a present but
+empty record answers the zero pair lookup returns for it. A
+pending row's mode is its expansion's: spawning or pending.
+================
+*/
+func (s *moverStorage) retaliationAt(slot uint32, gid uint32) (uint64, monster.MoverMode, bool) {
+	if s == nil {
+		return 0, 0, false
+	}
+	if int(slot) >= len(s.slots) || s.slots[slot].gid != gid {
+		var ok bool
+		if slot, ok = s.slotOf(gid); !ok {
+			return 0, 0, false
+		}
+	}
+	rec := s.slots[slot].rec
+	switch {
+	case rec.live != nil:
+		return rec.live.RetaliationRevision(), rec.live.Mode(), true
+	case rec.pending != nil:
+		row := rec.pending.sharedRow()
+		if row.Spawning {
+			return row.RetaliationRevision, monster.MoverSpawning, true
+		}
+		return row.RetaliationRevision, monster.MoverPending, true
+	}
+	return 0, 0, true
+}
+
+/*
+================
+has
+
+Whether gid has a row, without building its MoverState.
+================
+*/
+func (s *moverStorage) has(gid uint32) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.slotOf(gid)
+	return ok
+}
+
+/*
+================
+livePoseAt
+
+lookup(gid).LivePoseAt(nowMs, ground) without expanding a pending row. A
+pending row is exact as stored: PendingSnapshot admits only DepartMs ==
+ArriveMs == 0, where LivePoseAt neither interpolates nor resolves ground and
+returns Pose. Visibility reads one pose per candidate per viewer per tick,
+so this keeps them off the full expansion.
+================
+*/
+func (s *moverStorage) livePoseAt(gid uint32, nowMs int64, ground monster.GroundResolver) (monster.Pose, bool) {
+	if s == nil {
+		return monster.Pose{}, false
+	}
+	slot, ok := s.slotOf(gid)
+	if !ok {
+		return monster.Pose{}, false
+	}
+	return s.slots[slot].rec.livePoseAt(nowMs, ground), true
+}
+
+/*
+================
+livePoseAtSlot
+
+livePoseAt through a slot carried from the behaviour batch build,
+verified against the gid before use (#2133): a hit reads the row in
+its slot; a miss (the row moved, or the hint is the no-slot
+sentinel) delegates to livePoseAt, so the answer is the storage's
+either way.
+================
+*/
+func (s *moverStorage) livePoseAtSlot(slot uint32, gid uint32, nowMs int64, ground monster.GroundResolver) (monster.Pose, bool) {
+	if s == nil || int(slot) >= len(s.slots) || s.slots[slot].gid != gid {
+		return s.livePoseAt(gid, nowMs, ground)
+	}
+	return s.slots[slot].rec.livePoseAt(nowMs, ground), true
+}
+
+/*
+================
+livePoses
+
+Every row's livePoseAt, in slot order: a population scan that reads
+only where each mover stands, without expanding a single row.
+================
+*/
+func (s *moverStorage) livePoses(nowMs int64, ground monster.GroundResolver) iter.Seq2[uint32, monster.Pose] {
+	return func(yield func(uint32, monster.Pose) bool) {
+		for gid, r := range s.records() {
+			if !yield(gid, r.livePoseAt(nowMs, ground)) {
+				return
+			}
+		}
+	}
+}
+
+/*
+================
+moverRecord.livePoseAt
+
+r.value().LivePoseAt(nowMs, ground) without expanding a pending row. A
+pending row is exact as stored: PendingSnapshot admits only DepartMs ==
+ArriveMs == 0, where LivePoseAt neither interpolates nor resolves ground and
+returns Pose.
+================
+*/
+func (r moverRecord) livePoseAt(nowMs int64, ground monster.GroundResolver) monster.Pose {
+	switch {
+	case r.live != nil:
+		return r.live.LivePoseAt(nowMs, ground)
+	case r.pending != nil:
+		return r.pending.pose
+	}
+	// A record with neither form reads as moverRecord.value() does: the
+	// zero MoverState. set never stores one; this keeps the two reads equal.
+	return monster.MoverState{}.LivePoseAt(nowMs, ground)
+}
+
+/*
+================
+get
+================
+*/
+func (s *moverStorage) get(gid uint32) monster.MoverState {
+	row, _ := s.lookup(gid)
+	return row
+}
+
+/*
+================
+values
+================
+*/
+func (s *moverStorage) values() iter.Seq2[uint32, monster.MoverState] {
+	return func(yield func(uint32, monster.MoverState) bool) {
+		for gid, r := range s.records() {
+			if !yield(gid, r.value()) {
+				return
+			}
+		}
+	}
+}
+
+/*
+================
+records
+================
+*/
+func (s *moverStorage) records() iter.Seq2[uint32, moverRecord] {
+	return func(yield func(uint32, moverRecord) bool) {
+		if s == nil {
+			return
+		}
+		for _, slot := range s.slots {
+			if !yield(slot.gid, slot.rec) {
+				return
+			}
+		}
+	}
+}
+
+/*
+================
+moverSchedule
+
+What the behaviour queue reads of a mover (scheduleBehavior, tryDormant).
+================
+*/
+type moverSchedule struct {
+	mode     monster.MoverMode
+	activity monster.ActivityCadence
+	arriveMs int64
+	regionID uint16
+	// The idle gate's facts (#2136): an idle row's decision deadline
+	// and the latches that keep its step awake. Live rows only; a
+	// pending row's zeros keep the pending cadence branch.
+	deadlineMs       int64
+	idleEntryPending bool
+	controlMode      monster.ControlMode
+	targetGID        uint32
+	stuck            bool
+	// segmentHeld says the row still carries a movement segment
+	// (endpoints or times), gliding or matured: an idle row settles
+	// it at arrival. goalHeld says a navigation goal is held, whose
+	// next segment the step commits. Both false on a pending row,
+	// whose compact form admits neither.
+	segmentHeld bool
+	goalHeld    bool
+}
+
+/*
+================
+schedule
+
+lookup(gid)'s mode, activity cadence, arrival and region without building
+its MoverState. A pending row expands to its stored mode (Spawning or
+Pending), pose and cadence with no segment (PendingSnapshot admits only
+ArriveMs == 0); the behaviour queue reads one per due actor per tick.
+================
+*/
+func (s *moverStorage) schedule(gid uint32) (moverSchedule, bool) {
+	m, _, ok := s.scheduleSlot(gid)
+	return m, ok
+}
+
+/*
+================
+scheduleSlot
+
+schedule plus the dense slot the row sits in. The behaviour batch
+build carries the slot to the dispatch read (lookupAt), which
+verifies it before use: remove swaps the last row into the hole, so
+a slot carried across a despawn can name another actor (#2135).
+================
+*/
+func (s *moverStorage) scheduleSlot(gid uint32) (moverSchedule, uint32, bool) {
+	if s == nil {
+		return moverSchedule{}, 0, false
+	}
+	slot, ok := s.slotOf(gid)
+	if !ok {
+		return moverSchedule{}, 0, false
+	}
+	return s.scheduleRow(slot), slot, true
+}
+
+/*
+================
+scheduleRow
+
+The schedule facts of the row in slot: a live row's mode, cadence,
+arrival and region, a pending row's stored mode, pose cadence and
+region with no segment, a neither row's zero schedule. The pending
+mode reads the record's cached spawning bit: this read runs per
+due actor per leg, and expanding the interned shared row out of
+its handle for the one field was the mover schedule's flat cost
+in the seeded profile (#3027).
+================
+*/
+func (s *moverStorage) scheduleRow(slot uint32) moverSchedule {
+	r := s.slots[slot].rec
+	if r.live != nil {
+		return scheduleOf(r.live)
+	}
+	if r.pending != nil {
+		mode := monster.MoverPending
+		if r.pending.spawning {
+			mode = monster.MoverSpawning
+		}
+		return moverSchedule{mode: mode, activity: r.pending.activity, regionID: r.pending.pose.RegionID}
+	}
+	return moverSchedule{}
+}
+
+/*
+================
+scheduleOf
+
+scheduleRow for a mover value in hand: the activity commit has
+just written its row under the state lock it still holds, so its
+reschedule reads the schedule off the written value instead of
+re-reading the stored row (#3027). scheduleRow's live branch is
+this same projection, so the two can never drift. The row
+arrives by pointer: the projection reads a dozen scalars, and
+copying the whole mover to read them was the schedule read's
+flat cost in the seeded profile (#3027).
+================
+*/
+func scheduleOf(row *monster.MoverState) moverSchedule {
+	_, goalHeld := row.NavigationGoal()
+	return moverSchedule{mode: row.Mode(), activity: row.Activity, arriveMs: row.ArriveMs,
+		regionID: row.Pose.RegionID, deadlineMs: row.BehaviorDeadlineMs,
+		idleEntryPending: row.IdleEntryPending(), controlMode: row.ControlMode(),
+		targetGID: row.TargetGID(), stuck: row.Stuck(),
+		segmentHeld: row.From != (monster.Pose{}) || row.To != (monster.Pose{}) || row.ArriveMs != 0 || row.DepartMs != 0,
+		goalHeld:    goalHeld}
+}
+
+/*
+================
+moverStorage.activityGuardAt
+
+The activity commit's guard read through a carried slot: the
+row's commit generation and activity cadence, and whether the
+row exists, without expanding the row into a MoverState. The
+commit compares the pair against the generation and cadence its
+plan was read from: a whole-value write since then has bumped
+the generation (setRow), and the only writes that leave it
+alone stamp the cadence (stampActivity), so an unchanged pair
+proves the stored row is still the planned one (#3027). The
+slot is verified against the gid before use and delegates to
+the gid resolve on a miss, as every carried read does (#2133).
+================
+*/
+func (s *moverStorage) activityGuardAt(slot uint32, gid uint32) (uint64, monster.ActivityCadence, bool) {
+	if s == nil || int(slot) >= len(s.slots) || s.slots[slot].gid != gid {
+		resolved, ok := s.slotOf(gid)
+		if !ok {
+			return 0, monster.ActivityCadence{}, false
+		}
+		slot = resolved
+	}
+	return s.slots[slot].gen, s.scheduleRow(slot).activity, true
+}
+
+/*
+================
+scheduleSlotAt
+
+scheduleSlot through a slot carried from the last batch build,
+verified against the gid before use (#2133): a slot that no longer
+names gid (remove swapped another row into it, or the hint is the
+no-slot sentinel) delegates to scheduleSlot, so the answer is the
+row's either way.
+================
+*/
+func (s *moverStorage) scheduleSlotAt(slot uint32, gid uint32) (moverSchedule, uint32, bool) {
+	if s == nil || int(slot) >= len(s.slots) || s.slots[slot].gid != gid {
+		return s.scheduleSlot(gid)
+	}
+	return s.scheduleRow(slot), slot, true
+}
+
+/*
+================
+catchUpActivity
+
+Rewrites one actor's activity cadence in place to the phase it would
+hold had it never slept (monster.ActivityCadence.CatchUp). The dormancy
+wake calls this before rescheduling, so the scheduler's own cadence
+branch lands the actor's next due time on its native phase.
+================
+*/
+func (s *moverStorage) catchUpActivity(gid uint32, now uint32) {
+	if s == nil {
+		return
+	}
+	slot, ok := s.slotOf(gid)
+	if !ok {
+		return
+	}
+	r := s.slots[slot].rec
+	if r.live != nil {
+		r.live.Activity = r.live.Activity.CatchUp(now)
+	}
+	if r.pending != nil {
+		r.pending.activity = r.pending.activity.CatchUp(now)
+	}
+}
+
+/*
+================
+compact
+================
+*/
+func (s *moverStorage) compact(gid uint32) bool {
+	if s == nil {
+		return false
+	}
+	slot, ok := s.slotOf(gid)
+	return ok && s.slots[slot].rec.pending != nil
+}
+
+/*
+================
+len
+================
+*/
+func (s *moverStorage) len() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.slots)
+}
+
+/*
+================
+remove
+
+Swap-removes the slot: the last row takes the hole and its byGID
+entry follows it, so removal stays O(1) and slot order is the only
+casualty (see moverSlot).
+================
+*/
+func (s *moverStorage) remove(gid uint32) {
+	if s == nil {
+		return
+	}
+	slot, exists := s.slotOf(gid)
+	if !exists {
+		return
+	}
+	s.blocks.leaveSlot(slot, gid, s.slotOf)
+	s.blocks.rosterGeneration++
+	s.spatial.remove(gid, s.slots[slot].rec.interestBounds())
+	last := uint32(len(s.slots) - 1)
+	if slot != last {
+		s.slots[slot] = s.slots[last]
+		s.byGID[s.slots[slot].gid] = slot
+	}
+	s.slots[last] = moverSlot{}
+	s.slots = s.slots[:last]
+	s.blocks.moveSlot(slot, last)
+	delete(s.byGID, gid)
+}

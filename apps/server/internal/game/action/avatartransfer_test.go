@@ -1,0 +1,247 @@
+package action
+
+import (
+	"encoding/binary"
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"reflect"
+	"testing"
+)
+
+func TestAvatarTransferRoundtripPreservesBodyAndVisualOrder(t *testing.T) {
+	c := testCharacter()
+	c.MissionInventory = []enterworld.InventoryRow{{Slot: 20, RefObjID: 90001, Codename: "AVATAR_HAT", TypeFlags: wire.PackTypeFlags(3, 1, 13, 1), Plus: 2, VarianceBits: "123", Durability: 30, StackCount: 1}}
+	original := c.MissionInventory[0]
+	original.Slot = 13
+	items := staticItemSource{"AVATAR_HAT": {RefObjID: 90001, Codename: "AVATAR_HAT", TypeIDs: [4]int64{3, 1, 13, 1}, Country: 3, RequiredSex: 2, ReqQuadTypes: [4]int64{-1, -1, -1, -1}}}
+	rt, _ := newTestRuntime(c, items)
+	equip := rt.HandleItemMove(testDivision, c, []byte{0x24, 20, 0})
+	// The move, the avatar's reference and visual, then the owner's
+	// refreshed stats (as the reference server sends them): a worn avatar's options count only while it
+	// is worn. The owner's browser needs the reference as a viewer's does.
+	if len(equip.Frames) != 4 || equip.Frames[0].Opcode != wire.OpItemMoveResponse ||
+		equip.Frames[1].Opcode != opCommerceItemReferences || equip.Frames[2].Opcode != 0x3314 ||
+		equip.Frames[3].Opcode != wire.OpBaseStats {
+		t.Fatalf("equip: %+v", equip)
+	}
+	// Viewers get the same reference and visual (#340), never the owner's stats.
+	if len(equip.Broadcast) != 2 || !reflect.DeepEqual(equip.Broadcast, equip.Frames[1:3]) {
+		t.Fatalf("viewers: %+v", equip.Broadcast)
+	}
+	assertReferencedBeforeNamed(t, "owner", equip.Frames)
+	assertReferencedBeforeNamed(t, "viewers", equip.Broadcast)
+	if len(c.MissionInventory) != 0 || c.AvatarInventory == nil || len(c.AvatarInventory.Rows) != 1 {
+		t.Fatal("not committed")
+	}
+	unequip := rt.HandleItemMove(testDivision, c, []byte{0x23, 0, 20})
+	if len(unequip.Frames) != 3 || unequip.Frames[1].Opcode != 0x377c || unequip.Frames[2].Opcode != wire.OpBaseStats {
+		t.Fatalf("unequip: %+v", unequip)
+	}
+	if !reflect.DeepEqual(c.MissionInventory, []enterworld.InventoryRow{original}) || len(c.AvatarInventory.Rows) != 0 {
+		t.Fatalf("body changed: %+v", c.MissionInventory)
+	}
+}
+
+func TestAvatarTransferRejectsOccupiedAndEquipmentDestinationsAtomically(t *testing.T) {
+	c := testCharacter()
+	c.MissionInventory = []enterworld.InventoryRow{{Slot: 20, RefObjID: 90001, Codename: "AVATAR_HAT", TypeFlags: wire.PackTypeFlags(3, 1, 13, 1), VarianceBits: "0", StackCount: 1}, {Slot: 21, RefObjID: 90001, Codename: "AVATAR_HAT", TypeFlags: wire.PackTypeFlags(3, 1, 13, 1), VarianceBits: "0", StackCount: 1}}
+	rt, _ := newTestRuntime(c, staticItemSource{"AVATAR_HAT": {RefObjID: 90001, TypeIDs: [4]int64{3, 1, 13, 1}, Country: 3, RequiredSex: 2, ReqQuadTypes: [4]int64{-1, -1, -1, -1}}})
+	rt.HandleItemMove(testDivision, c, []byte{0x24, 20, 0})
+	for _, payload := range [][]byte{{0x24, 21, 0}, {0x24, 21, 1}, {0x23, 0, 6}, {0x23, 0, 45}, {0x24, 21, 4}, {0x23, 0}, {0x23, 0, 20, 1}} {
+		result := rt.HandleItemMove(testDivision, c, payload)
+		if len(result.Frames) != 1 || result.Frames[0].Payload[0] != 2 {
+			t.Fatalf("accepted %x: %+v", payload, result)
+		}
+		if len(c.MissionInventory) != 1 || c.MissionInventory[0].Slot != 21 || len(c.AvatarInventory.Rows) != 1 {
+			t.Fatalf("mutated for %x", payload)
+		}
+	}
+}
+
+func TestAvatarDressRemovalMovesAttachmentAtomicallyAndUsesFirstFreeSlots(t *testing.T) {
+	for _, freeCount := range []int{0, 1, 2} {
+		t.Run(string(rune('0'+freeCount)), func(t *testing.T) {
+			c := testCharacter()
+			c.MissionInventory = nil
+			for slot := 13; slot < 45-freeCount; slot++ {
+				c.MissionInventory = append(c.MissionInventory, enterworld.InventoryRow{Slot: int64(slot), RefObjID: 1, TypeFlags: 0x6c, StackCount: 1})
+			}
+			dress := enterworld.InventoryRow{Slot: 3, RefObjID: 90002, Codename: "DRESS", TypeFlags: 0x16ac, StackCount: 1, VarianceBits: "123", Plus: 2, Durability: 17}
+			attachment := enterworld.InventoryRow{Slot: 0, RefObjID: 90003, Codename: "ATTACHMENT", TypeFlags: 0x1eac, StackCount: 1, VarianceBits: "456", Plus: 3, Durability: 23}
+			c.AvatarInventory = &domain.AvatarInventory{Capacity: 4, Rows: []enterworld.InventoryRow{dress, attachment}}
+			before := append([]enterworld.InventoryRow(nil), c.MissionInventory...)
+			rt, _ := newTestRuntime(c, staticItemSource{
+				"DRESS":      {RefObjID: 90002, Codename: "DRESS", TypeIDs: [4]int64{3, 1, 13, 2}, ReqQuadTypes: [4]int64{-1, -1, -1, -1}},
+				"ATTACHMENT": {RefObjID: 90003, Codename: "ATTACHMENT", TypeIDs: [4]int64{3, 1, 13, 3}, ReqQuadTypes: [4]int64{-1, -1, -1, -1}},
+			})
+			result := rt.HandleItemMove(testDivision, c, []byte{0x23, 3, 20})
+			if freeCount < 2 {
+				if len(result.Frames) != 1 || !reflect.DeepEqual(result.Frames[0].Payload, []byte{2, 7}) || !reflect.DeepEqual(before, c.MissionInventory) || len(c.AvatarInventory.Rows) != 2 {
+					t.Fatalf("partial removal: %+v", result)
+				}
+				return
+			}
+			if len(result.Frames) != 4 || result.Frames[3].Opcode != wire.OpBaseStats ||
+				!reflect.DeepEqual(result.Frames[0].Payload, []byte{1, 0x23, 3, 43, 1, 0, 1, 0x23, 0, 44, 1, 0}) {
+				t.Fatalf("wire: %+v", result)
+			}
+			if binary.LittleEndian.Uint32(result.Frames[1].Payload[5:]) != 90003 || binary.LittleEndian.Uint32(result.Frames[2].Payload[5:]) != 90002 {
+				t.Fatal("attachment must disappear before dress")
+			}
+			if !reflect.DeepEqual(result.Broadcast, result.Frames[1:3]) {
+				t.Fatalf("viewers: %+v", result.Broadcast)
+			}
+			dress.Slot = 43
+			attachment.Slot = 44
+			if len(c.AvatarInventory.Rows) != 0 || !reflect.DeepEqual(c.MissionInventory[len(before):], []enterworld.InventoryRow{dress, attachment}) {
+				t.Fatalf("body changed: %+v", c.MissionInventory)
+			}
+		})
+	}
+}
+
+func TestStackSplitAndMergeRoundtripThroughNativeMoveFrames(t *testing.T) {
+	c := testCharacter()
+	c.MissionInventory = []enterworld.InventoryRow{{Slot: 20, RefObjID: 3630, Codename: "ITEM_ETC_HP_POTION_01", TypeFlags: wire.PackTypeFlags(3, 3, 1, 1), StackCount: 10, VarianceBits: "0"}}
+	rt, _ := newTestRuntime(c, testItems())
+	split := rt.HandleItemMove(testDivision, c, []byte{0, 20, 13, 3, 0})
+	if len(split.Frames) != 1 || !reflect.DeepEqual(split.Frames[0].Payload, []byte{1, 0, 20, 13, 3, 0, 0}) || len(c.MissionInventory) != 2 || c.MissionInventory[0].StackCount != 7 || c.MissionInventory[1].StackCount != 3 {
+		t.Fatalf("split: %+v / %+v", split, c.MissionInventory)
+	}
+	merge := rt.HandleItemMove(testDivision, c, []byte{0, 13, 20, 3, 0})
+	if len(merge.Frames) != 1 || merge.Frames[0].Payload[0] != 1 || len(c.MissionInventory) != 1 || c.MissionInventory[0].Slot != 20 || c.MissionInventory[0].StackCount != 10 {
+		t.Fatalf("merge: %+v / %+v", merge, c.MissionInventory)
+	}
+}
+
+/*
+================
+spiritCharacter
+
+A character with a Devil's Spirit in bag slot 20 and the item rows the
+runtime checks requirements against.
+================
+*/
+func spiritCharacter(t *testing.T, socket bool) (*enterworld.Character, *Runtime) {
+	t.Helper()
+	c := testCharacter()
+	c.MissionInventory = []enterworld.InventoryRow{{Slot: 20, RefObjID: 90010, Codename: "AVATAR_DEVIL", TypeFlags: wire.PackTypeFlags(3, 1, 14, 1), VarianceBits: "0", StackCount: 1}}
+	rt, _ := newTestRuntime(c, staticItemSource{"AVATAR_DEVIL": {RefObjID: 90010, Codename: "AVATAR_DEVIL", TypeIDs: [4]int64{3, 1, 14, 1}, Country: 3, RequiredSex: 2, ReqQuadTypes: [4]int64{-1, -1, -1, -1}}})
+	rt.NasrunSocket = socket
+	return c, rt
+}
+
+/*
+================
+TestSpiritWearsOnlyInTheFifthSocketWithTheSwitchOn
+
+Port-only, not native (SRO_NASRUN, #3456). Off is v1.150: the Spirit
+cannot be worn anywhere.
+================
+*/
+func TestSpiritWearsOnlyInTheFifthSocketWithTheSwitchOn(t *testing.T) {
+	c, rt := spiritCharacter(t, false)
+	if result := rt.HandleItemMove(testDivision, c, []byte{0x24, 20, 4}); result.Frames[0].Payload[0] != 2 {
+		t.Fatalf("switch off: worn: %+v", result)
+	}
+	c, rt = spiritCharacter(t, true)
+	c.MissionInventory[0].Data = spiritAwakeFor(rt, spiritTestDay)
+	// The hat's socket (its TID4) and every v1.150 slot refuse it.
+	for _, slot := range []byte{0, 1, 2, 3, 5} {
+		if result := rt.HandleItemMove(testDivision, c, []byte{0x24, 20, slot}); result.Frames[0].Payload[0] != 2 {
+			t.Fatalf("slot %d accepted the Spirit", slot)
+		}
+	}
+	if result := rt.HandleItemMove(testDivision, c, []byte{0x24, 20, 4}); result.Frames[0].Payload[0] != 1 {
+		t.Fatalf("slot 4 refused the Spirit: %+v", result)
+	}
+	if c.AvatarInventory == nil || c.AvatarInventory.Capacity != 5 || len(c.AvatarInventory.Rows) != 1 || c.AvatarInventory.Rows[0].Slot != 4 {
+		t.Fatalf("storage: %+v", c.AvatarInventory)
+	}
+}
+
+// spiritTestDay is a day of awakening, in seconds.
+const spiritTestDay = 86400
+
+/*
+================
+spiritAwakeFor
+
+A Spirit data word whose awakening ends seconds after the runtime's now
+(negative: that long ago).
+================
+*/
+func spiritAwakeFor(rt *Runtime, seconds int64) uint32 {
+	return uint32(rt.Now().Unix() + seconds)
+}
+
+/*
+================
+TestOnlyAnAwakeSpiritIsWorn
+
+Port-only (SRO_NASRUN, #3456 step 2): the v1.188 server wears a Spirit
+only while its awakening runs. A dormant Spirit (never used) and a lapsed
+one refuse with 0xF9; the same Spirit awake goes on.
+================
+*/
+func TestOnlyAnAwakeSpiritIsWorn(t *testing.T) {
+	for name, clock := range map[string]func(*Runtime) uint32{
+		"dormant": func(*Runtime) uint32 { return 0 },
+		"lapsed":  func(rt *Runtime) uint32 { return spiritAwakeFor(rt, -1) },
+	} {
+		c, rt := spiritCharacter(t, true)
+		c.MissionInventory[0].Data = clock(rt)
+		result := rt.HandleItemMove(testDivision, c, []byte{0x24, 20, 4})
+		if !reflect.DeepEqual(result.Frames[0].Payload, []byte{2, wire.ErrCodeSpiritAsleep}) || c.AvatarInventory != nil && len(c.AvatarInventory.Rows) != 0 {
+			t.Fatalf("%s Spirit: worn or refused with the wrong code: %+v / %+v", name, result, c.AvatarInventory)
+		}
+	}
+	c, rt := spiritCharacter(t, true)
+	c.MissionInventory[0].Data = spiritAwakeFor(rt, spiritTestDay)
+	if result := rt.HandleItemMove(testDivision, c, []byte{0x24, 20, 4}); result.Frames[0].Payload[0] != 1 {
+		t.Fatalf("an awake Spirit was refused: %+v", result)
+	}
+	// The clock moves with the Spirit into its socket.
+	if got := c.AvatarInventory.Rows[0].Data; got != spiritAwakeFor(rt, spiritTestDay) {
+		t.Fatalf("worn Spirit's clock = %d, want it carried", got)
+	}
+}
+
+/*
+================
+TestNoV150AvatarTakesTheSpiritSlot
+================
+*/
+func TestNoV150AvatarTakesTheSpiritSlot(t *testing.T) {
+	c := testCharacter()
+	c.MissionInventory = []enterworld.InventoryRow{{Slot: 20, RefObjID: 90001, Codename: "AVATAR_HAT", TypeFlags: wire.PackTypeFlags(3, 1, 13, 1), VarianceBits: "0", StackCount: 1}}
+	rt, _ := newTestRuntime(c, staticItemSource{"AVATAR_HAT": {RefObjID: 90001, TypeIDs: [4]int64{3, 1, 13, 1}, Country: 3, RequiredSex: 2, ReqQuadTypes: [4]int64{-1, -1, -1, -1}}})
+	rt.NasrunSocket = true
+	if result := rt.HandleItemMove(testDivision, c, []byte{0x24, 20, 4}); result.Frames[0].Payload[0] != 2 {
+		t.Fatalf("a hat took slot 4: %+v", result)
+	}
+}
+
+/*
+================
+TestAStoredSpiritComesOffWithTheSwitchOff
+
+A Spirit worn while the switch was on stays readable with it off: it can
+be taken off (to the first free bag slot, as every avatar), and the
+storage keeps five slots while it is there.
+================
+*/
+func TestAStoredSpiritComesOffWithTheSwitchOff(t *testing.T) {
+	c, rt := spiritCharacter(t, false)
+	spirit := c.MissionInventory[0]
+	spirit.Slot = 4
+	c.MissionInventory = nil
+	c.AvatarInventory = &domain.AvatarInventory{Capacity: 5, Rows: []enterworld.InventoryRow{spirit}}
+	if result := rt.HandleItemMove(testDivision, c, []byte{0x23, 4, 20}); result.Frames[0].Payload[0] != 1 {
+		t.Fatalf("switch off: the Spirit could not come off: %+v", result)
+	}
+	if len(c.AvatarInventory.Rows) != 0 || c.AvatarInventory.Capacity != 4 || len(c.MissionInventory) != 1 || c.MissionInventory[0].Slot != 13 {
+		t.Fatalf("after: %+v / %+v", c.AvatarInventory, c.MissionInventory)
+	}
+}

@@ -1,0 +1,280 @@
+/*
+===========================================================================
+
+groundwalk_test.go - accepted pose, actual elapsed stepping and stop fences
+
+===========================================================================
+*/
+package simulation
+
+import (
+	"fmt"
+	"testing"
+)
+
+/*
+================
+groundFixture
+================
+*/
+func groundFixture(t *testing.T, step func(Spawn, NavOwner, Spawn) (Spawn, NavOwner, bool)) (*WorldStore, *int64, func() WorldState, string) {
+	t.Helper()
+	now := int64(1000)
+	st := NewWorldStore()
+	st.ConfigureGroundWalk(GroundWalkConfig{Now: func() int64 { return now }, Step: step})
+	start := Spawn{RegionID: 0x679A, X: 10, Y: 0, Z: 50}
+	seed := func() WorldState { return DefaultWorldState(start) }
+	key := WorldKey("test", "Walker")
+	st.Update(key, seed, func(w *WorldState) {
+		w.Run = 50
+		goal := start
+		goal.X = 500
+		w.Spawn = goal
+		w.MoveSegment = w.TravelSegment(start, goal, RunMode, now)
+	})
+	return st, &now, seed, key
+}
+
+/*
+================
+TestGroundWalkUsesElapsedStepsAndNeverExtrapolatesUnchecked
+================
+*/
+func TestGroundWalkUsesElapsedStepsAndNeverExtrapolatesUnchecked(t *testing.T) {
+	var sources, goals []Spawn
+	st, now, seed, key := groundFixture(t, func(from Spawn, owner NavOwner, to Spawn) (Spawn, NavOwner, bool) {
+		sources, goals = append(sources, from), append(goals, to)
+		return to, owner, false
+	})
+	initial := st.Snapshot(key, seed)
+	if initial.Spawn.X != 500 || initial.PersistedSpawn().X != 10 {
+		t.Fatal("intent was published as accepted position")
+	}
+	*now += 300
+	first := st.Snapshot(key, seed)
+	if len(goals) != 1 || sources[0].X != 10 || goals[0].X != 25 {
+		t.Fatalf("actual 300ms step = %v -> %v", sources, goals)
+	}
+	if first.LiveSpawnAt(*now+60000).X != 25 {
+		t.Fatal("snapshot extrapolated through unchecked geometry")
+	}
+	*now += 10000
+	second := st.Snapshot(key, seed)
+	if second.LiveSpawnAt(*now).X != 185 || len(goals) != 2 {
+		t.Fatalf("stall was not one capped native step: %+v calls=%d", second.LiveSpawnAt(*now), len(goals))
+	}
+	if first.LiveSpawnAt(*now).X != 25 {
+		t.Fatal("an older snapshot changed under its reader")
+	}
+	if !st.AdmissionCurrent(key, initial) {
+		t.Fatal("progression invalidated accepted command acknowledgement")
+	}
+}
+
+/*
+================
+TestGroundCollisionKeepsActualLastStepSourceAndOneStop
+================
+*/
+func TestGroundCollisionKeepsActualLastStepSourceAndOneStop(t *testing.T) {
+	st, now, seed, key := groundFixture(t, func(from Spawn, owner NavOwner, to Spawn) (Spawn, NavOwner, bool) {
+		if to.X >= 40 {
+			return from, owner, true
+		}
+		return to, owner, false
+	})
+	admitted := st.Snapshot(key, seed)
+	*now += 500
+	if got := st.Snapshot(key, seed).PersistedSpawn(); got.X != 35 {
+		t.Fatalf("last accepted = %+v", got)
+	}
+	*now += 200
+	stopped := st.Snapshot(key, seed)
+	if stopped.Spawn.X != 35 || stopped.MoveSegment != nil {
+		t.Fatalf("collision fabricated pre-contact source: %+v", stopped)
+	}
+	updates := st.DrainGroundUpdates()
+	if len(updates) != 1 || !updates[0].Stopped {
+		t.Fatalf("stop delivery = %+v", updates)
+	}
+	if len(st.DrainGroundUpdates()) != 0 {
+		t.Fatal("stop delivered twice")
+	}
+	if !st.AdmissionCurrent(key, admitted) {
+		t.Fatal("collision suppressed its earlier accepted acknowledgement")
+	}
+	st.Update(key, seed, func(w *WorldState) { w.Spawn.X = 80; w.LifeRevision++ })
+	if st.GroundRevisionCurrent(key, updates[0].Revision) || st.AdmissionCurrent(key, admitted) {
+		t.Fatal("teleport retained stale stop or acknowledgement")
+	}
+}
+
+/*
+================
+TestGroundUpdateSettlesBeforeGameplayAndSpeedChange
+================
+*/
+func TestGroundUpdateSettlesBeforeGameplayAndSpeedChange(t *testing.T) {
+	st, now, seed, key := groundFixture(t, func(from Spawn, owner NavOwner, to Spawn) (Spawn, NavOwner, bool) { return to, owner, false })
+	revision := st.Snapshot(key, seed).GroundRevision()
+	*now += 200
+	st.Update(key, seed, func(w *WorldState) {
+		if w.LiveSpawnAt(*now).X != 20 {
+			t.Fatal("gameplay mutation observed unadvanced movement")
+		}
+		w.UpdateMovementSpeeds(20, 100, *now)
+	})
+	if got := st.Snapshot(key, seed).GroundRevision(); got != revision {
+		t.Fatalf("speed retime replaced initiating approach revision: %d != %d", got, revision)
+	}
+	*now += 200
+	if got := st.Snapshot(key, seed).PersistedSpawn(); got.X != 40 {
+		t.Fatalf("speed change restarted or skipped movement: %+v", got)
+	}
+}
+
+/*
+================
+TestGroundArrivalUsesNativePlanarFloatGoal
+================
+*/
+func TestGroundArrivalUsesNativePlanarFloatGoal(t *testing.T) {
+	for _, delta := range []Spawn{{X: 12.3456789}, {X: 12.3456789, Z: 8.7654321}, {X: 12.3456789, Y: 99, Z: 8.7654321}} {
+		t.Run(fmt.Sprintf("%v", delta), func(t *testing.T) {
+			st, now, seed, key := groundFixture(t, func(from Spawn, owner NavOwner, to Spawn) (Spawn, NavOwner, bool) { to.Y = 7; return to, owner, false })
+			st.Update(key, seed, func(w *WorldState) {
+				from := w.LiveSpawnAt(*now)
+				goal := from
+				goal.X += delta.X
+				goal.Y += delta.Y
+				goal.Z += delta.Z
+				w.Spawn = goal
+				w.MoveSegment = w.TravelSegment(from, goal, RunMode, *now)
+			})
+			goal := st.Snapshot(key, seed).Spawn
+			if updates := st.DrainGroundUpdates(); len(updates) != 0 {
+				t.Fatalf("admission persisted unchecked intent: %+v", updates)
+			}
+			for i := 0; i < 20 && st.Snapshot(key, seed).GroundActive(); i++ {
+				*now += 100
+			}
+			got := st.Snapshot(key, seed)
+			if got.GroundActive() || WorldDistance2D(got.Spawn, goal) > 0.5 || got.Spawn.Y != 7 {
+				t.Fatalf("native planar goal failed to settle: goal=%+v got=%+v active=%v", goal, got.PersistedSpawn(), got.GroundActive())
+			}
+			updates := st.DrainGroundUpdates()
+			if len(updates) != 1 || !updates[0].Arrived || updates[0].Stopped {
+				t.Fatalf("terminal arrival update = %+v", updates)
+			}
+		})
+	}
+}
+
+/*
+================
+TestGroundNativeArrivalBranches
+================
+*/
+func TestGroundNativeArrivalBranches(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		dx, dz, ox, oz float32
+		want           bool
+	}{
+		{"inside native radius", 0.3, 0.3, -10, -10, true},
+		{"equal native radius", 0.5, 0, -10, 0, true},
+		{"outside native radius", 0.5001, 0, -10, 0, false},
+		{"passed destination", -1, 0, -11, 0, true},
+		{"not passed destination", 1, 0, -9, 0, false},
+		{"perpendicular is not passed", 1, 0, 0, -10, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NativeGroundArrived(tc.dx, tc.dz, tc.ox, tc.oz); got != tc.want {
+				t.Fatalf("arrival=%v want%v", got, tc.want)
+			}
+		})
+	}
+}
+
+/*
+================
+TestGroundWalkResteerWithEarlierTickTimestampDoesNotDoubleStep
+
+Tick-driven movement (such as basic-attack pursuit resteers in
+advanceBasicAttackIntents) passes the tick-start timestamp nowMs to ApplyMove,
+while WorldStore.Update advances Ground.Pose using groundConfig.Now() (live
+wall clock, which is tens of milliseconds ahead of nowMs by the time later
+tick hooks run). Binding the new GroundWalkState must not rewind Ground.At
+back to MoveSegment.StartedAtMs and double-step [nowMs, groundConfig.Now()]
+on every resteer.
+================
+*/
+func TestGroundWalkResteerWithEarlierTickTimestampDoesNotDoubleStep(t *testing.T) {
+	st, wallNow, seed, key := groundFixture(t, func(from Spawn, owner NavOwner, to Spawn) (Spawn, NavOwner, bool) {
+		return to, owner, false
+	})
+
+	// Simulate 30 pursuit-resteer ticks spaced 100ms apart where the combat
+	// hook runs 70ms into each tick (wallNow = tickStart + 70ms). At 50 u/s,
+	// 3000ms of wall time from initial.At=1000 to wallNow=4000 must advance
+	// exactly 150 units (from X=10 to X=160), not ~255 units from double-stepping
+	// the 70ms intra-tick offset on every resteer.
+	for tick := 1; tick <= 30; tick++ {
+		tickStartMs := int64(1000 + tick*100)
+		*wallNow = tickStartMs + 70
+		st.Update(key, seed, func(w *WorldState) {
+			req := MovementRequest{
+				Mode:     MovementAckDestinationMode,
+				RegionID: w.Spawn.RegionID,
+				X:        1000,
+				Y:        0,
+				Z:        w.Spawn.Z,
+			}
+			ApplyMove(w, 100240, req, RunMode, tickStartMs)
+		})
+	}
+
+	got := st.Snapshot(key, seed).PersistedSpawn()
+	// Elapsed wall-clock time since fixture start (t=1000) is (4070 - 1000) = 3070ms.
+	// At speed 50 u/s, X must be 10 + 3.070 * 50 = 163.5.
+	const wantX = 163.5
+	if diff := got.X - wantX; diff < -0.05 || diff > 0.05 {
+		t.Fatalf("PersistedSpawn().X after 30 lagged tick resteers = %.3f, want %.3f (double-stepped intra-tick lag)", got.X, wantX)
+	}
+}
+
+/*
+================
+TestSnapshotAtNeverStepsPastItsTime
+
+A tick hook reads the walk at the tick's own time: after the tick's
+first snapshot stepped the walk to the wall clock, SnapshotAt for that
+tick time steps nothing more, and its pose is the one the first step
+answered. A later time steps as Snapshot would, never past the wall clock.
+================
+*/
+func TestSnapshotAtNeverStepsPastItsTime(t *testing.T) {
+	calls := 0
+	st, now, seed, key := groundFixture(t, func(from Spawn, owner NavOwner, to Spawn) (Spawn, NavOwner, bool) {
+		calls++
+		return to, owner, false
+	})
+	tickMs := *now + 300
+	*now = tickMs + 5 // prepare runs a few milliseconds into the tick
+	stepped := st.Snapshot(key, seed)
+	if calls != 1 {
+		t.Fatalf("prepare stepped %d time(s), want 1", calls)
+	}
+	*now += 7 // a later hook in the same tick
+	hook := st.SnapshotAt(key, seed, tickMs)
+	if calls != 1 {
+		t.Fatalf("SnapshotAt(tick time) stepped again: %d step(s)", calls)
+	}
+	if hook.LiveSpawnAt(tickMs) != stepped.LiveSpawnAt(tickMs) {
+		t.Fatalf("hook pose %+v, prepare's %+v", hook.LiveSpawnAt(tickMs), stepped.LiveSpawnAt(tickMs))
+	}
+	st.SnapshotAt(key, seed, *now+1000)
+	if calls != 2 {
+		t.Fatalf("a later time did not step: %d step(s)", calls)
+	}
+}

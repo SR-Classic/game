@@ -1,0 +1,1000 @@
+/*
+===========================================================================
+
+deployment.go - deployment inputs and job variables
+
+Resolves the catalog, identity, and game-data contracts before Nomad mutations.
+
+===========================================================================
+*/
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"opensro.online/server/internal/agent/bugreport"
+	agentserver "opensro.online/server/internal/agent/server"
+	"opensro.online/server/internal/cluster/shard"
+	"opensro.online/server/internal/config"
+	"opensro.online/server/internal/config/shardsettings"
+	"opensro.online/server/internal/data/store"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/gamedata"
+	"opensro.online/server/internal/security/auth"
+	"opensro.online/server/internal/transport"
+)
+
+const (
+	agentJobName        = "sro-agent"
+	gameWorldJobPrefix  = "sro-gameworld-"
+	gameWorldShardToken = "__SHARD_ID__"
+	agentAccountToken   = "__ACCOUNT_VARIABLES__"
+	agentTemplateName   = "agent.nomad.hcl"
+	gameTemplateName    = "gameworld.nomad.hcl"
+	accountChunkBytes   = 48 << 10
+	maxAccountChunks    = int(
+		(auth.MaxFileBytes + accountChunkBytes - 1) / accountChunkBytes,
+	)
+	developmentAllowedOrigins = "http://127.0.0.1:5180,http://localhost:5180,http://127.0.0.1:4180,http://localhost:4180," +
+		"http://127.0.0.1:4173," +
+		"http://127.0.0.1:5174," +
+		"http://localhost:4173," +
+		"http://localhost:5174"
+	developmentGMCharacters = "global-official:asd2"
+)
+
+/*
+================
+deployment
+================
+*/
+type deployment struct {
+	ModuleRoot     string
+	Catalog        string
+	StateDir       string
+	ReleaseDir     string
+	JobsDir        string
+	Namespace      string
+	Network        string
+	AllowedOrigins string
+	GMCharacters   string
+	BetaMastery    string
+	// StackSizes is the validated, port-only SRO_STACK_SIZES override.
+	StackSizes string
+	// PortOnly are the port-only GameWorld switches (portonly.go).
+	PortOnly              portOnlySettings
+	TransportCert         string
+	TransportKey          string
+	TransportTLSID        string
+	TransportWTAddr       string
+	IdentityIssuer        string
+	IdentityJWKSURL       string
+	AgentURL              string
+	AgentPort             int
+	AgentProvisioningPort int
+	PrivateNetwork        bool
+	// Pprof turns on the first shard's profiling listener (TRANSPORT_PPROF),
+	// its own loopback-only socket (transport/pprof.go). On by default:
+	// profiles are taken only on request, and the mutex and block profilers
+	// stay off.
+	Pprof          bool
+	TaskUser       string
+	TaskUID        int
+	TaskGID        int
+	AgentCPU       int
+	AgentMemoryMB  int
+	GameCPU        int
+	GameMemoryMB   int
+	AgentReleaseID string
+	GameReleaseID  string
+	AgentSource    string
+	GameSource     string
+	AgentBinary    string
+	GameBinary     string
+	DataPaths      gamedata.Paths
+	Shards         []shardDeployment
+	Secrets        clusterSecrets
+	// BugReports comes from the deployer's SRO_BUG_REPORT_* environment;
+	// its webhook travels only as a Nomad variable item.
+	BugReports bugreport.Config
+	// StaffWebhook is SRO_STAFF_DISCORD_WEBHOOK: the ops-only channel the
+	// GameWorld pages (the served WebTransport pair, #1447). Like the bug
+	// report webhook it travels only as a Nomad variable item; "" keeps
+	// the stored one, and StaffWebhookOff (the value "off") removes it.
+	StaffWebhook    string
+	StaffWebhookOff bool
+}
+
+/*
+================
+shardDeployment
+================
+*/
+type shardDeployment struct {
+	Definition    shard.Definition
+	ControlPort   int
+	TransportPort int
+	AuthorityDir  string
+	// PublicAPIAddr is the community site's read API listener: the first
+	// shard serves it on publicstats.DefaultAddr (moved by
+	// SRO_DEV_PORT_OFFSET, devstack.go), every other shard "off"
+	// (one host, one loopback port, one site).
+	PublicAPIAddr string
+	// PprofAddr is the profiling listener: the first shard serves it on
+	// transport.DefaultPprofAddr (moved by SRO_DEV_PORT_OFFSET) when
+	// profiling is on, every other shard not at all ("").
+	PprofAddr string
+}
+
+/*
+================
+resolveDeployment
+================
+*/
+func resolveDeployment(
+	options commandOptions,
+	requirePrerequisites bool,
+) (*deployment, error) {
+	portOnly := portOnlySettingsFromEnv()
+	if err := portOnly.validate(); err != nil {
+		return nil, err
+	}
+	taskUID, taskGID, err := resolveTaskOwner(options.TaskUser)
+	if err != nil {
+		return nil, err
+	}
+	moduleRoot := options.ModuleRoot
+	if moduleRoot == "" {
+		var err error
+		moduleRoot, err = config.FindModuleRoot()
+		if err != nil {
+			return nil, err
+		}
+	}
+	moduleRoot = cleanAbsolute(moduleRoot)
+
+	catalogPath := options.Catalog
+	if catalogPath == "" {
+		catalogPath = filepath.Join(moduleRoot, shard.DefaultCatalogPath)
+	}
+	stateDir := options.StateDir
+	if stateDir == "" {
+		stateDir = filepath.Join(moduleRoot, ".state", "cluster")
+	}
+	stateDir = cleanAbsolute(stateDir)
+	releaseDir := options.ReleaseDir
+	if releaseDir == "" {
+		releaseDir = filepath.Join(stateDir, "releases")
+	}
+	releaseDir = cleanAbsolute(releaseDir)
+	jobsDir := options.JobsDir
+	if jobsDir == "" {
+		jobsDir = filepath.Join(moduleRoot, "ops", "nomad", "jobs")
+	}
+
+	catalog, err := shard.Load(cleanAbsolute(catalogPath))
+	if err != nil {
+		return nil, fmt.Errorf("shard catalog: %w", err)
+	}
+	var dataPaths gamedata.Paths
+	var secrets clusterSecrets
+	var agentReleaseID string
+	var gameReleaseID string
+	if requirePrerequisites {
+		dataPaths, err = gamedata.Resolve()
+		if err != nil {
+			return nil, fmt.Errorf("game data: %w", err)
+		}
+		secrets, err = loadClusterSecrets(cleanAbsolute(stateDir))
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range []string{
+			binaryName("agent"),
+			binaryName("gameworld"),
+		} {
+			if err := requireRegularFile(filepath.Join(moduleRoot, name)); err != nil {
+				return nil, err
+			}
+		}
+		for _, name := range []string{
+			agentTemplateName,
+			gameTemplateName,
+		} {
+			if err := requireRegularFile(filepath.Join(jobsDir, name)); err != nil {
+				return nil, err
+			}
+		}
+		agentSource := filepath.Join(moduleRoot, binaryName("agent"))
+		gameSource := filepath.Join(moduleRoot, binaryName("gameworld"))
+		agentReleaseID, err = releaseID(
+			agentSource,
+			filepath.Join(jobsDir, agentTemplateName),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("agent release identity: %w", err)
+		}
+		gameReleaseID, err = releaseID(
+			gameSource,
+			filepath.Join(jobsDir, gameTemplateName),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("GameWorld release identity: %w", err)
+		}
+	}
+	if options.AgentPort < 1 || options.AgentPort > 65535 {
+		return nil, fmt.Errorf("agent port %d is invalid", options.AgentPort)
+	}
+	// Unset (options built without flags) is the documented default.
+	if options.AgentProvisioningPort == 0 {
+		options.AgentProvisioningPort = options.DevStack.provisioningPort()
+	}
+	if options.AgentProvisioningPort < 1 || options.AgentProvisioningPort > 65535 ||
+		options.AgentProvisioningPort == options.AgentPort {
+		return nil, fmt.Errorf("agent provisioning port %d is invalid", options.AgentProvisioningPort)
+	}
+	hostNetwork, err := normalizeHostNetwork(
+		options.Network,
+		options.PrivateNet,
+	)
+	if err != nil {
+		return nil, err
+	}
+	namespace := options.Namespace
+	if namespace == "" {
+		namespace = defaultNomadNamespace
+	}
+	if hostNetwork != "loopback" &&
+		namespace == defaultNomadNamespace {
+		return nil, fmt.Errorf(
+			"production host network %q refuses the shared Nomad namespace %q; "+
+				"create a dedicated namespace and pass -namespace",
+			hostNetwork,
+			defaultNomadNamespace,
+		)
+	}
+	agentURL := strings.TrimSuffix(strings.TrimSpace(options.AgentURL), "/")
+	if agentURL == "" && hostNetwork == "loopback" {
+		agentURL = fmt.Sprintf("http://127.0.0.1:%d", options.AgentPort)
+	}
+	if agentURL != "" {
+		if _, err := absoluteHTTPURL(agentURL); err != nil {
+			return nil, fmt.Errorf("agent URL: %w", err)
+		}
+	}
+	allowedOrigins := ""
+	if requirePrerequisites {
+		rawOrigins := options.AllowedOrigins
+		// A moved local stack's clients serve from moved ports too.
+		if strings.TrimSpace(rawOrigins) == "" && hostNetwork == "loopback" && options.DevStack.moved() {
+			rawOrigins = options.DevStack.allowedOrigins()
+		}
+		allowedOrigins, err = normalizeAllowedOrigins(
+			rawOrigins,
+			hostNetwork,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	gmCharacters, err := configuredGMCharacters(
+		options.GMCharacters,
+		hostNetwork,
+		stateDir,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("GM allowlist: %w", err)
+	}
+	bugReports, warnings := bugreport.LoadConfig(os.Getenv)
+	staffWebhook, staffWebhookOff, staffWarning := configuredStaffWebhook(os.Getenv(envStaffWebhook))
+	if staffWarning != "" {
+		fmt.Println("Staff alerts: " + staffWarning)
+	}
+	betaMastery, err := configuredBetaMastery(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	// The operator's value, else the deployment default (shardsettings).
+	stackSizes, err := enterworld.ParseStackSizes(shardsettings.Lookup(enterworld.EnvStackSizes).Value(os.Getenv))
+	if err != nil {
+		return nil, err
+	}
+	for _, warning := range warnings {
+		fmt.Printf("Bug reports: %s\n", warning)
+	}
+	identityIssuer := strings.TrimSuffix(
+		strings.TrimSpace(options.IdentityIssuer),
+		"/",
+	)
+	identityJWKSURL := strings.TrimSpace(options.IdentityJWKSURL)
+	if requirePrerequisites {
+		if identityIssuer == "" && hostNetwork == "loopback" {
+			identityIssuer = options.DevStack.nomadAddress()
+		}
+		if identityIssuer == "" {
+			return nil, fmt.Errorf(
+				"-identity-issuer is required outside loopback",
+			)
+		}
+		if _, err := secureIdentityURL(identityIssuer); err != nil {
+			return nil, fmt.Errorf("nomad identity issuer: %w", err)
+		}
+		if identityJWKSURL == "" {
+			identityJWKSURL = identityIssuer + "/.well-known/jwks.json"
+		}
+		if _, err := secureIdentityURL(identityJWKSURL); err != nil {
+			return nil, fmt.Errorf("nomad identity JWKS URL: %w", err)
+		}
+	}
+
+	shards := make([]shardDeployment, 0)
+	for _, definition := range catalog.Definitions() {
+		if !definition.Enabled {
+			continue
+		}
+		controlPort, err := endpointPort(definition.ControlURL)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"shard %q control URL: %w",
+				definition.ID,
+				err,
+			)
+		}
+		transportPort, err := endpointPort(definition.TransportURL)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"shard %q transport URL: %w",
+				definition.ID,
+				err,
+			)
+		}
+		authorityDir := filepath.Join(
+			moduleRoot,
+			".state",
+			"shards",
+			definition.ID,
+			"authority",
+		)
+		if requirePrerequisites {
+			err = requireRegularFile(
+				filepath.Join(authorityDir, store.DBFileName),
+			)
+		}
+		if err != nil {
+			return nil, fmt.Errorf(
+				"shard %q authority: %w",
+				definition.ID,
+				err,
+			)
+		}
+		publicAPIAddr, pprofAddr := "off", ""
+		if len(shards) == 0 {
+			publicAPIAddr = options.DevStack.publicAPIAddr()
+			if options.Pprof {
+				pprofAddr = options.DevStack.pprofAddr()
+			}
+		}
+		shards = append(shards, shardDeployment{
+			Definition:    definition,
+			ControlPort:   controlPort,
+			TransportPort: transportPort,
+			AuthorityDir:  cleanAbsolute(authorityDir),
+			PublicAPIAddr: publicAPIAddr,
+			PprofAddr:     pprofAddr,
+		})
+	}
+	if requirePrerequisites && len(shards) == 0 {
+		return nil, fmt.Errorf("shard catalog has no enabled shards")
+	}
+	transportCert, transportKey, transportTLSID, certificate, err :=
+		resolveTransportCertificate(
+			options.TransportCert,
+			options.TransportKey,
+			hostNetwork,
+			requirePrerequisites,
+			shards,
+		)
+	if err != nil {
+		return nil, err
+	}
+	if requirePrerequisites {
+		if err := validateWebTransportPosture(
+			certificate,
+			webTransportPosture{
+				Public:     portOnly.webTransportPublic(),
+				WTAddr:     options.TransportWTAddr,
+				PublicPort: options.TransportWTPublicPort,
+			},
+			shards,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	return &deployment{
+		ModuleRoot:            moduleRoot,
+		Catalog:               cleanAbsolute(catalogPath),
+		StateDir:              stateDir,
+		ReleaseDir:            releaseDir,
+		JobsDir:               cleanAbsolute(jobsDir),
+		Namespace:             namespace,
+		Network:               hostNetwork,
+		AllowedOrigins:        allowedOrigins,
+		GMCharacters:          gmCharacters,
+		BetaMastery:           betaMastery,
+		StackSizes:            stackSizes.String(),
+		PortOnly:              portOnly,
+		TransportCert:         transportCert,
+		TransportKey:          transportKey,
+		TransportTLSID:        transportTLSID,
+		TransportWTAddr:       strings.TrimSpace(options.TransportWTAddr),
+		IdentityIssuer:        identityIssuer,
+		IdentityJWKSURL:       identityJWKSURL,
+		AgentURL:              agentURL,
+		AgentPort:             options.AgentPort,
+		AgentProvisioningPort: options.AgentProvisioningPort,
+		PrivateNetwork:        options.PrivateNet,
+		Pprof:                 options.Pprof,
+		TaskUser:              options.TaskUser,
+		TaskUID:               taskUID,
+		TaskGID:               taskGID,
+		AgentCPU:              options.AgentCPU,
+		AgentMemoryMB:         options.AgentMemoryMB,
+		GameCPU:               options.GameCPU,
+		GameMemoryMB:          options.GameMemoryMB,
+		AgentReleaseID:        agentReleaseID,
+		GameReleaseID:         gameReleaseID,
+		AgentSource:           filepath.Join(moduleRoot, binaryName("agent")),
+		GameSource:            filepath.Join(moduleRoot, binaryName("gameworld")),
+		AgentBinary: filepath.Join(
+			releaseDir,
+			"agent",
+			agentReleaseID,
+			binaryName("agent"),
+		),
+		GameBinary: filepath.Join(
+			releaseDir,
+			"gameworld",
+			gameReleaseID,
+			binaryName("gameworld"),
+		),
+		DataPaths:       dataPaths,
+		Shards:          shards,
+		Secrets:         secrets,
+		BugReports:      bugReports,
+		StaffWebhook:    staffWebhook,
+		StaffWebhookOff: staffWebhookOff,
+	}, nil
+}
+
+/*
+================
+endpointPort
+================
+*/
+func endpointPort(raw string) (int, error) {
+	endpoint, err := url.Parse(raw)
+	if err != nil {
+		return 0, err
+	}
+	_, portText, err := net.SplitHostPort(endpoint.Host)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"%q must include an explicit port: %w",
+			raw,
+			err,
+		)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("%q has invalid port", raw)
+	}
+	return port, nil
+}
+
+/*
+================
+absoluteHTTPURL
+================
+*/
+func absoluteHTTPURL(raw string) (*url.URL, error) {
+	endpoint, err := url.Parse(raw)
+	if err != nil ||
+		(endpoint.Scheme != "http" && endpoint.Scheme != "https") ||
+		endpoint.Host == "" ||
+		endpoint.User != nil {
+		return nil, fmt.Errorf("%q must be an absolute http(s) URL", raw)
+	}
+	return endpoint, nil
+}
+
+/*
+================
+secureIdentityURL
+================
+*/
+func secureIdentityURL(raw string) (*url.URL, error) {
+	parsed, err := absoluteHTTPURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	host := parsed.Hostname()
+	loopback := strings.EqualFold(host, "localhost")
+	if !loopback {
+		if ip := net.ParseIP(host); ip != nil {
+			loopback = ip.IsLoopback()
+		}
+	}
+	if parsed.Scheme != "https" &&
+		(parsed.Scheme != "http" || !loopback) {
+		return nil, fmt.Errorf("must use HTTPS outside loopback")
+	}
+	return parsed, nil
+}
+
+/*
+================
+buildBinaries
+================
+*/
+func (deployment *deployment) buildBinaries(ctx context.Context) error {
+	commands := [][]string{
+		{"build", "-o", binaryName("agent"), agentLinkFlags(ctx, deployment.ModuleRoot), "./cmd/services/sro-agent"},
+		{"build", "-o", binaryName("gameworld"), "./cmd/services/sro-gameworld"},
+	}
+	for _, arguments := range commands {
+		command := exec.CommandContext(ctx, "go", arguments...)
+		command.Dir = deployment.ModuleRoot
+		command.Stdout = os.Stdout
+		command.Stderr = os.Stderr
+		if err := command.Run(); err != nil {
+			return fmt.Errorf(
+				"go %s: %w",
+				strings.Join(arguments, " "),
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+/*
+================
+agentLinkFlags
+
+Stamps the commit subject into the Agent for GET /title/build. Base64
+keeps quotes and spaces in the subject from breaking -ldflags; outside a
+git checkout the stamp is empty.
+================
+*/
+func agentLinkFlags(ctx context.Context, moduleRoot string) string {
+	command := exec.CommandContext(ctx, "git", "log", "-1", "--format=%s")
+	command.Dir = moduleRoot
+	subject, err := command.Output()
+	if err != nil {
+		subject = nil
+	}
+	encoded := base64.StdEncoding.EncodeToString(bytes.TrimSpace(subject))
+	return "-ldflags=-X " + agentserver.BuildSubjectSymbol + "=" + encoded
+}
+
+/*
+================
+jobTemplates
+================
+*/
+func (deployment *deployment) jobTemplates() ([]byte, []byte, error) {
+	agentTemplate, err := os.ReadFile(
+		filepath.Join(deployment.JobsDir, agentTemplateName),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	gameTemplate, err := os.ReadFile(
+		filepath.Join(deployment.JobsDir, gameTemplateName),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return agentTemplate, gameTemplate, nil
+}
+
+/*
+================
+agentVariables
+================
+*/
+func (deployment *deployment) agentVariables() map[string]any {
+	return deployment.nodeVariables(deployment.AgentCPU, deployment.AgentMemoryMB, map[string]any{
+		"binary_path":  slashPath(deployment.AgentBinary),
+		"catalog_path": slashPath(deployment.Catalog),
+		"directory_state_path": slashPath(filepath.Join(
+			deployment.StateDir,
+			"agent",
+			"shard-leases.json",
+		)),
+		"accounts_db_path": slashPath(filepath.Join(
+			deployment.StateDir,
+			"agent",
+			"accounts.db",
+		)),
+		"host_network":            deployment.Network,
+		"nomad_namespace":         deployment.Namespace,
+		"agent_port":              deployment.AgentPort,
+		"agent_provisioning_port": deployment.AgentProvisioningPort,
+		"release_id":              deployment.AgentReleaseID,
+		"private_network":         boolEnvValue(deployment.PrivateNetwork),
+		"allowed_origins":         deployment.AllowedOrigins,
+		"identity_issuer":         deployment.IdentityIssuer,
+		"identity_jwks_url":       deployment.IdentityJWKSURL,
+		"bug_report_replay_default": boolEnvValue(
+			deployment.BugReports.ReplayDefault,
+		),
+		"bug_report_max_bytes": strconv.FormatInt(
+			deployment.BugReports.MaxBytes,
+			10,
+		),
+		"bug_report_directory": deployment.BugReports.Directory,
+		"maintenance_message":  deployment.PortOnly.maintenanceMessage(),
+		// deploy.py MAINTENANCE_GATE, the same file the GameWorld jobs
+		// carry: the Agent names a not-operating refusal MAINTENANCE
+		// only while this gate file exists (#2861).
+		"maintenance_gate_path": slashPath(filepath.Join(
+			deployment.StateDir,
+			"maintenance-gate.json",
+		)),
+	})
+}
+
+/*
+================
+gameVariables
+================
+*/
+func (deployment *deployment) gameVariables(
+	game shardDeployment,
+) map[string]any {
+	return deployment.nodeVariables(deployment.GameCPU, deployment.GameMemoryMB, deployment.PortOnly.jobVariables(map[string]any{
+		"shard_id":                         game.Definition.ID,
+		"binary_path":                      slashPath(deployment.GameBinary),
+		"catalog_path":                     slashPath(deployment.Catalog),
+		"authority_dir":                    slashPath(game.AuthorityDir),
+		"server_game_data_root":            slashPath(deployment.DataPaths.RuntimeRoot),
+		"server_game_data_manifest_digest": deployment.DataPaths.ManifestDigest,
+		"cert_dir": slashPath(filepath.Join(
+			deployment.StateDir,
+			"dev-certs",
+		)),
+		// deploy.py MAINTENANCE_GATE: present only inside a maintenance release.
+		"maintenance_gate_path": slashPath(filepath.Join(
+			deployment.StateDir,
+			"maintenance-gate.json",
+		)),
+		"transport_cert_file": deployment.TransportCert,
+		"transport_key_file":  deployment.TransportKey,
+		"transport_tls_id":    deployment.TransportTLSID,
+		"transport_wt_addr":   deployment.TransportWTAddr,
+		"host_network":        deployment.Network,
+		"nomad_namespace":     deployment.Namespace,
+		"control_port":        game.ControlPort,
+		"transport_port":      game.TransportPort,
+		"release_id":          deployment.GameReleaseID,
+		"private_network":     boolEnvValue(deployment.PrivateNetwork),
+		"allowed_origins":     deployment.AllowedOrigins,
+		"gm_characters":       deployment.GMCharacters,
+		"beta_mastery":        deployment.BetaMastery,
+		"stack_sizes":         deployment.StackSizes,
+		"public_api_addr":     game.PublicAPIAddr,
+		"transport_pprof":     boolEnvValue(game.PprofAddr != ""),
+		"pprof_addr":          pprofAddrValue(game.PprofAddr),
+	}))
+}
+
+/*
+================
+renderGameWorldTemplate
+================
+*/
+func renderGameWorldTemplate(template []byte, shardID string) []byte {
+	return bytes.ReplaceAll(
+		template,
+		[]byte(gameWorldShardToken),
+		[]byte(shardID),
+	)
+}
+
+/*
+================
+renderAgentTemplate
+================
+*/
+func renderAgentTemplate(
+	template []byte,
+	chunkCount int,
+) ([]byte, error) {
+	if bytes.Count(template, []byte(agentAccountToken)) != 1 {
+		return nil, fmt.Errorf(
+			"agent job template must contain exactly one %s token",
+			agentAccountToken,
+		)
+	}
+	if chunkCount < 1 {
+		return nil, fmt.Errorf("agent account catalog has no chunks")
+	}
+	if chunkCount > maxAccountChunks {
+		return nil, fmt.Errorf(
+			"agent account catalog requires %d chunks, limit is %d",
+			chunkCount,
+			maxAccountChunks,
+		)
+	}
+	var rendered strings.Builder
+	for index := 0; index < chunkCount; index++ {
+		fmt.Fprintf(
+			&rendered,
+			`{{ with nomadVar %q }}{{ .payload }}{{ end }}`,
+			accountChunkVariablePath(index),
+		)
+		rendered.WriteByte('\n')
+	}
+	return bytes.Replace(
+		template,
+		[]byte(agentAccountToken),
+		[]byte(rendered.String()),
+		1,
+	), nil
+}
+
+/*
+================
+chunkAccountCatalog
+================
+*/
+func chunkAccountCatalog(payload []byte) ([]string, error) {
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("file is empty")
+	}
+	if !utf8.Valid(payload) {
+		return nil, fmt.Errorf("file is not valid UTF-8")
+	}
+	chunks := make([]string, 0, (len(payload)/accountChunkBytes)+1)
+	for start := 0; start < len(payload); {
+		end := start + accountChunkBytes
+		if end >= len(payload) {
+			end = len(payload)
+		} else {
+			for end > start && !utf8.RuneStart(payload[end]) {
+				end--
+			}
+		}
+		if end == start {
+			return nil, fmt.Errorf(
+				"cannot split UTF-8 account catalog at byte %d",
+				start,
+			)
+		}
+		chunks = append(chunks, string(payload[start:end]))
+		start = end
+	}
+	return chunks, nil
+}
+
+/*
+================
+boolEnvValue
+================
+*/
+func boolEnvValue(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}
+
+/*
+================
+normalizeHostNetwork
+================
+*/
+func normalizeHostNetwork(name string, private bool) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("host network name is required")
+	}
+	if strings.EqualFold(name, "loopback") {
+		return "loopback", nil
+	}
+	if !private {
+		return "", fmt.Errorf(
+			"host network %q requires -private-network acknowledgment",
+			name,
+		)
+	}
+	return name, nil
+}
+
+/*
+================
+configuredGMCharacters
+
+Host-owned durable configuration survives deploys launched by another shell.
+An existing empty file deliberately revokes all grants, including dev defaults.
+================
+*/
+func configuredGMCharacters(raw, hostNetwork, stateDir string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		data, err := os.ReadFile(filepath.Join(stateDir, "gm-characters.txt"))
+		if err == nil {
+			value := strings.TrimSpace(string(data))
+			if _, err := store.ParseGMCharacters(value); err != nil {
+				return "", err
+			}
+			return value, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	return normalizeGMCharacters(raw, hostNetwork)
+}
+
+/*
+================
+normalizeGMCharacters
+================
+*/
+func normalizeGMCharacters(raw string, hostNetwork string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" && hostNetwork == "loopback" {
+		raw = developmentGMCharacters
+	}
+	if _, err := store.ParseGMCharacters(raw); err != nil {
+		return "", err
+	}
+	return raw, nil
+}
+
+/*
+================
+normalizeAllowedOrigins
+================
+*/
+func normalizeAllowedOrigins(raw string, hostNetwork string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if hostNetwork == "loopback" {
+			return developmentAllowedOrigins, nil
+		}
+		return "", fmt.Errorf(
+			"-allowed-origins is required for host network %q",
+			hostNetwork,
+		)
+	}
+
+	seen := make(map[string]struct{})
+	origins := make([]string, 0)
+	for _, candidate := range strings.Split(raw, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return "", fmt.Errorf(
+				"-allowed-origins contains an empty origin",
+			)
+		}
+		origin, err := url.Parse(candidate)
+		if err != nil {
+			return "", fmt.Errorf(
+				"allowed origin %q: %w",
+				candidate,
+				err,
+			)
+		}
+		scheme := strings.ToLower(origin.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return "", fmt.Errorf(
+				"allowed origin %q must use http or https",
+				candidate,
+			)
+		}
+		if origin.Host == "" ||
+			origin.Hostname() == "" ||
+			origin.User != nil ||
+			(origin.Path != "" && origin.Path != "/") ||
+			origin.RawQuery != "" ||
+			origin.Fragment != "" {
+			return "", fmt.Errorf(
+				"allowed origin %q must be an origin without "+
+					"credentials, path, query, or fragment",
+				candidate,
+			)
+		}
+		if portText := origin.Port(); portText != "" {
+			port, err := strconv.Atoi(portText)
+			if err != nil || port < 1 || port > 65535 {
+				return "", fmt.Errorf(
+					"allowed origin %q has an invalid port",
+					candidate,
+				)
+			}
+		}
+		if strings.Contains(origin.Host, "*") {
+			return "", fmt.Errorf(
+				"allowed origin %q cannot use a wildcard host",
+				candidate,
+			)
+		}
+		canonical := scheme +
+			"://" + strings.ToLower(origin.Host)
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		origins = append(origins, canonical)
+	}
+	sort.Strings(origins)
+	return strings.Join(origins, ","), nil
+}
+
+/*
+================
+requireRegularFile
+================
+*/
+func requireRegularFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("required file %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("required file %s is not regular", path)
+	}
+	return nil
+}
+
+/*
+================
+cleanAbsolute
+================
+*/
+func cleanAbsolute(path string) string {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(absolute)
+}
+
+/*
+================
+slashPath
+================
+*/
+func slashPath(path string) string {
+	return filepath.ToSlash(filepath.Clean(path))
+}
+
+/*
+================
+pprofAddrValue
+
+The pprof_addr job variable: the shard's listener, or the default for a
+shard that serves none (TRANSPORT_PPROF is then 0 and it is never bound).
+================
+*/
+func pprofAddrValue(addr string) string {
+	if addr == "" {
+		return transport.DefaultPprofAddr
+	}
+	return addr
+}

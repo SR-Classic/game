@@ -1,0 +1,301 @@
+/*
+===========================================================================
+
+checkStamps.mjs - input fingerprints and pass stamps for skippable gates
+
+A gate, or one step of a gate, is a function of the files and keys it
+reads. fingerprint() digests those inputs; a pass records the digest under
+.state/check-stamps/<name>.json; a later run with a recorded digest has
+nothing new to check. run_if_changed.mjs applies this to whole gates and
+check_go_server.mjs to each of its steps.
+
+Inputs are git pathspecs, `@command,arg,...` whose output joins the digest,
+`!path` for an ignored-by-git file that still counts, and `=text` for a
+literal key. A gate with several steps takes one snapshot() and digests
+each step's share of it with fingerprintOf().
+
+A stamp is only written after a pass, and any input change - a source
+edit, a new file, a toolchain upgrade - changes the fingerprint, so nothing
+is skipped for inputs it has not checked. SRO_CHECK_FORCE=1 ignores stamps.
+
+The stamps live in the main checkout's .state, shared by every worktree
+(ops #335 row 1): a fingerprint holds checkout-relative paths, git blob
+ids and digests of the shared trees, never a checkout's own path, so a
+pass in one worktree is a pass in another with the same files. Before
+that every fresh worktree paid the full gate once (the UI action census:
+173 s on 11-14). Writers race, so a stamp is replaced atomically and a
+torn or lost one only costs a rerun.
+
+===========================================================================
+*/
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { serverGameDataRoot } from "../build/world/paths.mjs";
+import { generatedPath, resolveMainCheckout } from "../lib/generatedRoot.mjs";
+
+const rebuildRoot = path.resolve( path.dirname( fileURLToPath( import.meta.url ) ), "..", ".." );
+const stampDirectory = path.join( resolveMainCheckout( rebuildRoot ), ".state", "check-stamps" );
+// Every worktree records into one list, so keep enough that switching
+// between a few branches still finds each one's pass.
+const RECENT_PASSES = 32;
+// Checkout-relative names of the trees a worktree may read from elsewhere.
+const GENERATED_PREFIX = ".generated/";
+const SERVER_GAME_DATA_PREFIX = "apps/server/.generated/game-data/1.150/server/";
+
+/*
+================
+git
+
+Runs a git command in the repository and returns its stdout lines.
+================
+*/
+function git( args ) {
+	const result = spawnSync( "git", args, {
+		windowsHide: true,
+		cwd: rebuildRoot,
+		encoding: "utf8",
+		maxBuffer: 256 * 1024 * 1024
+	} );
+	if ( result.status !== 0 ) {
+		throw new Error( `git ${args.join( " " )} failed: ${result.stderr}` );
+	}
+	return result.stdout.split( /\r?\n/ ).filter( ( line ) => line.length > 0 );
+}
+
+/*
+================
+gitAsync
+
+git without blocking the event loop, so independent calls overlap.
+================
+*/
+function gitAsync( args ) {
+	return new Promise( ( resolve, reject ) => {
+		const child = spawn( "git", args, { windowsHide: true, cwd: rebuildRoot } );
+		const chunks = [];
+		let errors = "";
+		child.stdout.on( "data", ( chunk ) => chunks.push( chunk ) );
+		child.stderr.on( "data", ( chunk ) => {
+			errors += chunk;
+		} );
+		child.on( "error", reject );
+		child.on( "close", ( code ) => {
+			if ( code !== 0 ) {
+				reject( new Error( `git ${args.join( " " )} failed: ${errors}` ) );
+				return;
+			}
+			resolve(
+				Buffer.concat( chunks ).toString( "utf8" ).split( /\r?\n/ ).filter( ( line ) => line.length > 0 )
+			);
+		} );
+	} );
+}
+
+/*
+================
+snapshotOf
+
+Builds the sorted [path, state] array from the three git listings.
+================
+*/
+function snapshotOf( tracked, modified, untracked ) {
+	const state = new Map();
+	for ( const line of tracked ) {
+		const tab = line.indexOf( "\t" );
+		state.set( line.slice( tab + 1 ), line.slice( 0, tab ) );
+	}
+	for ( const file of new Set( [ ...modified, ...untracked ] ) ) {
+		const absolute = path.join( rebuildRoot, file );
+		state.set(
+			file,
+			existsSync( absolute ) ?
+				"changed " + createHash( "sha256" ).update( readFileSync( absolute ) ).digest( "hex" ) :
+				"deleted"
+		);
+	}
+	return [ ...state ].sort( ( left, right ) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0) );
+}
+
+/*
+================
+snapshot
+
+The state of every file under the given pathspecs, in three git calls:
+tracked files contribute their index blob ids (`git ls-files -s`); files
+modified in the working tree and untracked, non-ignored files contribute
+the digest of their current content. That makes fingerprints exact without
+re-hashing the whole tree. Returns a sorted array of [path, state].
+================
+*/
+export function snapshot( paths ) {
+	if ( paths.length === 0 ) return [];
+	return snapshotOf(
+		git( [ "ls-files", "-s", "--", ...paths ] ),
+		git( [ "diff", "--name-only", "--", ...paths ] ),
+		git( [ "ls-files", "-o", "--exclude-standard", "--", ...paths ] )
+	);
+}
+
+/*
+================
+snapshotAsync
+
+snapshot() with the three git calls running concurrently.
+================
+*/
+export async function snapshotAsync( paths ) {
+	if ( paths.length === 0 ) return [];
+	const [tracked, modified, untracked] = await Promise.all( [
+		gitAsync( [ "ls-files", "-s", "--", ...paths ] ),
+		gitAsync( [ "diff", "--name-only", "--", ...paths ] ),
+		gitAsync( [ "ls-files", "-o", "--exclude-standard", "--", ...paths ] )
+	] );
+	return snapshotOf( tracked, modified, untracked );
+}
+
+/*
+================
+extraInputPath
+
+Where an `!path` input lives. Gates name generated files by their checkout
+path; a worktree reads the shared build through SRO_GENERATED_ROOT and the
+server projection through SRO_SERVER_GAME_DATA_ROOT, so the stamp must hash
+the file the gate actually reads, not a missing checkout-local copy.
+================
+*/
+function extraInputPath( relative ) {
+	if ( relative.startsWith( GENERATED_PREFIX ) ) return generatedPath( relative.slice( GENERATED_PREFIX.length ) );
+	if ( relative.startsWith( SERVER_GAME_DATA_PREFIX ) ) {
+		return path.join( serverGameDataRoot, relative.slice( SERVER_GAME_DATA_PREFIX.length ) );
+	}
+	return path.join( rebuildRoot, relative );
+}
+
+/*
+================
+keyOf
+
+The digest of one non-path input: `@command,arg,...` output, an `!path`
+file's bytes, or an `=text` literal.
+================
+*/
+function keyOf( input ) {
+	if ( input.startsWith( "@" ) ) {
+		const [command, ...args] = input.slice( 1 ).split( "," );
+		const result = spawnSync( command, args, {
+			windowsHide: true,
+			cwd: rebuildRoot,
+			encoding: "utf8",
+			shell: false
+		} );
+		return `command ${input}\n${result.stdout ?? ""}${result.stderr ?? ""}`;
+	}
+	if ( input.startsWith( "!" ) ) {
+		const absolute = extraInputPath( input.slice( 1 ) );
+		const bytes = existsSync( absolute ) ? readFileSync( absolute ) : "<missing>";
+		return `extra ${input}\n` + createHash( "sha256" ).update( bytes ).digest( "hex" );
+	}
+	return `key ${input}`;
+}
+
+/*
+================
+fingerprintOf
+
+Digests the snapshot entries a step reads (select(path) is true) together
+with its non-path inputs.
+================
+*/
+export function fingerprintOf( entries, select, keys ) {
+	const hash = createHash( "sha256" );
+	for ( const [file, state] of entries ) {
+		if ( select( file ) ) hash.update( `${state}\t${file}\n` );
+	}
+	for ( const input of keys ) hash.update( `${keyOf( input )}\n` );
+	return hash.digest( "hex" );
+}
+
+/*
+================
+fingerprint
+
+One gate's inputs: pathspecs, plus `@`, `!` and `=` keys.
+================
+*/
+export function fingerprint( inputs ) {
+	const paths = inputs.filter( ( input ) => !/^[@!=]/.test( input ) );
+	const keys = inputs.filter( ( input ) => /^[@!=]/.test( input ) );
+	return fingerprintOf( snapshot( paths ), () => true, keys );
+}
+
+/*
+================
+readPasses
+================
+*/
+function readPasses( name ) {
+	const file = stampPath( name );
+	if ( !existsSync( file ) ) return [];
+	try {
+		return [ JSON.parse( readFileSync( file, "utf8" ) ) ].flat();
+	} catch {
+		return []; // torn by a racing writer: no pass, so the gate runs
+	}
+}
+
+/*
+================
+stampPath
+
+Where one gate's passes are kept (the main checkout's, shared).
+================
+*/
+export function stampPath( name ) {
+	return path.join( stampDirectory, `${name}.json` );
+}
+
+/*
+================
+findPass
+
+The recorded pass for this fingerprint, or undefined. Always undefined
+under SRO_CHECK_FORCE=1.
+================
+*/
+export function findPass( name, key ) {
+	if ( process.env.SRO_CHECK_FORCE === "1" ) return undefined;
+	return readPasses( name ).find( ( pass ) => pass.fingerprint === key );
+}
+
+/*
+================
+recordPass
+
+Keeps the most recent passes, so reverting an edit or switching back to a
+branch that already passed is a skip too.
+================
+*/
+export function recordPass( name, key ) {
+	mkdirSync( stampDirectory, { recursive: true } );
+	const recent = [
+		{ fingerprint: key, passedAt: new Date().toISOString() },
+		...readPasses( name ).filter( ( pass ) => pass.fingerprint !== key )
+	].slice( 0, RECENT_PASSES );
+	const file = stampPath( name ), temporary = `${file}.${process.pid}`;
+	writeFileSync( temporary, `${JSON.stringify( recent )}\n` );
+	try {
+		renameSync( temporary, file );
+	} catch ( error ) {
+		// Windows refuses a rename over a file another worktree is replacing
+		// (EPERM/EBUSY); that writer's list stands and this pass reruns once.
+		try {
+			rmSync( temporary, { force: true } );
+		} catch {
+			// a temporary that cannot be removed is litter, never a failed gate
+		}
+		console.log( `check stamp ${name}: not saved (${error.code ?? error.message})` );
+	}
+}

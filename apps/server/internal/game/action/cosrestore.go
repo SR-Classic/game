@@ -1,0 +1,140 @@
+/*
+===========================================================================
+
+cosrestore.go - restore the riding relation before entry serialization
+
+A newly admitted actor recreates its saved vehicle beside the owner, then
+binds it before bootstrap projects speed and ride state. An existing logical
+actor retains its current parked vehicle on repeated transport admission.
+
+===========================================================================
+*/
+package action
+
+import (
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"strings"
+)
+
+/*
+================
+restoreCharacterCOS
+
+The reference server recreates saved nonpersistent vehicles and mounts them when usable.
+The caller holds the division lock. This updates authority before packets
+are composed; bootstrap never invents a relation solely for presentation.
+================
+*/
+func (rt *Runtime) restoreCharacterCOS(division, name string) {
+	rt.petMu.Lock()
+	resident := rt.petSessions[petOwnerKey{division: division, name: strings.ToLower(name)}] != nil
+	rt.petMu.Unlock()
+	if resident {
+		return
+	}
+	c := rt.findCharacter(division, name)
+	refs, ok := rt.deps.ItemReferences().(enterworld.CharacterRefSource)
+	if c == nil || !ok {
+		return
+	}
+	rt.deps.Update(c, "restore-cos-ride", func() bool {
+		changed := false
+		// Legacy records are adopted only by their matching summoner slot.
+		// Never fabricate an item or overwrite another retained companion.
+		if legacy := c.ActiveCOS; legacy != nil {
+			if ref, valid := rt.cosReference(legacy); valid && (ref.TidWord>>11 == 3 || ref.TidWord>>11 == 4) {
+				for i := range c.MissionInventory {
+					row := &c.MissionInventory[i]
+					item, found := rt.deps.ItemReferences().ItemRefByCodename(row.Codename)
+					if row.Slot == int64(legacy.InventorySlot) && row.Summon == nil && found && item != nil && wire.IsCosSummoner(item.TypeFlags()) && uint16(item.TypeIDs[3]+2) == ref.TidWord>>11 {
+						row.Summon = legacy
+						c.ActiveCOS = nil
+						changed = true
+						break
+					}
+				}
+			}
+		}
+		now := rt.Now().Unix()
+		for i := range c.MissionInventory {
+			row := &c.MissionInventory[i]
+			pet := row.Summon
+			if pet == nil {
+				continue
+			}
+			before := *pet
+			pet.ResolveStacks = 0
+			pet.ArcaneMagicPercent = 0
+			rt.wolfHowls.Lock()
+			delete(rt.wolfHowls.arcane, petOwnerKey{division: division, name: strings.ToLower(c.Name), gid: pet.GID})
+			rt.wolfHowls.Unlock()
+			changed = pet.RefreshRentalTimes(now) || changed
+			ref, valid := rt.cosReference(pet)
+			if !valid || row.Slot < 0 || row.Slot > 255 {
+				continue
+			}
+			pet.InventorySlot = uint8(row.Slot)
+			// The grab pet page rule raises a retained bag on restore; it
+			// is never lowered, so every row survives the change either way.
+			if pet.Container != nil {
+				if raised := rt.PetInventoryPages.GrabCapacity(pet.Container.Capacity); raised != pet.Container.Capacity {
+					pet.Container.Capacity = raised
+					changed = true
+				}
+			}
+			if rt.AttackPetExpansion && ref.TidWord>>11 == attackPetBand && pet.CurrentHP > ref.MaxHP {
+				pet.CurrentHP = ref.MaxHP
+				changed = true
+			}
+			// The reference server restores only records whose alive and summoned bits are set.
+			// A retained corpse remains on the item for revival, not in the world.
+			if pet.CurrentHP == 0 || pet.StateFlags&1 == 0 || (ref.TidWord>>11 == 4 && pet.RentalExpiresAtUnix <= now) {
+				pet.Summoned = false
+				pet.StateFlags &^= cosStateSummoned
+			}
+			if pet.Summoned {
+				pet.GID, _ = enterworld.PersistentCOSObjectID(c, ref.TidWord>>11)
+			}
+			if before.StateFlags != pet.StateFlags || before.GID != pet.GID || before.Summoned != pet.Summoned || before.RentalRemainingSeconds != pet.RentalRemainingSeconds || before.InventorySlot != pet.InventorySlot {
+				changed = true
+			}
+		}
+		kept := make([]*enterworld.CharacterCOS, 0, len(c.Mercenaries))
+		for _, soldier := range c.Mercenaries {
+			ref, valid := rt.cosReference(soldier)
+			if !valid || ref.TidWord>>11 != 5 || !c.OwnsMercenaryID(soldier.GID) || soldier.CurrentHP == 0 || !soldier.Summoned || soldier.RentalExpiresAtUnix <= now {
+				changed = true
+				continue
+			}
+			changed = soldier.RefreshRentalTimes(now) || changed
+			kept = append(kept, soldier)
+		}
+		c.Mercenaries = kept
+		pet := c.ActiveCOS
+		if pet == nil || !pet.Summoned || pet.CurrentHP == 0 {
+			return changed
+		}
+		ref, found := refs.CharacterRefByCodename(pet.Codename)
+		if !found || ref == nil || ref.RefObjID != pet.RefObjID || !ref.CanRide || ref.TidWord&0x7fe != 0x1c6 || (ref.TidWord>>11 != 1 && ref.TidWord>>11 != 2) {
+			return changed
+		}
+		// A transport summoned before summons kept the reference capacity
+		// (itemuse.go) was saved without its cargo bag; it
+		// comes back with the authored one.
+		if pet.Container == nil && ref.InventoryCapacity > 0 {
+			pet.Container = &domain.COSContainer{Capacity: rt.PetInventoryPages.TransportCapacity(ref.InventoryCapacity)}
+			changed = true
+		} else if pet.Container != nil {
+			if raised := rt.PetInventoryPages.TransportCapacity(pet.Container.Capacity); raised != pet.Container.Capacity {
+				pet.Container.Capacity = raised
+				changed = true
+			}
+		}
+		changed = changed || !pet.Mounted
+		rt.mountCompanion(division, c, pet, rt.Now().UnixMilli())
+		rt.refreshCosAbnormalSpeed(rt.newCosAbnormalOwner(division, c, rt.Now().UnixMilli()))
+		return changed
+	})
+}

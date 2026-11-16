@@ -1,0 +1,120 @@
+/*
+===========================================================================
+
+playable-session.mjs - authenticated scratch-character browser admission
+
+The optional pre-login hook admits diagnostic transport faults before any
+world socket exists. Ordinary probes use the same unmodified login path.
+
+===========================================================================
+*/
+import assert from "node:assert/strict";
+import { CLIENT_NEXT_BASE_URL } from "../../../../../scripts/lib/probeEndpoints.mjs";
+import { resolveProbeCredentials, resolveProbeDivisionId } from "../../../../../scripts/lib/probeSession.mjs";
+import { assertCharacterAllowed } from "../../../../../scripts/lib/probeCharacter.mjs";
+
+const WORLD_POLL_MS = 250;
+
+/*
+================
+bindPlayableRuntime
+
+The runtime belongs to the page's own entry module. On the dev server that
+is /src/bootstrap.ts. A bench bundle (pnpm build:bench) re-exports it from
+/assets/bench-runtime.js, a facade over the chunk the page already ran, so
+importing it returns that same runtime, never a second one. A release bundle
+has neither, on purpose, so binding to one fails with the reason.
+================
+*/
+export async function bindPlayableRuntime( page ) {
+	await page.evaluate( async () => {
+		// The exact href the page loaded, query included: another URL for the
+		// same file would be a second module instance with a second runtime.
+		const dev = [ ...document.querySelectorAll( 'script[type="module"][src]' ) ]
+			.map( script => new URL( script.getAttribute( "src" ) ?? "", location.href ) )
+			.find( url => url.origin === location.origin && url.pathname === "/src/bootstrap.ts" );
+		const url = dev ? dev.href : new URL( "/assets/bench-runtime.js", location.href ).href;
+		let runtime;
+		try {
+			runtime = (await import( url )).runtime;
+		} catch ( error ) {
+			throw Error(
+				`${url} did not load (${error}): benchmark the dev server or a bench bundle (pnpm build:bench)`
+			);
+		}
+		if ( !runtime ) throw Error( `${url} exports no runtime` );
+		globalThis.__playableRuntime = runtime;
+	} );
+}
+/*
+================
+waitPlayableWorld
+
+Polls on a timer: Playwright's default animation-frame polling never runs
+in a hidden tab, where a background entry must still be observed.
+================
+*/
+export async function waitPlayableWorld( page, character ) {
+	await page.waitForFunction(
+		character => {
+			const state = __playableRuntime.sessionState();
+			if (
+				state?.phase === "failed" || state?.phase === "disconnected" ||
+				state?.phase === "character-select" && state.error
+			) throw Error( state.error ?? "World admission failed" );
+			return state?.phase === "world" && state.character === character &&
+				/Frontend: world\n/.test( document.querySelector( "output" )?.textContent );
+		},
+		character,
+		{ timeout: 60000, polling: WORLD_POLL_MS }
+	);
+}
+/*
+================
+enterPlayableSession
+
+Log in and press Enter for the scratch character, without waiting for the
+world. A probe that changes the page between entry and arrival (a hidden
+tab) starts here; everything else uses bootPlayableSession.
+================
+*/
+/** @param {((page: import('playwright-core').Page) => Promise<void>) | undefined} [beforeLogin] */
+export async function enterPlayableSession( page, name, beforeLogin = undefined ) {
+	const character = assertCharacterAllowed( name, { context: "client-next playable skill acceptance" } );
+	await page.setViewportSize( { width: 1024, height: 768 } );
+	await page.route( "**/character/list", async route => {
+		const response = await route.fetch(), body = await response.json();
+		assert.ok( body.characters.some( row => row.name === character ), "scratch character must exist" );
+		await route.fulfill( {
+			response,
+			json: { ...body, characters: body.characters.filter( row => row.name === character ) }
+		} );
+	} );
+	await page.goto( CLIENT_NEXT_BASE_URL );
+	await bindPlayableRuntime( page );
+	await page.waitForFunction( () => __playableRuntime.sessionState()?.phase === "signed-out" );
+	if ( beforeLogin ) await beforeLogin( page );
+	const { loginId, loginPassword } = resolveProbeCredentials(), serverId = resolveProbeDivisionId();
+	await page.evaluate(
+		( { id, password, serverId } ) =>
+			__playableRuntime.session( { kind: "login", apiBase: location.origin + "/api", id, password, serverId } ),
+		{ id: loginId, password: loginPassword, serverId }
+	);
+	await page.locator( '[data-ui-id="frontend:create"]' ).waitFor( { timeout: 30000 } );
+	await page.mouse.click( 505, 430 );
+	await page.locator( '[data-ui-id="enter"]' ).waitFor();
+	await page.waitForFunction( () => document.querySelector( '[data-ui-id="enter"]' )?.disabled === false );
+	await page.locator( '[data-ui-id="enter"]' ).click();
+	return character;
+}
+/*
+================
+bootPlayableSession
+================
+*/
+/** @param {((page: import('playwright-core').Page) => Promise<void>) | undefined} [beforeLogin] */
+export async function bootPlayableSession( page, name, beforeLogin = undefined ) {
+	const character = await enterPlayableSession( page, name, beforeLogin );
+	await waitPlayableWorld( page, character );
+	return character;
+}

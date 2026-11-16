@@ -1,0 +1,140 @@
+/*
+===========================================================================
+
+skillstatuscast.go - complete damage-free hostile status programs
+
+The Wizard's Root, Mesh Root and Lightning Shock, the Warrior's Axis
+Quiver, the Rogue's Poison Field and the Chinese Frost Nova carry no att
+block: the cast is one
+successful zero-damage record whose only consequences are the server's
+status roll and the authored aggression. Admission is by executable
+shape, never by skill name.
+
+===========================================================================
+*/
+
+package enterworld
+
+import "opensro.online/server/internal/game/abnormal"
+
+const (
+	// tagStatusThreat is tant, authored on every damage-free status cast.
+	// The parameter index binds +3C8; the server applies its percentage, then
+	// adds its flat word. It takes precedence over tnt2 (+3CC).
+	// Shipped status casts author zero percent, leaving only the flat word.
+	tagStatusThreat = 0x74616e74
+
+	// statusCastSelect is the efr +0x14 mask of most offense areas: hostile
+	// characters (0x08) and non-character objects (0x10). Mana Drought
+	// authors statusCastPlayers, hostile characters alone.
+	statusCastSelect  = 24
+	statusCastPlayers = 8
+
+	// statusCastContinueColumn is ContinueBasicAttack (skilldata column 19).
+	// Axis Quiver authors 1; the combat intent resumes the basic attack
+	// after the skill generically (basicattack.go; the server accepts exactly 1),
+	// so the flag needs nothing from this owner. Any byte is admissible here.
+	statusCastContinueColumn = continueBasicAttackColumn
+)
+
+/*
+================
+compileSkillStatusCast
+
+The server's hit stage emits a successful zero-damage record for a program
+without att, as it does for taunts. Admit a row when its complete program is status
+blocks plus aggression, caster getv modifiers, reqi equipment pairs and
+an optional primary-centered area. Aggression is tant or tnt2 (Axis
+Quiver); with both, tant wins. The server admits tnt2 without att and
+emits a successful zero-damage record (compileSkillTaunt). reqi pairs are stored
+on row.Reqi by noteParameterIndex and enforced before dispatch
+(action.skillEquipmentRefusal, 0x300D); Poison Field authors two of them,
+so reqi, like getv, may repeat. A targeted row names an enemy (Enemy_M or
+Enemy_P, column 29): Mana Drain and Mana Drought author Enemy_P alone and
+apply Combustion (csmp) to players. The server's target-permission check
+judges player targets only, so the server refuses nothing for a
+monster. A targeted area selects around its primary (efr shape 2) with
+select 24 or, for Mana Drought, 8 (players). An untargeted row selects
+its hostile victims around the caster (efr shape 1, select 24) and leaves
+the target columns empty (Lightning Impact).
+================
+*/
+func compileSkillStatusCast(fields []string, row SkillRow) (SkillThreat, bool) {
+	if len(fields) != 118 || fields[0] != "1" || fields[8] != "2" || fields[68] != "0" ||
+		!row.TimingPinned || !row.Consumption.Pinned || !row.ActionRangePinned ||
+		row.TargetRequired && !row.Targets.EnemyM && !row.Targets.EnemyP ||
+		row.ChainSub || row.ChainNext != 0 || row.Attack.Present {
+		return SkillThreat{}, false
+	}
+	// Frost Nova authors no action duration: the release ends the action
+	// at once (the close is queued at release + 0). Nothing in the server's
+	// hit stage reads
+	// column 13.
+	// No projectile, no ground target, no secondary-target columns.
+	for _, column := range []int{15, 16, 17, 20, 24, 25, 26, 27, 28, 31, 32, 33, 56} {
+		if fields[column] != "0" {
+			return SkillThreat{}, false
+		}
+	}
+	if _, ok := textdataByte(fields[statusCastContinueColumn]); !ok {
+		return SkillThreat{}, false
+	}
+	program, err := CompileSkillProgram(fields)
+	if err != nil {
+		return SkillThreat{}, false
+	}
+	var threat SkillThreat
+	statuses := 0
+	seen := make(map[uint32]bool)
+	statusThreat := false
+	for i := 0; i < program.Len(); i++ {
+		op := program.Instruction(i)
+		if seen[op.Tag] && op.Tag != tagGetv && op.Tag != tagReqi {
+			return SkillThreat{}, false
+		}
+		seen[op.Tag] = true
+		if _, found := abnormal.SourceIndex(op.Tag); found {
+			statuses++
+			continue
+		}
+		switch op.Tag {
+		case tagStatusThreat:
+			// A present tant takes the record's aggression and the
+			// tnt2 block is skipped, in whichever order the row authors them.
+			threat.Present, threat.Flat, threat.Percent = true, op.Arguments[0], op.Arguments[1]
+			statusThreat = true
+		case tagThreat:
+			if !statusThreat {
+				threat.Present, threat.Flat, threat.Percent = true, op.Arguments[0], op.Arguments[1]
+			}
+		case tagReqi: // row.Reqi; admitted before dispatch
+		case tagGetv: // caster getv modifiers (WIMD, WIRU, RPDU, RPTU) read at cast
+			if _, known := SkillParameterFromKey(op.Arguments[0]); !known {
+				return SkillThreat{}, false
+			}
+		case tagEfr:
+			a := op.Arguments
+			// A targeted row centres on its primary (shape 2) or selects
+			// along the line to it (shapes 3 and 4, Frost Nova A to C;
+			// skillarea_directional.go); an untargeted row centres on the
+			// caster (shape 1, Lightning Impact, Frost Nova D).
+			shapeOK := a[1] == 1
+			if row.TargetRequired {
+				shapeOK = a[1] >= 2 && a[1] <= 4
+			}
+			if a[0] != 1 || !shapeOK || a[2] == 0 || a[2] > 0xffff ||
+				a[3] == 0 || a[3] > 255 || a[4] > 100 ||
+				a[5] != statusCastSelect && (a[5] != statusCastPlayers || !row.TargetRequired) {
+				return SkillThreat{}, false
+			}
+			threat.Area = SkillOffensiveArea{Shape: uint8(a[1]), Radius: a[2], MaxTargets: uint8(a[3]),
+				ReductionPercent: uint8(a[4]), Select: uint8(a[5])}
+		default:
+			return SkillThreat{}, false
+		}
+	}
+	if statuses == 0 || !row.Abnormal.Present() || !row.TargetRequired && threat.Area.Radius == 0 {
+		return SkillThreat{}, false
+	}
+	return threat, true
+}

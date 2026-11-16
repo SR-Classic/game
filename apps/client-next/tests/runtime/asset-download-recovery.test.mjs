@@ -1,0 +1,868 @@
+/*
+===========================================================================
+
+asset-download-recovery.test.mjs - bounded recovery at the asset transport
+
+Exercise the shipping worker with failed fetches and interrupted bodies.
+Mock time keeps backoff deterministic; cancellation and byte-budget failures
+must retain their original meaning. A download that receives nothing for
+15 s, waiting for headers or mid-body, is abandoned and retried as a
+transport failure; any received byte restarts that window.
+
+===========================================================================
+*/
+import "../helpers/native-source-loader.mjs";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+const { createLoader, transientAssetFault } = await import( "../../src/engine/runtime/assets/worker/loader.ts" );
+const { NO_PROGRESS_MS, settle, fixture, packedAsset, stallingBody } = await import( "../helpers/asset-download.mjs" );
+
+for ( const status of [ null, 408, 429, 500, 502, 503, 504 ] ) {
+	test(`asset transport recovers after ${status ?? "network rejection"}`, async t => {
+		let attempts = 0;
+		const { messages } = fixture( t, async () => {
+			if ( ++attempts === 1 ) {
+				if ( status === null ) throw new TypeError( "Load failed" );
+				return new Response( "unavailable", { status } );
+			}
+			return new Response( Uint8Array.of( 1, 2, 3 ) );
+		} );
+		await settle();
+		assert.equal( attempts, 1 );
+		assert.equal( messages.length, 0 );
+		t.mock.timers.tick( 249 );
+		await settle();
+		assert.equal( attempts, 1 );
+		t.mock.timers.tick( 1 );
+		await settle();
+		assert.equal( attempts, 2 );
+		assert.equal( messages.length, 1 );
+		assert.equal( messages[0].kind, "bytes" );
+		assert.deepEqual( [ ...new Uint8Array( messages[0].buffer ) ], [ 1, 2, 3 ] );
+	});
+}
+
+test("interrupted response body restarts the read without publishing partial bytes", async t => {
+	let attempts = 0;
+	const { messages } = fixture( t, async () => {
+		if ( ++attempts !== 1 ) return new Response( Uint8Array.of( 4, 5, 6 ) );
+		let reads = 0;
+		return new Response(
+			new ReadableStream( {
+				/*
+			================
+			pull
+			================
+			*/
+				pull( controller ) {
+					if ( reads++ === 0 ) controller.enqueue( Uint8Array.of( 9 ) );
+					else controller.error( new TypeError( "Load failed" ) );
+				}
+			} )
+		);
+	} );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2 );
+	assert.equal( messages.length, 1 );
+	assert.deepEqual( [ ...new Uint8Array( messages[0].buffer ) ], [ 4, 5, 6 ] );
+});
+
+test("persistent transport failure exhausts exactly three attempts", async t => {
+	let attempts = 0;
+	const { messages } = fixture( t, async () => {
+		attempts++;
+		throw new TypeError( "Load failed" );
+	} );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2 );
+	t.mock.timers.tick( 999 );
+	await settle();
+	assert.equal( attempts, 2 );
+	t.mock.timers.tick( 1 );
+	await settle();
+	assert.equal( attempts, 3 );
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.match( messages[0].error, /Load failed/ );
+	assert.equal( messages[0].transient, true );
+	t.mock.timers.tick( 60000 );
+	await settle();
+	assert.equal( attempts, 3 );
+});
+
+for ( const dispose of [ false, true ] ) {
+	test(`backoff is cancelled promptly by ${dispose ? "disposal" : "request cancellation"}`, async t => {
+		let attempts = 0;
+		const { loader, messages } = fixture( t, async () => {
+			attempts++;
+			throw new TypeError( "Load failed" );
+		} );
+		await settle();
+		if ( dispose ) loader.dispose();
+		else loader.receive( { kind: "cancel", id: 1 } );
+		await settle();
+		assert.deepEqual( messages, dispose ? [] : [ { kind: "released", id: 1 } ] );
+		t.mock.timers.tick( 60000 );
+		await settle();
+		assert.equal( attempts, 1 );
+	});
+}
+
+for ( const status of [ 400, 401, 403, 404, 410 ] ) {
+	test(`permanent HTTP ${status} is not retried`, async t => {
+		let attempts = 0;
+		const { messages } = fixture( t, async () => {
+			attempts++;
+			return new Response( "unavailable", { status } );
+		} );
+		await settle();
+		t.mock.timers.tick( 60000 );
+		await settle();
+		assert.equal( attempts, 1 );
+		assert.equal( messages[0].kind, "error" );
+		assert.match( messages[0].error, new RegExp( `Asset HTTP ${status}` ) );
+		assert.equal( messages[0].transient, undefined );
+	});
+}
+
+test("oversized response remains a permanent byte-budget failure", async t => {
+	let attempts = 0;
+	const { messages } = fixture( t, async () => {
+		attempts++;
+		return new Response( Uint8Array.of( 1, 2, 3, 4 ) );
+	} );
+	await settle();
+	t.mock.timers.tick( 60000 );
+	await settle();
+	assert.equal( attempts, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.match( messages[0].error, /byte limit/ );
+	assert.equal( messages[0].transient, undefined );
+});
+
+/*
+================
+failedBody
+================
+*/
+function failedBody() {
+	return new ReadableStream( {
+		/*
+		================
+		start
+		================
+		*/
+		start( controller ) {
+			controller.error( new TypeError( "body disconnected" ) );
+		}
+	} );
+}
+
+test("HTTP failure survives a rejected response-body cleanup", async t => {
+	let attempts = 0;
+	const { messages } = fixture( t, async () => {
+		attempts++;
+		return new Response( failedBody(), { status: 404 } );
+	} );
+	await settle();
+	t.mock.timers.tick( 60000 );
+	await settle();
+	assert.equal( attempts, 1 );
+	assert.match( messages[0].error, /Asset HTTP 404/ );
+});
+
+test("a listed file answered 404 is marked stale", async t => {
+	// The release watch reads stale as the publish replacing this page's files.
+	const gone = fixture( t, async () => new Response( "gone", { status: 404 } ) );
+	await settle();
+	assert.equal( gone.messages[0].kind, "error" );
+	assert.equal( gone.messages[0].stale, true );
+});
+
+test("a refused request is not stale", async t => {
+	const refused = fixture( t, async () => new Response( "forbidden", { status: 403 } ) );
+	await settle();
+	assert.equal( refused.messages[0].kind, "error" );
+	assert.equal( refused.messages[0].stale, undefined );
+});
+
+for ( const dispose of [ false, true ] ) {
+	test( `shared member backoff respects ${dispose ? "owner disposal" : "subscriber cancellation"}`, {
+		timeout: 10000
+	}, async t => {
+		t.mock.timers.enable( { apis: [ "setTimeout" ] } );
+		// Backoff and cancellation are the subject: a plain member keeps the
+		// delivery free of real decompression work (#1595).
+		const asset = packedAsset( false ), messages = [];
+		let deliver = () => {};
+		/** @type {Promise<void>} */
+		const deliveredResult = new Promise( resolve => {
+			deliver = resolve;
+		} );
+		let attempts = 0;
+		/** @type {{ signal?: AbortSignal }} */
+		const transport = {};
+		t.mock.method( globalThis, "fetch", async ( url, options ) => {
+			if ( !asset.isMember( options ) ) return asset.serve( url, options );
+			transport.signal = options.signal ?? undefined;
+			if ( ++attempts === 1 ) throw new TypeError( "Load failed" );
+			return asset.serve( url, options );
+		} );
+		const loader = createLoader( message => {
+			if (
+				![ "progress", "job-progress", "job-decoding", "job-fetching", "hd-availability" ].includes(
+					message.kind
+				)
+			) {
+				messages.push( message );
+			}
+			if ( message.kind === "bytes" || message.kind === "error" ) deliver();
+		} );
+		t.after( () => loader.dispose() );
+		for ( const id of [ 1, 2 ] ) {
+			loader.receive( { kind: "load", id, url: `https://example.test${asset.path}`, limit: asset.bytes.length } );
+		}
+		await settle();
+		assert.equal( attempts, 1 );
+		if ( dispose ) loader.dispose();
+		else loader.receive( { kind: "cancel", id: 1 } );
+		// Each attempt fetches under its own signal (the no-progress window), and
+		// the first attempt has already ended: the owner's signal is what stops
+		// the backoff, which the attempt count below proves.
+		assert.ok( transport.signal );
+		t.mock.timers.tick( 250 );
+		// The plain member decodes with no stream work; only its 4 KiB SHA-256
+		// remains asynchronous, so the result follows within a few turns.
+		if ( !dispose ) await deliveredResult;
+		else await settle();
+		if ( dispose ) {
+			assert.equal( attempts, 1 );
+			assert.deepEqual( messages, [] );
+		} else {
+			assert.equal( attempts, 2 );
+			const delivered = messages.filter( row => row.kind === "bytes" );
+			assert.equal( delivered.length, 1 );
+			assert.equal( delivered[0].id, 2 );
+			assert.deepEqual( new Uint8Array( delivered[0].buffer ), asset.bytes );
+			assert.ok( !messages.some( row => row.kind === "error" ) );
+		}
+	} );
+}
+
+test("invalid range is a transient transport failure even when response cleanup rejects", async t => {
+	// A proxy that answers a ranged read with the wrong shape (here a 206
+	// naming some other range) is a transport fact, not bad content: the
+	// read retries on the download budget and ends marked transient for
+	// the bounded recovery (#2337).
+	t.mock.timers.enable( { apis: [ "setTimeout" ] } );
+	const asset = packedAsset(), messages = [];
+	let attempts = 0;
+	t.mock.method( globalThis, "fetch", async url => {
+		if ( url.endsWith( "/manifest.json" ) ) return Response.json( asset.manifest );
+		attempts++;
+		return new Response( failedBody(), { status: 206, headers: { "Content-Range": "bytes 0-9/10" } } );
+	} );
+	const loader = createLoader( message => {
+		if (
+			![ "progress", "job-progress", "job-decoding", "job-fetching", "hd-availability" ].includes( message.kind )
+		) {
+			messages.push( message );
+		}
+	} );
+	t.after( () => loader.dispose() );
+	loader.receive( { kind: "load", id: 1, url: `https://example.test${asset.path}`, limit: asset.bytes.length } );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2 );
+	t.mock.timers.tick( 1000 );
+	await settle();
+	assert.equal( attempts, 3 );
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.match( messages[0].error, /Invalid asset range response/ );
+	assert.equal( messages[0].transient, true );
+});
+
+/*
+================
+hangingFetch
+
+A fetch that never answers until its signal aborts, as a stalled connection
+does, and records how each attempt ended.
+================
+*/
+function hangingFetch( ended ) {
+	return ( url, options ) =>
+		new Promise( ( resolve, reject ) => {
+			options.signal.addEventListener( "abort", () => {
+				ended.push( "aborted" );
+				reject( options.signal.reason );
+			}, { once: true } );
+		} );
+}
+
+test("a request with no headers for the no-progress window is retried, then answered as transient", async t => {
+	const ended = [];
+	let attempts = 0;
+	const { messages } = fixture( t, ( url, options ) => {
+		attempts++;
+		return hangingFetch( ended )( url, options );
+	} );
+	await settle();
+	t.mock.timers.tick( NO_PROGRESS_MS - 1 );
+	await settle();
+	assert.equal( attempts, 1, "no abort before the window ends" );
+	t.mock.timers.tick( 1 );
+	await settle();
+	assert.deepEqual( ended, [ "aborted" ] );
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2 );
+	t.mock.timers.tick( NO_PROGRESS_MS );
+	await settle();
+	t.mock.timers.tick( 1000 );
+	await settle();
+	assert.equal( attempts, 3 );
+	t.mock.timers.tick( NO_PROGRESS_MS );
+	await settle();
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.match( messages[0].error, /No download progress for 15000 ms/ );
+	assert.equal( messages[0].transient, true );
+});
+
+test("a body that stalls mid-read is abandoned and retried without publishing partial bytes", async t => {
+	let attempts = 0;
+	const { messages } = fixture(
+		t,
+		async () => ++attempts === 1 ? stallingBody( [ Uint8Array.of( 9 ) ] ) : new Response( Uint8Array.of( 4, 5, 6 ) )
+	);
+	await settle();
+	t.mock.timers.tick( NO_PROGRESS_MS );
+	await settle();
+	assert.equal( messages.length, 0 );
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2 );
+	assert.equal( messages.length, 1 );
+	assert.deepEqual( [ ...new Uint8Array( messages[0].buffer ) ], [ 4, 5, 6 ] );
+});
+
+test("every received chunk restarts the window; an empty chunk does not", async t => {
+	const pulls = [];
+	let attempts = 0;
+	const { messages } = fixture( t, async () => {
+		if ( ++attempts > 1 ) return new Response( Uint8Array.of( 4, 5, 6 ) );
+		return new Response(
+			new ReadableStream( {
+				/*
+				================
+				pull
+				================
+				*/
+				pull( controller ) {
+					return new Promise( resolve => {
+						pulls.push( chunk => {
+							if ( chunk === null ) controller.close();
+							else controller.enqueue( chunk );
+							resolve();
+						} );
+					} );
+				}
+			} )
+		);
+	} );
+	await settle();
+	// Real bytes every 10 s keep a slow download alive past the window.
+	for ( let i = 0; i < 2; i++ ) {
+		t.mock.timers.tick( 10000 );
+		pulls.shift()( Uint8Array.of( i ) );
+		await settle();
+	}
+	assert.equal( attempts, 1, "a progressing download is not abandoned" );
+	// An empty chunk is not progress: 15 s after the last byte, it stalls.
+	t.mock.timers.tick( 10000 );
+	pulls.shift()( new Uint8Array( 0 ) );
+	await settle();
+	t.mock.timers.tick( 5000 );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2, "the empty chunk did not restart the window" );
+	assert.equal( messages.length, 1 );
+	assert.deepEqual( [ ...new Uint8Array( messages[0].buffer ) ], [ 4, 5, 6 ], "no partial first-attempt bytes" );
+});
+
+test("the caller's cancellation during a stalled request stays a cancellation", async t => {
+	const ended = [];
+	const { loader, messages } = fixture( t, hangingFetch( ended ) );
+	await settle();
+	t.mock.timers.tick( NO_PROGRESS_MS - 1 );
+	loader.receive( { kind: "cancel", id: 1 } );
+	await settle();
+	assert.deepEqual( messages, [ { kind: "released", id: 1 } ] );
+	t.mock.timers.tick( 60000 );
+	await settle();
+	assert.deepEqual( ended, [ "aborted" ], "one attempt, ended by the caller, never retried" );
+});
+
+test("a cancellation that arrives after its job settled is still acknowledged", async t => {
+	// #2871: the execution finishes while the caller's cancel is still
+	// queued (the worker was inside a decode it could not interrupt).
+	// The job leaves the worker's table as it settles, but the caller's
+	// slot is freed by the acknowledgement: dropping the cancel here
+	// strands the slot and reports a healthy worker as unanswering.
+	const { loader, messages } = fixture( t, async () => new Response( Uint8Array.of( 1, 2, 3 ) ) );
+	await settle();
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "bytes" );
+	loader.receive( { kind: "cancel", id: 1 } );
+	await settle();
+	assert.deepEqual( messages[1], { kind: "released", id: 1 } );
+});
+
+test("a stalled body whose cancel never settles still frees the attempt for its retry", async t => {
+	let attempts = 0;
+	const { messages } = fixture( t, async () => {
+		if ( ++attempts > 1 ) return new Response( Uint8Array.of( 4, 5, 6 ) );
+		return new Response(
+			new ReadableStream( {
+				/*
+				================
+				pull
+				================
+				*/
+				pull() {
+					return new Promise( () => {} );
+				},
+				/*
+				================
+				cancel
+				================
+				*/
+				cancel() {
+					return new Promise( () => {} );
+				}
+			} )
+		);
+	} );
+	await settle();
+	t.mock.timers.tick( NO_PROGRESS_MS );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2, "the hanging cleanup did not hold the request" );
+	assert.equal( messages.length, 1 );
+	assert.deepEqual( [ ...new Uint8Array( messages[0].buffer ) ], [ 4, 5, 6 ] );
+});
+
+test("a cancellation racing the stall timer stays a cancellation", async t => {
+	const ended = [];
+	const { loader, messages } = fixture( t, hangingFetch( ended ) );
+	await settle();
+	// The stall abort and the caller's cancel land in the same turn.
+	t.mock.timers.tick( NO_PROGRESS_MS );
+	loader.receive( { kind: "cancel", id: 1 } );
+	await settle();
+	t.mock.timers.tick( 60000 );
+	await settle();
+	assert.deepEqual( messages, [ { kind: "released", id: 1 } ] );
+	assert.deepEqual( ended, [ "aborted" ], "never retried after the cancel" );
+});
+
+/*
+================
+hangingCancel
+
+A readable body whose cancel never settles, for cleanup that must not
+hold the request.
+================
+*/
+function hangingCancel( bytes ) {
+	return new ReadableStream( {
+		/*
+		================
+		start
+		================
+		*/
+		start( controller ) {
+			controller.enqueue( bytes );
+		},
+		/*
+		================
+		pull
+		================
+		*/
+		pull() {
+			return new Promise( () => {} );
+		},
+		/*
+		================
+		cancel
+		================
+		*/
+		cancel() {
+			return new Promise( () => {} );
+		}
+	} );
+}
+
+test("an HTTP failure whose body cancel never settles still retries", async t => {
+	let attempts = 0;
+	const { messages } = fixture( t, async () =>
+		++attempts === 1 ?
+			new Response( hangingCancel( Uint8Array.of( 1 ) ), { status: 503 } ) :
+			new Response( Uint8Array.of( 4, 5, 6 ) ) );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2 );
+	assert.deepEqual( [ ...new Uint8Array( messages[0].buffer ) ], [ 4, 5, 6 ] );
+});
+
+test("a byte-limit failure whose body cancel never settles still answers", async t => {
+	const { messages } = fixture( t, async () => new Response( hangingCancel( Uint8Array.of( 1, 2, 3, 4 ) ) ) );
+	await settle();
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.match( messages[0].error, /exceeds byte limit/ );
+	assert.equal( messages[0].transient, undefined, "a budget failure stays permanent" );
+});
+
+test(
+	"a stalled shared member read is abandoned once and serves the subscriber that stayed",
+	{ timeout: 10000 },
+	async t => {
+		t.mock.timers.enable( { apis: [ "setTimeout" ] } );
+		const asset = packedAsset(), messages = [], transports = [];
+		let deliver = () => {};
+		/** @type {Promise<void>} */
+		const delivered = new Promise( resolve => {
+			deliver = resolve;
+		} );
+		t.mock.method( globalThis, "fetch", ( url, options ) => {
+			if ( !asset.isMember( options ) ) return Promise.resolve( asset.serve( url, options ) );
+			transports.push( options.signal );
+			// The first member request never answers; the retry does.
+			if ( transports.length === 1 ) {
+				return new Promise( ( resolve, reject ) => {
+					options.signal.addEventListener( "abort", () => reject( options.signal.reason ), { once: true } );
+				} );
+			}
+			return Promise.resolve( asset.serve( url, options ) );
+		} );
+		const loader = createLoader( message => {
+			if (
+				![ "progress", "job-progress", "job-decoding", "job-fetching", "hd-availability" ].includes(
+					message.kind
+				)
+			) {
+				messages.push( message );
+			}
+			if ( message.kind === "bytes" || message.kind === "error" ) deliver();
+		} );
+		t.after( () => loader.dispose() );
+		for ( const id of [ 1, 2 ] ) {
+			loader.receive( { kind: "load", id, url: `https://example.test${asset.path}`, limit: asset.bytes.length } );
+		}
+		await settle();
+		assert.equal( transports.length, 1, "both subscribers share one member request" );
+		loader.receive( { kind: "cancel", id: 1 } );
+		await settle();
+		assert.equal( transports[0].aborted, false, "one subscriber leaving does not end the shared request" );
+		t.mock.timers.tick( NO_PROGRESS_MS );
+		await settle();
+		assert.equal( transports[0].aborted, true, "the stall abandons the shared request" );
+		t.mock.timers.tick( 250 );
+		await delivered;
+		assert.equal( transports.length, 2, "exactly one retry for both subscribers" );
+		const bytes = messages.filter( row => row.kind === "bytes" );
+		assert.equal( bytes.length, 1 );
+		assert.equal( bytes[0].id, 2 );
+		assert.deepEqual( new Uint8Array( bytes[0].buffer ), asset.bytes );
+		assert.ok( !messages.some( row => row.kind === "error" ) );
+	}
+);
+
+test("headers just inside the window restart it: the stalled body is abandoned a full window later", async t => {
+	let attempts = 0, answer = () => {};
+	const { messages } = fixture( t, ( url, options ) => {
+		if ( ++attempts > 1 ) return Promise.resolve( new Response( Uint8Array.of( 4, 5, 6 ) ) );
+		return new Promise( ( resolve, reject ) => {
+			answer = () => resolve( stallingBody( [] ) );
+			options.signal.addEventListener( "abort", () => reject( options.signal.reason ), { once: true } );
+		} );
+	} );
+	await settle();
+	t.mock.timers.tick( NO_PROGRESS_MS - 100 );
+	answer();
+	await settle();
+	// 15 s after the start, but only 100 ms after the headers: still waiting.
+	t.mock.timers.tick( 100 );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 1, "the headers restarted the window" );
+	// A full window after the headers, the stalled body is abandoned.
+	t.mock.timers.tick( NO_PROGRESS_MS - 350 );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2 );
+	assert.deepEqual( [ ...new Uint8Array( messages[0].buffer ) ], [ 4, 5, 6 ] );
+});
+
+/*
+================
+errorBody
+
+A body that fails its first read with the given error.
+================
+*/
+function errorBody( error ) {
+	return new ReadableStream( {
+		/*
+		================
+		start
+		================
+		*/
+		start( controller ) {
+			controller.error( error );
+		}
+	} );
+}
+
+test("an allocation refusal mid-body is retried as a transport failure", async t => {
+	// Memory pressure is device state, not content (#2337): the engine's
+	// refusal - a RangeError here, a bare "out of memory" string on the
+	// incident in #2299 - retries like any other transport failure.
+	let attempts = 0;
+	const { messages } = fixture( t, async () => {
+		if ( ++attempts === 1 ) return new Response( errorBody( new RangeError( "Array buffer allocation failed" ) ) );
+		return new Response( Uint8Array.of( 4, 5, 6 ) );
+	} );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2 );
+	assert.equal( messages.length, 1 );
+	assert.deepEqual( [ ...new Uint8Array( messages[0].buffer ) ], [ 4, 5, 6 ] );
+});
+
+test("an I/O DOMException mid-body is retried as a transport failure", async t => {
+	let attempts = 0;
+	const { messages } = fixture( t, async () => {
+		if ( ++attempts === 1 ) {
+			return new Response( errorBody( new DOMException( "the network connection was lost", "NetworkError" ) ) );
+		}
+		return new Response( Uint8Array.of( 4, 5, 6 ) );
+	} );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	assert.equal( attempts, 2 );
+	assert.equal( messages.length, 1 );
+	assert.deepEqual( [ ...new Uint8Array( messages[0].buffer ) ], [ 4, 5, 6 ] );
+});
+
+test("a non-I/O DOMException stays permanent", async t => {
+	// InvalidStateError is the decode surfaces' refusal name; classifying
+	// it transient would retry broken content. Only the I/O shapes are
+	// transport (#2337).
+	let attempts = 0;
+	const { messages } = fixture( t, async () => {
+		attempts++;
+		return new Response( errorBody( new DOMException( "the stream is disturbed", "InvalidStateError" ) ) );
+	} );
+	await settle();
+	t.mock.timers.tick( 60000 );
+	await settle();
+	assert.equal( attempts, 1 );
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.equal( messages[0].transient, undefined );
+});
+
+test("the transient fault classifier names exactly the recoverable shapes", () => {
+	assert.equal( transientAssetFault( new RangeError( "Array buffer allocation failed" ) ), true );
+	assert.equal( transientAssetFault( "out of memory" ), true, "the bare string an engine throws (#2299)" );
+	assert.equal( transientAssetFault( Object.assign( new Error( "marked" ), { transient: true } ) ), true );
+	assert.equal( transientAssetFault( new DOMException( "lost", "NetworkError" ) ), true );
+	assert.equal(
+		transientAssetFault( new Error( "Asset SHA-256 mismatch" ) ),
+		false,
+		"unmarked validation stays out"
+	);
+	assert.equal( transientAssetFault( new TypeError( "Load failed" ) ), false, "the download gate's own term" );
+	assert.equal( transientAssetFault( new DOMException( "cancelled", "AbortError" ) ), false, "cancellation owns it" );
+	assert.equal( transientAssetFault( new DOMException( "disturbed", "InvalidStateError" ) ), false );
+});
+
+test("a middlebox answering a ranged read with 200 is a transient transport failure", async t => {
+	t.mock.timers.enable( { apis: [ "setTimeout" ] } );
+	const asset = packedAsset(), messages = [];
+	let attempts = 0;
+	t.mock.method( globalThis, "fetch", async url => {
+		if ( url.endsWith( "/manifest.json" ) ) return Response.json( asset.manifest );
+		attempts++;
+		return new Response( "the whole object; the Range header was ignored", { status: 200 } );
+	} );
+	const loader = createLoader( message => {
+		if (
+			![ "progress", "job-progress", "job-decoding", "job-fetching", "hd-availability" ].includes( message.kind )
+		) {
+			messages.push( message );
+		}
+	} );
+	t.after( () => loader.dispose() );
+	loader.receive( { kind: "load", id: 1, url: `https://example.test${asset.path}`, limit: asset.bytes.length } );
+	await settle();
+	t.mock.timers.tick( 250 );
+	await settle();
+	t.mock.timers.tick( 1000 );
+	await settle();
+	assert.equal( attempts, 3 );
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.match( messages[0].error, /Invalid asset range response/ );
+	assert.equal( messages[0].transient, true );
+});
+
+test("a pack block shorter than its claimed range is a transient transport failure", async t => {
+	// The stream ends cleanly one byte early (a re-framing middlebox), so
+	// only the block's own length check sees the cut (#2337).
+	t.mock.timers.enable( { apis: [ "setTimeout" ] } );
+	const asset = packedAsset( false ), messages = [];
+	const total = asset.manifest.groups[0].packs[0].bytes;
+	let deliver = () => {};
+	/** @type {Promise<void>} */
+	const delivered = new Promise( resolve => {
+		deliver = resolve;
+	} );
+	t.mock.method( globalThis, "fetch", async ( url, options ) => {
+		if ( !asset.isMember( options ) ) return asset.serve( url, options );
+		const range = /bytes=(\d+)-(\d+)/.exec( options?.headers?.Range ?? "" );
+		assert.ok( range );
+		const [start, end] = range.slice( 1 ).map( Number );
+		return new Response( new Uint8Array( end - start ), {
+			status: 206,
+			headers: { "Content-Range": `bytes ${start}-${end}/${total}` }
+		} );
+	} );
+	const loader = createLoader( message => {
+		if (
+			![ "progress", "job-progress", "job-decoding", "job-fetching", "hd-availability" ].includes( message.kind )
+		) {
+			messages.push( message );
+		}
+		if ( message.kind === "bytes" || message.kind === "error" ) deliver();
+	} );
+	t.after( () => loader.dispose() );
+	loader.receive( { kind: "load", id: 1, url: `https://example.test${asset.path}`, limit: asset.bytes.length } );
+	await delivered;
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.match( messages[0].error, /Truncated pack block/ );
+	assert.equal( messages[0].transient, true );
+});
+
+test("a decoder failure on unverified bytes is a transient transport failure", async t => {
+	// A loose read carries no digest: three wrong bytes can only mean the
+	// body arrived cut or substituted, so the refusal retries (#2337).
+	const messages = [];
+	let deliver = () => {};
+	/** @type {Promise<void>} */
+	const delivered = new Promise( resolve => {
+		deliver = resolve;
+	} );
+	t.mock.method( globalThis, "fetch", async () => new Response( Uint8Array.of( 1, 2, 3 ) ) );
+	const loader = createLoader( message => {
+		if (
+			![ "progress", "job-progress", "job-decoding", "job-fetching", "hd-availability" ].includes( message.kind )
+		) {
+			messages.push( message );
+		}
+		if ( message.kind === "bytes" || message.kind === "error" ) deliver();
+	} );
+	t.after( () => loader.dispose() );
+	loader.receive( { kind: "load", id: 1, url: "https://example.test/tex.dds", decode: "dds", limit: 1024 } );
+	await delivered;
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.match( messages[0].error, /Truncated DDS header/ );
+	assert.equal( messages[0].transient, true );
+});
+
+/*
+================
+ddsPack
+
+A small whole pack holding one three-byte "texture": the manifest's
+digest names those exact bytes, so the pack reader verifies them and
+only the DDS decoder can refuse them.
+================
+*/
+function ddsPack() {
+	const member = Uint8Array.of( 1, 2, 3 );
+	const hash = value => createHash( "sha256" ).update( value ).digest( "hex" );
+	const path = "/assets/tex.dds", packPath = "/assets/packs/tex.bin";
+	const row = {
+		path,
+		offset: 0,
+		length: member.length,
+		mime: "application/octet-stream",
+		sha256: hash( member )
+	};
+	const header = Buffer.from( JSON.stringify( { format: "sro-asset-pack", version: 2, files: [ row ] } ) );
+	const prefix = Buffer.alloc( 12 );
+	prefix.write( "SROPACK2" );
+	prefix.writeUInt32LE( header.length, 8 );
+	const pack = Buffer.concat( [ prefix, header, member ] );
+	const manifest = {
+		version: 2,
+		groups: [ {
+			name: "test",
+			assetCount: 1,
+			packs: [ { path: packPath, bytes: pack.length, sha256: hash( pack ), assetCount: 1 } ]
+		} ],
+		assets: [ { ...row, packPath } ]
+	};
+	return { manifest, pack, path };
+}
+
+test("a decoder failure on verified bytes stays permanent", async t => {
+	// The same three bytes, but the manifest's digest vouches for them:
+	// the content itself is broken and no retry repairs it (#2337).
+	const asset = ddsPack(), messages = [];
+	let deliver = () => {};
+	/** @type {Promise<void>} */
+	const delivered = new Promise( resolve => {
+		deliver = resolve;
+	} );
+	t.mock.method(
+		globalThis,
+		"fetch",
+		async url => url.endsWith( "/manifest.json" ) ? Response.json( asset.manifest ) : new Response( asset.pack )
+	);
+	const loader = createLoader( message => {
+		if (
+			![ "progress", "job-progress", "job-decoding", "job-fetching", "hd-availability" ].includes( message.kind )
+		) {
+			messages.push( message );
+		}
+		if ( message.kind === "bytes" || message.kind === "error" ) deliver();
+	} );
+	t.after( () => loader.dispose() );
+	loader.receive( { kind: "load", id: 1, url: `https://example.test${asset.path}`, decode: "dds", limit: 1024 } );
+	await delivered;
+	assert.equal( messages.length, 1 );
+	assert.equal( messages[0].kind, "error" );
+	assert.match( messages[0].error, /Truncated DDS header/ );
+	assert.equal( messages[0].transient, undefined );
+});

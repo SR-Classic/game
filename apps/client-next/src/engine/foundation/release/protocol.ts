@@ -1,0 +1,57 @@
+/*
+===========================================================================
+
+protocol.ts - the release identity this client build speaks
+
+RELEASE_PROTOCOL names the complete set of browser-facing wire contracts
+(the server owner is apps/server/internal/releaseprotocol). Every request
+to the title and agent services declares it; a server speaking another
+answers 426 Upgrade Required, and the page offers the newer release.
+
+ASSET_SCHEMA is the format of the published asset data this client reads
+(the pipeline owner is scripts/build/assetSchema.mjs). The release build
+refuses to package data of another schema.
+
+This file imports nothing, so Node tooling (probes, the release build and
+checks) reads the same numbers the client ships.
+
+===========================================================================
+*/
+
+// Protocol 17 filters the seasonal decoration by its world layer (a region
+// bundle placement's `layer`, world-layers.ts), which 16 ignored and drew
+// every season's props at once.
+// Protocol 16 names the pet a chat item link means ([u32 gid] after the
+// slot of a pet-source ref; chat-item-links.ts), which 15 misread.
+// Protocol 15 adds pet passive cooldowns, paid Bond feedback and public
+// buffs, with crow wind moved to 0x3FBE so most-wanted keeps 0x3FBA.
+// Protocol 14 carries the port-only item links in player chat
+// (SRO_CHAT_ITEM_LINKS, chat-item-links.ts): a link block after the text of
+// 0x7367 and of the Global Chatting 0x75BD, and the linked item bodies after
+// the text of a player 0x3667 line, which 13 read as trailing bytes and
+// failed its session on. Protocol 13 grew the 0x3FBA most-wanted body.
+// Protocol 12 shows the port-only 0x3FBA most-wanted state on the buff
+// board (most-wanted.ts); the frame is never offered to an 11 browser,
+// whose release the server refuses with 426 at connect, so no client
+// ignore path exists for it. Protocol 11 reads the 0xB738
+// movement acknowledgement's source block as f32 x/y/z (#1744), which 10
+// read as i16 x10 words that fail its length check and drop every walk.
+// Protocol 10 shows the port-only 0x3667 notice channels 0x80 (job kills)
+// and 0x81 (seal drops, +8..+11), which 9 dropped (system-notices.ts); 0x81
+// also carries the player and item it names after its text (notice-links.ts).
+// Protocol 9 answers the friend request's prompt (S->C 0x7164, C->S 0x3012
+// consent; #965/#966), which 8 ignored until the request cancelled.
+// Protocol 8 retires the token-0 attached effects every heal, cure and
+// revival sends (attached-effects.ts roomForAttachedEffect), which 7 kept
+// until it threw; 7 decodes a COS bag of any one-byte capacity (#801:
+// item-mall transports hold 141 to 177 slots, which 6 refused); 6 publishes
+// every creatable monster's row in the reference file (#369); 5 added
+// populated persistent summoners and concurrent COS lifetimes.
+// Protocol 17 also adds survival checkpoint rewards (#3189).
+export const RELEASE_PROTOCOL = 17;
+// The public reference file's contract (releaseprotocol.ReferencesContract).
+export const REFERENCES_CONTRACT = 3;
+export const RELEASE_PROTOCOL_HEADER = "X-OpenSRO-Protocol";
+// 426 Upgrade Required: the server speaks another release protocol.
+export const RELEASE_OUTDATED_STATUS = 426;
+export const ASSET_SCHEMA = 4;

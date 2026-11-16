@@ -1,0 +1,151 @@
+package simulation
+
+import "opensro.online/server/internal/game/world/monster"
+
+// AI cadence belongs to MonsterState, independently of mover snapshots. A
+// rejected/stale movement commit must not rewind a consumed scan deadline.
+// Timers survive idle/wander/combat transitions and disappear with their GID.
+// This is a Go simulation adapter to the bounded retail-server timer model, not an
+// activation of a native C++ replacement or a claim of v1.150 equivalence.
+func (s *MonsterState) checkAITimer(divisionID string, gid uint32, id monster.AITimerID, nowMs int64) bool {
+	return s.checkAITimerAt(divisionID, gid, behaviorNoMonsterSlot, id, nowMs)
+}
+
+/*
+================
+checkAITimerAt
+
+checkAITimer through the monster slot the behaviour batch carried
+for the actor (#2133): the instance read goes through the verified
+hint and falls back to the gid resolve when the hint no longer
+names the gid, so the timer verdict is checkAITimer's either way.
+The population membership test rides the same hint
+(populationForObjectAt); the timer bank itself is keyed by gid as
+before. The check reads the timer facts (hit points, nest
+tactics flags) off the resident row instead of expanding the full
+Instance (#2029): the facts are all it uses.
+================
+*/
+func (s *MonsterState) checkAITimerAt(divisionID string, gid uint32, monsterSlot uint32, id monster.AITimerID, nowMs int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.populationForObjectAt(divisionID, gid, monsterSlot)
+	hp, tacticsFlags, ok := state.instances.timerFactsAt(monsterSlot, gid)
+	if !ok || hp == 0 {
+		return false
+	}
+	return s.aiTimerBankLocked(state, gid, tacticsFlags, nowMs).CheckTimer(id, uint32(nowMs))
+}
+
+func (s *MonsterState) selectedAITimerReady(divisionID string, gid uint32, nowMs int64) bool {
+	return s.selectedAITimerReadyAt(divisionID, gid, behaviorNoMonsterSlot, nowMs)
+}
+
+/*
+================
+selectedAITimerReadyAt
+
+selectedAITimerReady through the monster slot the behaviour
+batch carried for the actor (#2133): the population and the
+timer facts go through the verified hint and fall back to the
+gid resolve whenever the hint no longer names the gid, so the
+verdict is selectedAITimerReady's either way. The facts are
+read off the resident row instead of expanding the full
+Instance (#2029): hit points and the nest tactics flags are
+all the check uses.
+================
+*/
+func (s *MonsterState) selectedAITimerReadyAt(divisionID string, gid uint32, monsterSlot uint32, nowMs int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.populationForObjectAt(divisionID, gid, monsterSlot)
+	hp, tacticsFlags, ok := state.instances.timerFactsAt(monsterSlot, gid)
+	if !ok || hp == 0 {
+		return false
+	}
+	return s.aiTimerBankLocked(state, gid, tacticsFlags, nowMs).CheckSelectedTimer(uint32(nowMs))
+}
+
+// CompleteMonsterSkillCommand owns the event-4 success timer independently
+// of detached mover plans. Retaliation can replace a target without rewinding
+// an accepted command's timer. Called inside the division action transaction.
+func (s *MonsterState) CompleteMonsterSkillCommand(divisionID string, gid uint32, duration uint32, nowMs int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.populationForObject(divisionID, gid)
+	instance, exists := state.instances.lookup(gid)
+	if !exists || instance.CurrentHP == 0 {
+		return
+	}
+	s.aiTimersLocked(state, instance, nowMs).SetTimer(10, duration, 0, uint32(nowMs), true,
+		func() uint32 { return monster.SummonRandomWord(s.random()) })
+}
+
+/*
+================
+aiTimersLocked
+
+The actor's timer bank for a caller holding the full instance;
+aiTimerBankLocked does the work.
+================
+*/
+func (s *MonsterState) aiTimersLocked(state *divisionMonsterState, instance monster.Instance, nowMs int64) *monster.AITimeManager {
+	return s.aiTimerBankLocked(state, instance.Gid, instance.Nest.NativeTacticsFlags, nowMs)
+}
+
+/*
+================
+aiTimerBankLocked
+
+Lazy entity initialization is distinct from consuming a decision's timer.
+Callers hold s.mu. FOLLOW stages CheckTimer on a detached value until commit.
+================
+*/
+func (s *MonsterState) aiTimerBankLocked(state *divisionMonsterState, gid uint32, nativeTacticsFlags uint32, nowMs int64) *monster.AITimeManager {
+	if state.aiTimers == nil {
+		state.aiTimers = make(map[uint32]*monster.AITimeManager)
+	}
+	timers := state.aiTimer(gid)
+	if timers == nil {
+		timers = monster.NewAITimeManager()
+		next := func() uint32 { return monster.SummonRandomWord(s.random()) }
+		// First-bank setup includes discarded CRT draws.
+		timers.SetTimer(0, 300, 0, uint32(nowMs), false, next)
+		timers.SetTimer(6, 1500, 0, uint32(nowMs), false, next)
+		timers.SetTimer(7, 30, 0, uint32(nowMs), false, next)
+		timers.InitAcquisitionTimer(uint8(nativeTacticsFlags), next)
+		state.aiTimers[gid] = timers
+	}
+	return timers
+}
+
+func (ops *MonsterMoverOps) acquisitionReady(divisionID string, instance *monster.Instance, nowMs int64) bool {
+	// Inside the actor's step the batch's monster slot is armed on
+	// the ops (#2133): read the instance through it. The hint is
+	// verified against the gid before use, so an actor other than
+	// the step's own still resolves by gid below.
+	if ops.stepGenArmed {
+		return ops.Monsters.checkAITimerAt(divisionID, instance.Gid, ops.stepMonsterSlot, monster.TimerIDAcquisition, nowMs)
+	}
+	return ops.Monsters.checkAITimer(divisionID, instance.Gid, monster.TimerIDAcquisition, nowMs)
+}
+
+func (ops *MonsterMoverOps) selectedTimerReady(divisionID string, instance *monster.Instance, nowMs int64) bool {
+	// The attack step's selected-timer check, through the same
+	// armed slot as the acquisition check above (#2133).
+	if ops.stepGenArmed {
+		return ops.Monsters.selectedAITimerReadyAt(divisionID, instance.Gid, ops.stepMonsterSlot, nowMs)
+	}
+	return ops.Monsters.selectedAITimerReady(divisionID, instance.Gid, nowMs)
+}
+
+// FOLLOW OnEnter replaces Timer 0 with 100ms (the retail server's timer
+// setter). CommitMover
+// calls this with s.mu held, after rejecting stale/dead plans. Replans within
+// FOLLOW preserve the existing deadline. Timer 0's first-bank setter ignores
+// the timestamp argument; its immediate flag and discarded RNG draw remain.
+func (s *MonsterState) beginFollowCadenceLocked(state *divisionMonsterState, gid uint32) {
+	if timers := state.aiTimer(gid); timers != nil {
+		timers.SetTimer(0, 100, 0, 0, false, func() uint32 { return monster.SummonRandomWord(s.random()) })
+	}
+}

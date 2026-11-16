@@ -1,0 +1,205 @@
+/*
+===========================================================================
+
+linkeddamage.go - fence and Pain Quota links taking part of a member's hit
+
+The reference server's skill manager runs its damage effects on the recipient of every
+hit before the hit lands. The Warrior's Physical and Magical Fence (lkdr,
+the recipient's +2C8 list) move part of the hit to the Warrior;
+Pain Quota (lkdd, +20C) keeps part and divides the rest among the
+recipient's party members within quotaMemberRange. Both run before dgmp.
+combat.FenceShare and combat.QuotaShare own the arithmetic.
+
+The moved shares register on a queued area context the attacker's manager
+drains (the reference server's area-effect queue), so each taker receives its share as
+the attacker's hit, published as a deferred damage tick: a victim label
+with no hit reaction, the HP itself riding the vitals refresh.
+INFERENCE: a moved share does not run its taker's own links again, nor
+the skc damage cancellation (a Bard's dance or music survives it); the
+queued context is not a hit outcome, as damagereturn.go reasons for dmgr.
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"opensro.online/server/internal/game/abnormal"
+	"opensro.online/server/internal/game/combat"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/world/monster"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+// quotaMemberRange is the native constant: the distance within which a party
+// member takes a Pain Quota share.
+const quotaMemberRange = 1000.0
+
+/*
+================
+linkedMove
+
+One share a link moved off a recipient's hit: who takes it and how much.
+================
+*/
+type linkedMove struct {
+	gid    uint32
+	amount uint32
+}
+
+/*
+================
+planQuotaMembers
+
+Natively before the victim's door (the members' positions are read
+through their own doors): the victim's party members other than the
+victim, alive, within quotaMemberRange of the victim. Empty when the
+victim holds no Pain Quota link.
+================
+*/
+func (rt *Runtime) planQuotaMembers(division string, victim *enterworld.Character, now int64) []uint32 {
+	if _, ok := rt.effects.QuotaLink(division, victim.Name, now); !ok {
+		return nil
+	}
+	snapshot := rt.characterSnapshot(division, victim)
+	if snapshot == nil {
+		return nil
+	}
+	at := rt.liveSpawn(simulation.WorldKey(division, snapshot.Name), snapshot, now)
+	from := monster.Pose{RegionID: at.RegionID, X: at.X, Y: at.Y, Z: at.Z}
+	self := enterworld.ObjectIDForCharacter(snapshot)
+	var out []uint32
+	for gid := range rt.auraParty(division, snapshot) {
+		if gid == self {
+			continue
+		}
+		// Only the member's life and live pose are weighed, so read
+		// the life fact as a value and seed the pose from the live
+		// record instead of detaching every member (#1943).
+		member := rt.findCharacterByGid(division, gid)
+		if member == nil {
+			continue
+		}
+		if alive, _, _ := rt.characterLifeState(division, member); !alive {
+			continue
+		}
+		to := rt.liveSpawn(simulation.WorldKey(division, member.Name), member, now)
+		if float64(monster.NativeActorDistance(from, monster.Pose{RegionID: to.RegionID, X: to.X, Y: to.Y, Z: to.Z})) > quotaMemberRange {
+			continue
+		}
+		out = append(out, gid)
+	}
+	return out
+}
+
+/*
+================
+shareLinkedDamageInDoor
+
+The fence step then the Pain Quota step for one impact inside the victim's door: every fence
+link moves its lanes to its source and counts the hit, then the Pain Quota
+link divides what is left among the planned members. Returns the hit the
+victim keeps; the moves are appended to out.
+================
+*/
+func (rt *Runtime) shareLinkedDamageInDoor(s playerStrike, formula combat.Result, out *playerStruck) combat.Result {
+	for _, link := range rt.effects.FenceLinks(s.division, s.victim.Name, s.now) {
+		var moved uint32
+		formula, moved = combat.FenceShare(link.FenceMask, link.FencePercent, formula)
+		if moved == 0 {
+			continue
+		}
+		out.linkMoves = append(out.linkMoves, linkedMove{gid: link.SourceGID, amount: moved})
+		rt.effects.CountFenceHit(s.division, link.SourceToken)
+	}
+	if link, ok := rt.effects.QuotaLink(s.division, s.victim.Name, s.now); ok && len(s.quotaMembers) != 0 {
+		var share uint32
+		formula, share = combat.QuotaShare(link.QuotaPercent, formula, len(s.quotaMembers))
+		if share != 0 {
+			for _, gid := range s.quotaMembers {
+				out.linkMoves = append(out.linkMoves, linkedMove{gid: gid, amount: share})
+			}
+		}
+	}
+	return formula
+}
+
+/*
+================
+struckTicks
+
+The share's committed damage as deferred ticks, one per struck impact.
+================
+*/
+func struckTicks(struck playerStruck) []uint32 {
+	var ticks []uint32
+	for _, impact := range struck.impacts {
+		if impact.Damage != 0 {
+			ticks = append(ticks, impact.Damage)
+		}
+	}
+	return ticks
+}
+
+/*
+================
+strikeLinkedShares
+
+After the victim's door: each moved share lands on its taker as the
+attacker's hit (source, skill), through the shared player strike with the
+taker's own links off, and is published as a deferred damage tick with
+the taker's own struck frames.
+================
+*/
+func (rt *Runtime) strikeLinkedShares(division string, source uint32, killer deathKiller, skill enterworld.SkillRow, moves []linkedMove, now int64, doors characterDoors) OpResult {
+	var result OpResult
+	for _, move := range moves {
+		taker := rt.findCharacterByGid(division, move.gid)
+		if taker == nil {
+			continue
+		}
+		strike := playerStrike{division: division, victim: taker, killer: killer, skill: skill, impacts: 1, linkedShare: true, now: now}
+		formula := combat.Result{Damage: min(move.amount, wire.MaxSkillActionDamage), ResultFlags: 1}
+		if !rt.planPlayerStrike(&strike,
+			func(*enterworld.SkillWall) (combat.WallOutcome, error) {
+				return combat.WallOutcome{Defender: formula}, nil
+			},
+			func(*enterworld.SkillWall, combat.Result) ([]abnormal.Record, error) { return nil, nil }) {
+			continue
+		}
+		var struck playerStruck
+		if !doors.update(taker, "linked-damage-share", func() bool {
+			if taker.DeletePending || !enterworld.CharacterAlive(taker) {
+				return false
+			}
+			struck = rt.strikePlayerInDoor(strike)
+			return len(struck.impacts) > 0
+		}) {
+			continue
+		}
+		if struck.fatal {
+			rt.bindResidentRegion(simulation.WorldKey(division, taker.Name), now)
+		}
+		public, private := rt.playerStruckFrames(division, taker, struck, now)
+		// The reference server publishes the landed share as a deferred
+		// damage tick, not as the attacker's cast result: the taker shows
+		// the tick number without a hit reaction, and its HP reaches
+		// observers on the vitals refresh, never on the tick itself. A
+		// killing share sets the tick's death byte, and the life frames
+		// in public (the zero baseline, then the dead state) ride this
+		// same broadcast after it, so observers commit the number and
+		// the death together.
+		if ticks := struckTicks(struck); len(ticks) != 0 {
+			result.Broadcast = append(result.Broadcast,
+				wire.SkillDamageTickFrame(source, struck.fatal, move.gid, ticks),
+				wire.Frame{Opcode: simulation.OpVitalsUpdate,
+					Payload: simulation.VitalsRefreshWithSourcePayload(move.gid, simulation.VitalsSourceCombatDamage, rt.publishedVitals(division, taker))})
+		}
+		result.Broadcast = append(result.Broadcast, public...)
+		if len(private) != 0 {
+			result.Recipients = append(result.Recipients, RecipientFrames{CharacterID: taker.ID, Frames: private})
+		}
+	}
+	return result
+}

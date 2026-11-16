@@ -1,0 +1,397 @@
+/*
+===========================================================================
+
+world-math.ts - world placement, camera and frustum math
+
+Placement matrices for characters and map objects, the native left-handed
+camera with WebGPU 0..1 depth, and the frustum tests the renderer culls
+with. Frustum planes are kept in double precision so every test sees the
+exact coefficients the native float path rounds from.
+
+===========================================================================
+*/
+import type { WorldCamera } from "@/engine/contracts/scene";
+import type { Radians } from "@/engine/foundation/math/angles";
+import { hypot3 } from "@/engine/foundation/math/hypot";
+import { regionRelativeXZ } from "@/engine/foundation/world/world-space";
+/*
+================
+identity
+================
+*/
+export function identity() {
+	return new Float32Array( [ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 ] );
+}
+/*
+================
+placement
+
+Character pose yaw uses the presentation convention; map records use the
+opposite rotation (mapPlacement). Both retain native region-local distance
+units.
+================
+*/
+export function placement( region: number, origin: number, x: number, y: number, z: number, yaw: Radians ) {
+	const c = Math.cos( yaw ), s = Math.sin( yaw );
+	const [rx, rz] = regionRelativeXZ( origin, { regionId: region, x, z } );
+	return new Float32Array( [
+		c,
+		0,
+		-s,
+		0,
+		0,
+		1,
+		0,
+		0,
+		s,
+		0,
+		c,
+		0,
+		rx,
+		y,
+		rz,
+		1
+	] );
+}
+/*
+================
+nativeModelOffset
+
+Carry a native model-space vector (a skilleffectset start/target offset,
+8D6880) into world space through an imported actor's model matrix, whose
+first three columns are its axes. The exporter mirrors native Z and the
+loader adds the Sx(-1) import root, so imported model space is Ry(PI) of
+native space: the native vector (x, y, z) is (-x, y, -z) on those axes.
+Columns that carry the actor's scale scale the vector too, as 8D6880
+scales it by the character's +0xC0 height scale.
+================
+*/
+export function nativeModelOffset( model: ArrayLike<number>, offset: readonly [number, number, number] ) {
+	const [x, y, z] = offset;
+	return [
+		-model[0]! * x + model[4]! * y - model[8]! * z,
+		-model[1]! * x + model[5]! * y - model[9]! * z,
+		-model[2]! * x + model[6]! * y - model[10]! * z
+	] as const;
+}
+/*
+================
+importedModelBasis
+
+The world basis an imported mesh needs to stand in a native world basis:
+imported model space is Ry(PI) of native space (exportGlb mirrors Z, the
+loader's __gltf_left_handed__ root adds Sx), so its first and third columns
+turn over. Columns are stored three floats each (CharacterActor effectBasis).
+================
+*/
+export function importedModelBasis( basis: readonly number[] ) {
+	return [
+		-basis[0]!,
+		-basis[1]!,
+		-basis[2]!,
+		basis[3]!,
+		basis[4]!,
+		basis[5]!,
+		-basis[6]!,
+		-basis[7]!,
+		-basis[8]!
+	] as const;
+}
+/*
+================
+nativeRootOffset
+
+nativeModelOffset through a character's own placement (pose yaw and scale)
+when no rendered matrix exists yet: the same root rule from the entity pose.
+================
+*/
+export function nativeRootOffset( yaw: Radians, scale: number, offset: readonly [number, number, number] ) {
+	const c = Math.cos( yaw ) * scale, s = Math.sin( yaw ) * scale;
+	return nativeModelOffset( [ c, 0, -s, 0, 0, scale, 0, 0, s, 0, c ], offset );
+}
+/*
+================
+mapPlacement
+
+MapLoader 0x441484 -> 0x451a10: m[2]=sin(yaw), m[8]=-sin(yaw). This maps
++X toward +Z for positive map yaw. Do not reuse character yaw here.
+================
+*/
+export function mapPlacement( region: number, origin: number, x: number, y: number, z: number, yaw: Radians ) {
+	const matrix = placement( region, origin, x, y, z, yaw );
+	matrix[2] = Math.sin( yaw );
+	matrix[8] = -Math.sin( yaw );
+	return matrix;
+}
+/*
+================
+dungeonObjectMatrix
+
+The world matrix of a DOF block object, as the native client builds it
+(CRTDunBlock object creator 0xAD4DC0). The record's rotation vector goes
+through 0xAD05F0, its scale becomes a diagonal matrix, and 0x926EA4 (an
+import thunk for a matrix multiply, out = A x B) joins them as scale x
+rotation. The translation is the record's position, in the dungeon's own
+space. 0xAD05F0 is Rx(rx) x Ry(-ry) x Rz(rz) with the usual column-vector
+axis matrices, laid out row by row; the tests pin it against the
+instruction-level emulation of that function.
+================
+*/
+export function dungeonObjectMatrix(
+	x: number,
+	y: number,
+	z: number,
+	rotation: readonly [number, number, number],
+	scale: readonly [number, number, number]
+) {
+	const cx = Math.cos( rotation[0] ), sx = Math.sin( rotation[0] );
+	const cy = Math.cos( rotation[1] ), sy = Math.sin( rotation[1] );
+	const cz = Math.cos( rotation[2] ), sz = Math.sin( rotation[2] );
+	// Rx x Ry( -ry ) x Rz, with Ry( -ry ) = [ cy 0 -sy ; 0 1 0 ; sy 0 cy ].
+	const r = [
+		cy * cz,
+		-cy * sz,
+		-sy,
+		cx * sz - sx * sy * cz,
+		cx * cz + sx * sy * sz,
+		-sx * cy,
+		sx * sz + cx * sy * cz,
+		sx * cz - cx * sy * sz,
+		cx * cy
+	];
+	return new Float32Array( [
+		r[0]! * scale[0],
+		r[1]! * scale[0],
+		r[2]! * scale[0],
+		0,
+		r[3]! * scale[1],
+		r[4]! * scale[1],
+		r[5]! * scale[1],
+		0,
+		r[6]! * scale[2],
+		r[7]! * scale[2],
+		r[8]! * scale[2],
+		0,
+		x,
+		y,
+		z,
+		1
+	] );
+}
+/*
+================
+terrainLod
+
+Terrain LOD by squared distance in cells from the eye cell.
+================
+*/
+export function terrainLod( distanceSquared: number ) {
+	return distanceSquared <= 16 ? 0 : distanceSquared <= 39 ? 1 : distanceSquared <= 81 ? 2 : 3;
+}
+/*
+================
+cameraBasis
+================
+*/
+export function cameraBasis( camera: WorldCamera ) {
+	const forward = camera.target.map( ( v, i ) => v - camera.eye[i]! );
+	const length = hypot3( forward[0]!, forward[1]!, forward[2]! );
+	if ( !Number.isFinite( length ) || length < 1e-8 ) throw new Error( "Invalid world camera" );
+	const [zx, zy, zz] = forward.map( v => v / length ) as [number, number, number];
+	const [ux, uy, uz] = camera.up ?? [ 0, 1, 0 ];
+	let xx = uy * zz - uz * zy, xy = uz * zx - ux * zz, xz = ux * zy - uy * zx;
+	const xl = hypot3( xx, xy, xz );
+	if ( !Number.isFinite( xl ) || xl < 1e-8 ) throw new Error( "Camera up vector is parallel to view" );
+	xx /= xl;
+	xy /= xl;
+	xz /= xl;
+	return {
+		forward: [ zx, zy, zz ] as const,
+		right: [ xx, xy, xz ] as const,
+		up: [ zy * xz - zz * xy, zz * xx - zx * xz, zx * xy - zy * xx ] as const
+	};
+}
+/*
+================
+projectionFov
+
+Port-only (GH #1246, not native): a camera that locks its horizontal FOV
+keeps the landscape frame's horizontal extent when the viewport is taller
+than wide, widening the vertical FOV instead of cropping the authored
+sides. Aspect >= 1, and every camera without the lock, projects exactly
+the authored fov. The widened FOV stays below PI so extreme viewports
+keep a finite projection.
+================
+*/
+function projectionFov( camera: WorldCamera, aspect: number ): number {
+	if ( !camera.lockHorizontalFov || aspect >= 1 ) return camera.fov;
+	return Math.min( Math.PI - 0.01, 2 * Math.atan( Math.tan( camera.fov / 2 ) / aspect ) );
+}
+
+/*
+================
+projectionTangents
+
+The tangents of the projected half-angles viewProjection builds with,
+after the horizontal-FOV lock: a view-space point (x, y, z) projects to
+NDC (x / (z * tanX), y / (z * tanY)), so a depth-reading pass rebuilds
+view positions from the same projection the scene was drawn with.
+================
+*/
+export function projectionTangents( camera: WorldCamera, aspect: number ): { tanX: number; tanY: number; } {
+	const tanY = Math.tan( projectionFov( camera, aspect ) / 2 );
+	return { tanX: tanY * aspect, tanY };
+}
+/*
+================
+viewProjection
+================
+*/
+export function viewProjection( camera: WorldCamera, aspect: number ) {
+	if (
+		!Number.isFinite( aspect ) || aspect <= 0 || camera.near <= 0 || camera.far <= camera.near || camera.fov <= 0 ||
+		camera.fov >= Math.PI
+	) throw new Error( "Invalid world camera" );
+	// Native left-handed camera and WebGPU 0..1 depth share this basis with sky.
+	const axes = cameraBasis( camera ),
+		[ex, ey, ez] = camera.eye,
+		[zx, zy, zz] = axes.forward,
+		[xx, xy, xz] = axes.right,
+		[yx, yy, yz] = axes.up;
+	const view = new Float32Array( [
+		xx,
+		yx,
+		zx,
+		0,
+		xy,
+		yy,
+		zy,
+		0,
+		xz,
+		yz,
+		zz,
+		0,
+		-xx * ex - xy * ey - xz * ez,
+		-yx * ex - yy * ey - yz * ez,
+		-zx * ex - zy * ey - zz * ez,
+		1
+	] );
+	const f = 1 / Math.tan( projectionFov( camera, aspect ) / 2 ),
+		a = camera.far / (camera.far - camera.near),
+		b = -camera.near * a;
+	const projection = new Float32Array( [ f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, a, 1, 0, 0, b, 0 ] ),
+		out = new Float32Array( 16 );
+	for ( let col = 0; col < 4; col++ ) {
+		for ( let row = 0; row < 4; row++ ) {
+			let sum = 0;
+			for ( let k = 0; k < 4; k++ ) sum += projection[k * 4 + row]! * view[col * 4 + k]!;
+			out[col * 4 + row] = sum;
+		}
+	}
+	return out;
+}
+/*
+================
+visibleSphere
+
+A sphere against the clip planes of a view-projection matrix.
+================
+*/
+export function visibleSphere( m: Float32Array, c: readonly number[], radius: number ) {
+	const x = c[0]!, y = c[1]!, z = c[2]!;
+	// WebGPU clip space: -w<=x,y<=w, 0<=z<=w.
+	for ( let plane = 0; plane < 6; plane++ ) {
+		const axis = plane < 2 ? 0 : plane < 4 ? 1 : 2, sign = plane % 2 === 0 ? 1 : -1;
+		const zero = plane === 4;
+		const a = (zero ? 0 : m[3]!) + sign * m[axis]!,
+			b = (zero ? 0 : m[7]!) + sign * m[4 + axis]!,
+			d = (zero ? 0 : m[11]!) + sign * m[8 + axis]!,
+			e = (zero ? 0 : m[15]!) + sign * m[12 + axis]!;
+		if ( a * x + b * y + d * z + e < -radius * hypot3( a, b, d ) ) return false;
+	}
+	return true;
+}
+
+/*
+================
+prepareViewFrustum
+
+The six clip planes (a, b, d, e, |abd|) of a view-projection matrix.
+Double precision preserves the exact coefficients and hypot3 (Math.hypot) result
+used by visibleSphere. Float32 storage here would move clip boundaries.
+================
+*/
+export function prepareViewFrustum( m: Float32Array ): Float64Array {
+	const planes = new Float64Array( 30 );
+	for ( let plane = 0; plane < 6; plane++ ) {
+		const axis = plane < 2 ? 0 : plane < 4 ? 1 : 2,
+			sign = plane % 2 === 0 ? 1 : -1,
+			zero = plane === 4,
+			offset = plane * 5;
+		const a = (zero ? 0 : m[3]!) + sign * m[axis]!,
+			b = (zero ? 0 : m[7]!) + sign * m[4 + axis]!,
+			d = (zero ? 0 : m[11]!) + sign * m[8 + axis]!,
+			e = (zero ? 0 : m[15]!) + sign * m[12 + axis]!;
+		planes[offset] = a;
+		planes[offset + 1] = b;
+		planes[offset + 2] = d;
+		planes[offset + 3] = e;
+		planes[offset + 4] = hypot3( a, b, d );
+	}
+	return planes;
+}
+
+/*
+================
+visibleFrustumSphere
+================
+*/
+export function visibleFrustumSphere( planes: Float64Array, x: number, y: number, z: number, radius: number ): boolean {
+	for ( let i = 0; i < 30; i += 5 ) {
+		if ( planes[i]! * x + planes[i + 1]! * y + planes[i + 2]! * z + planes[i + 3]! < -radius * planes[i + 4]! ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+================
+visibleFrustumBox
+
+Tests the support corner of the local box b against each transformed
+plane. Equivalent to checking all eight world-space corners, without
+allocating or rebuilding a larger world AABB when a placement rotates.
+================
+*/
+export function visibleFrustumBox(
+	planes: Float64Array,
+	b: ArrayLike<number>,
+	m: Float32Array,
+	offset = 0
+): boolean {
+	for ( let i = 0; i < 30; i += 5 ) {
+		const a = planes[i]!, c = planes[i + 1]!, d = planes[i + 2]!;
+		const x = a * m[offset]! + c * m[offset + 1]! + d * m[offset + 2]!,
+			y = a * m[offset + 4]! + c * m[offset + 5]! + d * m[offset + 6]!,
+			z = a * m[offset + 8]! + c * m[offset + 9]! + d * m[offset + 10]!;
+		const tx = a * m[offset + 12]!, ty = c * m[offset + 13]!, tz = d * m[offset + 14]!, w = planes[i + 3]!;
+		const px = x * b[x >= 0 ? 3 : 0]!, py = y * b[y >= 0 ? 4 : 1]!, pz = z * b[z >= 0 ? 5 : 2]!;
+		const distance = px + py + pz + tx + ty + tz + w;
+		// A nonnegative support distance already passes any nonnegative margin.
+		// Keep the exact rounding guard for rejected-side boundary candidates only.
+		if ( distance >= 0 ) continue;
+		// Preserve boundary geometry despite float32 shader transform rounding.
+		const magnitude =
+			(Math.abs( a * m[offset]! ) + Math.abs( c * m[offset + 1]! ) + Math.abs( d * m[offset + 2]! )) *
+				Math.max( Math.abs( b[0]! ), Math.abs( b[3]! ) ) +
+			(Math.abs( a * m[offset + 4]! ) + Math.abs( c * m[offset + 5]! ) + Math.abs( d * m[offset + 6]! )) *
+				Math.max( Math.abs( b[1]! ), Math.abs( b[4]! ) ) +
+			(Math.abs( a * m[offset + 8]! ) + Math.abs( c * m[offset + 9]! ) + Math.abs( d * m[offset + 10]! )) *
+				Math.max( Math.abs( b[2]! ), Math.abs( b[5]! ) );
+		const margin = 16 * 2 ** -23 *
+			(Math.abs( tx ) + Math.abs( ty ) + Math.abs( tz ) + Math.abs( w ) + magnitude + 1);
+		if ( distance < -margin ) return false;
+	}
+	return true;
+}

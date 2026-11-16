@@ -1,0 +1,888 @@
+/*
+===========================================================================
+
+basicattack.go - basic attacks and the attack intent loop
+
+Own pursuit and linked attack progression so command replacement, range checks,
+and stage execution share one simulation order.
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"math"
+	"sort"
+	"strings"
+	"time"
+
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/combat"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+// defaultUnarmedActionRange is the v1.150 bare-hand reach in native world
+// units. SKILL_PUNCH_01 deliberately has action-range column 0 because the
+// player base-attack family obtains reach from its weapon class; the empty
+// weapon class uses the same 6-unit reach carried by every shipped one-hand,
+// spear, dagger, staff, wand, and harp weapon row. Zero-range bow/crossbow
+// basics use their item range; EU caster basics override it with skill range.
+const defaultUnarmedActionRange = 6
+
+// Reference server: target-range navigation has a 100 ms floor.
+// Waiting 500 ms (or for a reach-relative drift threshold) lets short legs
+// expire and repeatedly strands the actor outside live attack range.
+// The simulation owns scheduling; this owner only gates goal publication.
+const attackPursuitResteerMinMs = 100
+
+const attackPursuitPositionEpsilon = 0.01
+
+/*
+==================
+skillActionReach
+
+skillActionReach resolves the action before its equipment fallback. Native
+the reference server uses the skill's nonzero range for basic and advanced casts;
+only zero calls the equipped/unarmed range resolver. Keep pursuit and hit
+admission on this same rule (EU caster basic skills author 150, not zero).
+
+The reference server's normal-attack and cast handlers then add the caster's CBRA
+and WIRU values when the row asks for them (getv +0x50C, +0x4E8), and cut
+the sum by keeper param 0xB7 percent. Each step is stored as a float.
+==================
+*/
+func skillActionReach(skill enterworld.SkillRow, loadout combat.Loadout, caster combat.Stats) simulation.ActionReach {
+	var reach float32
+	switch {
+	case skill.ActionRange > 0:
+		reach = float32(skill.ActionRange)
+	case loadout.HasWeapon:
+		// The reference server truncates the keeper: the weapon's range plus every ru
+		// an active buff adds (Demon Soul Arrow), else the weapon alone.
+		reach = float32(loadout.ActionRange)
+		if keeper, ok := caster.Param(combat.AttackRangeParameter); ok && keeper > 0 {
+			reach = float32(int32(keeper))
+		}
+	default:
+		reach = defaultUnarmedActionRange
+	}
+	// The reference server's cast handler adds ru only on the equipment fallback, before getv
+	// bonuses and the range-reduction keeper. It is a distance, not a rate.
+	if skill.ActionRange == 0 && skill.BuffModifiers.Ru {
+		reach = float32(float64(reach) + float64(skill.BuffModifiers.RuRate))
+	}
+	for _, slot := range [...]enterworld.SkillParameter{enterworld.ParameterCrossbowRange, enterworld.ParameterWizardRange} {
+		if skill.Attack.Parameters.Has(slot) {
+			reach = float32(float64(reach) + float64(caster.SkillParameters[slot]))
+		}
+	}
+	cut, _ := caster.Param(0xb7)
+	return reducedActionReach(reach, cut)
+}
+
+/*
+================
+reducedActionReach
+
+The reference server applies Myopia after the skill and keeper range contributions.
+Players, monsters and their COS targets share the same float store boundary.
+================
+*/
+func reducedActionReach(reach, reduction float32) simulation.ActionReach {
+	return simulation.ActionReach(float32((1 - float64(reduction)/100) * float64(reach)))
+}
+
+/*
+================
+playerActionReach
+
+Resolve range against the complete keeper, including effects and abnormals.
+================
+*/
+func (rt *Runtime) playerActionReach(division string, c *enterworld.Character, skill enterworld.SkillRow, loadout combat.Loadout) simulation.ActionReach {
+	caster, _, err := rt.playerCombatStats(division, c)
+	if err != nil {
+		return 0
+	}
+	return skillActionReach(skill, loadout, caster)
+}
+
+/*
+==================
+basicAttackIntent
+
+basicAttackIntent is the authoritative continuation of one native engage
+command. The wire command chooses the target once; subsequent ticks keep
+approaching and striking until a superseding command or invalid state
+clears the intent. SupportCast walks into reach for one support cast.
+FollowTarget instead retains player pursuit without opening combat. All
+three share one slot so a superseding command cannot leave a second owner.
+==================
+*/
+type basicAttackIntent struct {
+	Deferred       *deferredObjectAction // immutable command admitted behind a committed cast
+	FollowTarget   bool                  // persistent player pursuit, with no combat action
+	FollowSession  uint64                // prevents a reconnected target inheriting old pursuit
+	SupportCast    bool                  // a player-targeted heal, cure or resurrection waiting for reach
+	CaptureCast    bool                  // a Monster Mask waiting to reach its corpse
+	SingleCast     bool                  // executes the explicit sequence before any authored basic continuation
+	ResumeBasic    bool                  // transition resolves the current weapon after the explicit action closes
+	ResumeNotified bool                  // the skill-to-basic count transition has reached the actor
+	ComboRootID    uint32                // nonzero only after a root stage commits; never supplied by the client
+	DivisionID     string
+	CharacterName  string
+	TargetGid      uint32
+	SkillID        uint32
+	ActionReach    simulation.ActionReach
+	CooldownMs     int64
+	NextActionMs   int64
+	// WaitUntilMs is the first tick at which the full evaluation may
+	// act again, stamped by the evaluation itself when it settles
+	// into the swing wait (#3101). The tick skips the intent while
+	// nowMs < WaitUntilMs instead of re-resolving its whole combat
+	// context to arrive at the same wait. Zero - every fresh,
+	// promoted or replaced intent - always evaluates.
+	WaitUntilMs int64
+
+	// ApproachTargetSample is the live target pose from which the most recent
+	// player movement goal was authored. It belongs to this attack intent; the
+	// monster's private movement-plan destination must never cross this
+	// boundary. HasApproach records that a goal was issued even after the
+	// player reaches it, so a slowly moving target cannot restart one tiny leg
+	// per simulation tick.
+	ApproachTargetSample     simulation.Spawn
+	ApproachIssuedAtMs       int64
+	HasApproach              bool
+	ApproachMovementRevision uint64
+}
+
+// basicAttackSpreadBudget is the per-tick ceiling on advancing attack
+// intents: a burst of due intents drains over later ticks instead of
+// inside one (#2143). At least one intent always advances, so a single
+// expensive intent cannot stall the step either. A var so tests can
+// shrink it to zero and watch the spread happen.
+var basicAttackSpreadBudget = 4 * time.Millisecond
+
+/*
+================
+ClearCombatIntent
+
+Movement, actor teardown and explicit cancellation retire the same command
+slot. Follow shares this lifetime so it cannot resume after a new command.
+================
+*/
+func (rt *Runtime) ClearCombatIntent(divisionID, characterName string) {
+	rt.finishCombatIntent(divisionID, characterName)
+	rt.discardQueuedAction(divisionID, characterName)
+}
+
+/*
+================
+finishCombatIntent
+
+Retire the executing front without discarding an independently queued next
+command. The action-session owner promotes it after the current cast closes.
+================
+*/
+func (rt *Runtime) finishCombatIntent(divisionID, characterName string) {
+	rt.basicAttackIntentsMu.Lock()
+	delete(rt.basicAttackIntents, simulation.WorldKey(divisionID, characterName))
+	rt.basicAttackIntentsMu.Unlock()
+}
+
+/*
+================
+setCombatIntent
+================
+*/
+func (rt *Runtime) setCombatIntent(intent basicAttackIntent) {
+	rt.basicAttackIntentsMu.Lock()
+	rt.basicAttackIntents[simulation.WorldKey(intent.DivisionID, intent.CharacterName)] = intent
+	rt.basicAttackIntentsMu.Unlock()
+}
+
+/*
+================
+combatIntentIsCurrent
+
+The tick must not resurrect a command replaced after its snapshot.
+================
+*/
+func (rt *Runtime) combatIntentIsCurrent(intent basicAttackIntent) bool {
+	rt.basicAttackIntentsMu.Lock()
+	defer rt.basicAttackIntentsMu.Unlock()
+	current, ok := rt.basicAttackIntents[simulation.WorldKey(intent.DivisionID, intent.CharacterName)]
+	return ok && current == intent
+}
+
+/*
+================
+combatIntentSnapshot
+
+Release the intent mutex before callers enter character or world authority.
+The result is the caller's own; readers that outlive a tick (the tests)
+take this form.
+================
+*/
+func (rt *Runtime) combatIntentSnapshot() []basicAttackIntent {
+	return rt.fillCombatIntents(nil)
+}
+
+/*
+================
+fillCombatIntents
+
+The tick's snapshot of the intent map, refilled into dst and sorted in
+the order the advance pass serves: division, then the case-folded name.
+The tick passes its runtime scratch (basicAttackSnapshot) and consumes
+the result in line, so a steady tick grows nothing (#2033); the intent
+mutex is released before the caller enters character or world authority.
+================
+*/
+func (rt *Runtime) fillCombatIntents(dst []basicAttackIntent) []basicAttackIntent {
+	rt.basicAttackIntentsMu.Lock()
+	out := dst[:0]
+	for _, intent := range rt.basicAttackIntents {
+		out = append(out, intent)
+	}
+	rt.basicAttackIntentsMu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DivisionID != out[j].DivisionID {
+			return out[i].DivisionID < out[j].DivisionID
+		}
+		return foldedNameLess(out[i].CharacterName, out[j].CharacterName)
+	})
+	return out
+}
+
+/*
+================
+foldedNameLess
+
+Whether a sorts before b in the order strings.ToLower imposes, without
+building the lowered copies the sort used to allocate per comparison.
+ASCII folds byte-wise, which is exactly ToLower there; a name carrying
+non-ASCII bytes takes the ToLower comparison itself, so the order never
+moves.
+================
+*/
+func foldedNameLess(a, b string) bool {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 0x80 || cb >= 0x80 {
+			return strings.ToLower(a) < strings.ToLower(b)
+		}
+		if 'A' <= ca && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if 'A' <= cb && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return ca < cb
+		}
+	}
+	return len(a) < len(b)
+}
+
+/*
+================
+liveChainOwners
+
+Keep the root bracket open while another server-owned chain stage remains.
+================
+*/
+func (rt *Runtime) liveChainOwners() map[string]struct{} {
+	rt.basicAttackIntentsMu.Lock()
+	defer rt.basicAttackIntentsMu.Unlock()
+	// The drain consumes the set in line and keeps nothing, so the
+	// runtime's scratch map serves every tick instead of a fresh one
+	// (#2033). It is only ever read by the drain that refilled it.
+	owners := rt.liveChainScratch
+	if owners == nil {
+		owners = make(map[string]struct{})
+	} else {
+		clear(owners)
+	}
+	for key, intent := range rt.basicAttackIntents {
+		if intent.ComboRootID != 0 && !intent.ResumeBasic {
+			owners[key] = struct{}{}
+		}
+	}
+	rt.liveChainScratch = owners
+	return owners
+}
+
+/*
+================
+findCharacter
+
+Prefer indexed authority lookup; the roster fallback serves small test stores.
+================
+*/
+func (rt *Runtime) findCharacter(divisionID, characterName string) *enterworld.Character {
+	if source, ok := rt.deps.(domain.CharacterLookup); ok {
+		return source.CharacterByName(divisionID, characterName)
+	}
+	for _, candidate := range rt.deps.CharactersForDivision(divisionID) {
+		if candidate != nil && strings.EqualFold(candidate.Name, characterName) {
+			return candidate
+		}
+	}
+	return nil
+}
+
+/*
+==================
+resolveBasicAttack
+
+resolveBasicAttack binds the current equipped weapon to the learned racial
+base row. It deliberately resolves on every strike: equipment, death, and
+skill state can change after the double-click and are authority inputs, not
+properties cached forever by a UI gesture.
+==================
+*/
+func (rt *Runtime) resolveBasicAttack(character *enterworld.Character) (enterworld.SkillRow, combat.Loadout, string) {
+	var zeroSkill enterworld.SkillRow
+	var zeroLoadout combat.Loadout
+	if !enterworld.CharacterAlive(character) {
+		return zeroSkill, zeroLoadout, "character-not-alive"
+	}
+	base, loadout, err := combat.PlayerStats(character, rt.statCatalogs())
+	if err != nil {
+		return zeroSkill, zeroLoadout, "character-loadout-invalid"
+	}
+	source := rt.deps.SkillData()
+	if source == nil {
+		return zeroSkill, zeroLoadout, "skill-data-unavailable"
+	}
+	if id := rt.transformAttackSkill(character); id != 0 {
+		skill, ok := source.SkillByID(id)
+		actionLifecycleMs, actionLifecyclePinned := skill.ActionLifecycleMs()
+		if !ok || !skill.CombatPinned || !skill.Attack.Present || !skill.TargetRequired ||
+			!actionLifecyclePinned || actionLifecycleMs == 0 || !skill.TimingPinned || skill.CoolTimeMs == 0 {
+			return zeroSkill, zeroLoadout, "transform-attack-unavailable"
+		}
+		if skillActionReach(skill, loadout, base) <= 0 {
+			return zeroSkill, zeroLoadout, "attack-range-unavailable"
+		}
+		return skill, loadout, ""
+	}
+	for _, skillID := range character.Skills {
+		skill, ok := source.SkillByID(skillID)
+		actionLifecycleMs, actionLifecyclePinned := skill.ActionLifecycleMs()
+		if !ok || !skill.CombatPinned || !skill.Attack.Present ||
+			!skill.TargetRequired || !actionLifecyclePinned || actionLifecycleMs == 0 ||
+			!skill.TimingPinned || skill.CoolTimeMs == 0 ||
+			!isPinnedBaseAttack(character, skill.Codename) ||
+			!loadoutMatchesSkill(loadout, skill.RequiredWeaponKinds) {
+			continue
+		}
+		if skillActionReach(skill, loadout, base) <= 0 {
+			return zeroSkill, zeroLoadout, "attack-range-unavailable"
+		}
+		return skill, loadout, ""
+	}
+	return zeroSkill, zeroLoadout, "compatible-base-attack-unavailable"
+}
+
+/*
+================
+beginBasicAttack
+
+Run the whole transition at the caller's one simulation instant.
+================
+*/
+func (rt *Runtime) beginBasicAttack(divisionID string, character *enterworld.Character, engage wire.BasicAttackEngage, nowMs int64, doors characterDoors) OpResult {
+	if character == nil || rt.Monsters == nil || engage.TargetGid == 0 {
+		return OpResult{DiagnosticRefusal: "attack-context-unavailable"}
+	}
+	snapshot := rt.characterSnapshotCombat(divisionID, character)
+	if snapshot == nil || snapshot.DeletePending {
+		return OpResult{DiagnosticRefusal: "character-unavailable"}
+	}
+	skill, loadout, refusal := rt.resolveBasicAttack(snapshot)
+	if refusal != "" {
+		return OpResult{DiagnosticRefusal: refusal}
+	}
+	target, ok := rt.resolveCombatTarget(divisionID, snapshot, engage.TargetGid, nowMs)
+	if !ok {
+		return OpResult{DiagnosticRefusal: "target-unavailable"}
+	}
+	// The reference server's attack-target check: a player (or a COS through
+	// its owner) the attacker may not fight is refused at the command, before
+	// any walk.
+	if target.cos != nil {
+		if code := rt.cosTargetRefusal(divisionID, snapshot, target, nowMs); code != 0 {
+			return offensiveRefusal(code)
+		}
+	} else if target.player != nil {
+		if code := rt.playerAttackTargetRefusal(divisionID, snapshot, target.snapshot, nowMs); code != 0 {
+			return offensiveRefusal(code)
+		}
+	} else if target.monster != nil {
+		if code := rt.jobMonsterTargetRefusal(snapshot, *target.monster); code != 0 {
+			return offensiveRefusal(code)
+		}
+	}
+	// Command acceptance runs phase 0x37 with the ammo bit 0x20
+	// (the reference server's cost check): an empty bow is refused at the double-click, before the
+	// approach. A transformed strike is the monster's and spends nothing.
+	if rt.transformAttackSkill(snapshot) == 0 && weaponRequiresAmmunition(loadout.WeaponKind) {
+		if _, valid := rt.planEquippedAmmunition(snapshot, loadout.WeaponKind, ammunitionSpent(skill, false)); !valid {
+			return offensiveRefusal(0x300e)
+		}
+	}
+	intent := basicAttackIntent{
+		DivisionID: divisionID, CharacterName: snapshot.Name,
+		TargetGid: engage.TargetGid, SkillID: skill.ID,
+		ActionReach: rt.playerActionReach(divisionID, snapshot, skill, loadout), CooldownMs: int64(rt.playerSkillCooldown(divisionID, snapshot, skill)),
+		// A swing cancelled for movement leaves its cooldown running. A new
+		// attack command waits it out (the repeating-attack gate below) rather
+		// than being refused with 0x3005 and dropped.
+		NextActionMs: skillCooldownDeadline(snapshot, skill),
+	}
+	rt.setCombatIntent(intent)
+	return rt.advanceBasicAttackIntent(character, intent, nowMs, doors)
+}
+
+/*
+================
+advanceBasicAttackIntent
+
+Dispatch the command owner before resolving any combat skill or cost.
+================
+*/
+func (rt *Runtime) advanceBasicAttackIntent(character *enterworld.Character, intent basicAttackIntent, nowMs int64, doors characterDoors) OpResult {
+	// An evaluation that runs has consumed the wait: every write-back
+	// below carries a cleared stamp, and only the two swing-wait
+	// gates stamp a new one (#3101).
+	intent.WaitUntilMs = 0
+	if intent.Deferred != nil {
+		rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		return rt.handleTargetInteractLocked(intent.DivisionID, character, intent.Deferred.payload, doors)
+	}
+	if intent.FollowTarget {
+		return rt.advanceFollowIntent(character, intent, nowMs, doors)
+	}
+	if intent.SupportCast {
+		return rt.advanceSupportCastIntent(character, intent, nowMs, doors)
+	}
+	if intent.CaptureCast {
+		return rt.advanceCaptureIntent(character, intent, nowMs, doors)
+	}
+	snapshot := rt.characterSnapshotCombat(intent.DivisionID, character)
+	if snapshot == nil || snapshot.DeletePending || !enterworld.CharacterAlive(snapshot) {
+		rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		return OpResult{}
+	}
+	// Admission must precede pursuit and the movement-to-combat handoff. The
+	// central cast gate in acceptSkillCastAt protects direct skill requests,
+	// but reaching it only after approach would let a seated double-click move
+	// the character before the eventual cast refusal.
+	if rt.skillCastPostureBlocked(intent.DivisionID, snapshot, nowMs) {
+		rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		return OpResult{}
+	}
+	// The reference server's target-attackable check, reached from
+	// its player attack-target check (vtable +0x62C): an untouchable attacker
+	// (body mode 2) may not attack anything.
+	if snapshot.NativeBodyStatus == untouchableBodyStatus {
+		rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		return offensiveRefusal(0x3020)
+	}
+	var skill enterworld.SkillRow
+	var loadout combat.Loadout
+	var refusal string
+	if intent.ResumeBasic {
+		if nowMs <= intent.NextActionMs {
+			// The resume is purely time-gated while no skill cast is
+			// open: stamp the wait so the tick skips to the first
+			// tick that can act (this gate fires past NextActionMs).
+			if !rt.hasOpenSkillCast(intent.DivisionID, intent.CharacterName) {
+				intent.WaitUntilMs = intent.NextActionMs + 1
+				rt.setCombatIntent(intent)
+			}
+			return OpResult{}
+		}
+		if rt.hasOpenSkillCast(intent.DivisionID, intent.CharacterName) {
+			return OpResult{}
+		}
+		// The reference server transfers the target to a new basic command. Resolve
+		// its weapon/learned row now, never repeat or re-charge the old skill.
+		basic, _, why := rt.resolveBasicAttack(snapshot)
+		if why != "" {
+			rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+			return OpResult{DiagnosticRefusal: why}
+		}
+		intent.SingleCast, intent.ResumeBasic = false, false
+		intent.ResumeNotified = false
+		intent.ComboRootID, intent.SkillID = 0, basic.ID
+	}
+	if intent.SingleCast {
+		if intent.ComboRootID == 0 {
+			skill, loadout, refusal = rt.resolveOffensiveSkill(snapshot, intent.SkillID)
+		} else {
+			skill, loadout, refusal = rt.resolveOffensiveStage(snapshot, intent.ComboRootID, intent.SkillID)
+		}
+		if refusal == "" && intent.ComboRootID == 0 {
+			if _, code := rt.offensiveCost(intent.DivisionID, snapshot, skill, nowMs); code != 0 {
+				rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+				return offensiveRefusal(code)
+			}
+		}
+	}
+	if !intent.SingleCast {
+		skill, loadout, refusal = rt.resolveBasicAttack(snapshot)
+	}
+	if refusal != "" || skill.ID != intent.SkillID {
+		rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		if refusal == "" {
+			refusal = "base-attack-changed"
+		}
+		if intent.SingleCast {
+			return rt.offensiveAdmissionRefusal(refusal)
+		}
+		return OpResult{DiagnosticRefusal: refusal}
+	}
+	target, ok := rt.resolveCombatTarget(intent.DivisionID, snapshot, intent.TargetGid, nowMs)
+	if !ok {
+		rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		return OpResult{}
+	}
+	targetSpawn := target.at
+	worldKey := simulation.WorldKey(intent.DivisionID, snapshot.Name)
+	live := rt.liveSpawn(worldKey, snapshot, nowMs)
+	actionReach := rt.playerActionReach(intent.DivisionID, snapshot, skill, loadout)
+	spacing, spacingOK := rt.combatTargetSpacing(snapshot, target, actionReach)
+	if !spacingOK {
+		rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		return OpResult{DiagnosticRefusal: "combat-spacing-unavailable"}
+	}
+	// The reference server returns a linked stage to action state 2, which executes it;
+	// only state 1 measures range and pursues. A combo stage therefore
+	// never pursues, and never waits for its target to come back in reach.
+	if !spacing.Contains(live, targetSpawn) && intent.ComboRootID == 0 {
+		// Equipment is an authority input for every continuation tick. Keep the
+		// pursuit stop distance in the same freshly-resolved loadout snapshot as
+		// the eventual strike; otherwise swapping weapon families while chasing
+		// leaves the approach leg bound to the weapon worn at double-click time.
+		reachChanged := math.Abs(float64(intent.ActionReach-actionReach)) > attackPursuitPositionEpsilon
+		intent.ActionReach = actionReach
+		if !reachChanged && !rt.pursuitSteerDue(intent, worldKey, snapshot, targetSpawn, nowMs) {
+			return OpResult{}
+		}
+		return rt.approachIntentTarget(character, snapshot, intent, spacing, live, targetSpawn, nowMs, doors)
+	}
+	// Entering action range (or, for a combo stage, its turn, in reach or
+	// not) transfers ownership from movement to combat.
+	// Native B245 enters motion state 2 and stops local path following; commit
+	// the same live point on the authority plane so later range checks and
+	// peer corrections cannot continue an obsolete approach behind the attack.
+	combatTransition, transitioned := rt.enterBasicAttackRange(
+		character,
+		snapshot,
+		worldKey,
+		targetSpawn,
+		nowMs,
+		doors,
+	)
+	if !transitioned {
+		rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		return OpResult{}
+	}
+	intent.HasApproach = false
+	rt.setCombatIntent(intent)
+	// The reference server's normal-attack handler checks vt+0x5A0
+	// (the motion-change lock, which asks the attack lock)
+	// in state 0, holding basic attacks while a wall stands
+	// or a skill cast is open; its cast handler allows an in-range non-ao/pw
+	// skill to fire in place.
+	if nowMs < intent.NextActionMs {
+		// Settled into the swing wait and the transition published
+		// nothing: stamp the wait so the tick skips the resolution
+		// above until the first tick the swing can fire (this gate
+		// fires at NextActionMs). Admission blocks and the attack
+		// lock are re-judged by that evaluation, exactly as they
+		// were re-judged on every waiting tick before (#3101).
+		if len(combatTransition.Frames) == 0 && len(combatTransition.Broadcast) == 0 &&
+			len(combatTransition.ActorPrivate) == 0 && len(combatTransition.Recipients) == 0 &&
+			len(combatTransition.Around) == 0 {
+			intent.WaitUntilMs = intent.NextActionMs
+			rt.setCombatIntent(intent)
+		}
+		return combatTransition
+	}
+	if rt.actionAdmissionBlocked(intent.DivisionID, intent.CharacterName, intent.ComboRootID != 0) || (!intent.SingleCast && rt.PlayerAttackLocked(intent.DivisionID, intent.CharacterName)) {
+		return combatTransition
+	}
+	result, decision := rt.acceptSkillStageAt(intent.DivisionID, character, snapshot, wire.SkillAction{
+		ActionId: skill.ID, HasTarget: true, TargetGid: intent.TargetGid,
+	}, nowMs, intent.ComboRootID, doors)
+	switch decision {
+	case skillCastDeferred:
+		// Range and the previous action bracket are transient states. Preserve
+		// the target intent; the next simulation tick re-evaluates the live poses.
+		return prependOpResult(combatTransition, result)
+	case skillCastRefused:
+		rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		return prependOpResult(combatTransition, result)
+	}
+	intent.ActionReach = actionReach
+	if intent.SingleCast {
+		alive := rt.combatTargetExists(intent.DivisionID, snapshot, intent.TargetGid)
+		lifecycle, _ := skill.ActionLifecycleMs()
+		if intent.ComboRootID != 0 || skill.ChainNext != 0 {
+			// The root deco carries the chain's one authored clip, so the
+			// bracket closes only when the last performed stage's whole
+			// action (casting + duration) ends, not at its casting point.
+			rt.extendChainBracket(intent.DivisionID, intent.CharacterName, nowMs+int64(lifecycle))
+		}
+		if skill.ChainNext != 0 && alive {
+			if intent.ComboRootID == 0 {
+				intent.ComboRootID = skill.ID
+			}
+			intent.SkillID = skill.ChainNext
+			// Native stage pacing: the client sends the next stage when
+			// this stage's motion completes (casting + duration) and the
+			// reference server executes it on arrival, linked to the
+			// previous stage's cast. The port drives
+			// the stages itself, so it waits the same full action time.
+			// The native 500 ms figure (the record's chain-latency
+			// fields) only tolerates a late client stage command; with
+			// no client command to tolerate it must not compress the
+			// schedule (#3152).
+			intent.NextActionMs = nowMs + int64(lifecycle)
+			rt.setCombatIntent(intent)
+			return prependOpResult(combatTransition, result)
+		}
+		if skill.ContinueBasicAttack && alive {
+			intent.ResumeBasic = true
+			// An authored basic-attack continuation waits the stage's
+			// full action time, like every other stage boundary.
+			intent.NextActionMs = nowMs + int64(lifecycle)
+			rt.setCombatIntent(intent)
+		} else {
+			rt.finishCombatIntent(intent.DivisionID, intent.CharacterName)
+		}
+		return prependOpResult(combatTransition, result)
+	}
+	intent.CooldownMs = int64(rt.playerSkillCooldown(intent.DivisionID, snapshot, skill))
+	intent.NextActionMs = nowMs + intent.CooldownMs
+	rt.setCombatIntent(intent)
+	return prependOpResult(combatTransition, result)
+}
+
+/*
+==================
+pursuitSteerDue
+
+Whether a pursuing intent may publish a new approach goal. Never replace a
+young goal. Once the packet floor expires, an in-flight leg is replaced
+only for changed target geometry. A leg that has already settled may be
+replaced from the current sample even for smaller drift: live range already
+proved the actor is out of reach, so suppressing it forever would strand
+the engage.
+==================
+*/
+func (rt *Runtime) pursuitSteerDue(intent basicAttackIntent, worldKey string, snapshot *enterworld.Character, target simulation.Spawn, nowMs int64) bool {
+	if !intent.HasApproach {
+		return true
+	}
+	world := rt.Worlds.Snapshot(worldKey, func() simulation.WorldState { return simulation.SeedWorldState(snapshot) })
+	approachInFlight := world.MovingAt(nowMs)
+	targetMoved := simulation.WorldDistance2D(intent.ApproachTargetSample, target) > 0.01
+	young := nowMs-intent.ApproachIssuedAtMs < attackPursuitResteerMinMs
+	return !young && (!approachInFlight || targetMoved)
+}
+
+/*
+==================
+approachIntentTarget
+
+Publishes one approach leg toward the intent's target, a monster or a
+player, and records the sample it was authored from.
+==================
+*/
+func (rt *Runtime) approachIntentTarget(character, snapshot *enterworld.Character, intent basicAttackIntent, spacing simulation.CombatSpacing, from, target simulation.Spawn, nowMs int64, doors characterDoors) OpResult {
+	goal, disposition := spacing.ApproachGoal(from, target)
+	if disposition == simulation.CombatApproachInvalid {
+		rt.ClearCombatIntent(intent.DivisionID, intent.CharacterName)
+		return OpResult{}
+	}
+	if disposition == simulation.CombatApproachHold {
+		// Range admission and goal derivation consume the same live sample, so
+		// this is only a quantisation/coordinate-boundary no-op. Keep the
+		// identity latch; the next authoritative tick will sample again.
+		return OpResult{}
+	}
+	return rt.commitIntentMovement(character, snapshot, intentMovement{
+		intent: intent, from: from, target: target, goal: goal, nowMs: nowMs,
+	}, doors)
+}
+
+/*
+================
+intentMovement
+
+Combat and follow derive different goals but share navigation admission,
+authoritative movement commits and actor/peer publication.
+================
+*/
+type intentMovement struct {
+	intent             basicAttackIntent
+	from, target, goal simulation.Spawn
+	nowMs              int64
+}
+
+/*
+================
+commitIntentMovement
+================
+*/
+func (rt *Runtime) commitIntentMovement(character, snapshot *enterworld.Character, move intentMovement, doors characterDoors) OpResult {
+	// The reference server's pursuit tick dispatches
+	// its pursuit walk through the character's move command handler, which
+	// drops the move when vt+0x5A0 (the motion-change lock, which asks
+	// the attack lock) is true.
+	if rt.PlayerAttackLocked(move.intent.DivisionID, character.Name) {
+		return OpResult{}
+	}
+	if mountedOnCOS(snapshot) {
+		return rt.commitRiddenIntentMovement(character, snapshot, move)
+	}
+	intent, from, target, goal, nowMs := move.intent, move.from, move.target, move.goal, move.nowMs
+	worldKey := simulation.WorldKey(intent.DivisionID, character.Name)
+	_, fromOwner := rt.liveNav(worldKey, snapshot, nowMs)
+	goal, walk, refusal := rt.admitGroundWalk(snapshot.Name, from, fromOwner, goal)
+	if refusal != nil || simulation.WorldDistance2D(from, goal) < attackPursuitPositionEpsilon {
+		// Collision/path ownership can be transient (the target may move
+		// back into reach or open a route). It is not a terminal command
+		// refusal, so preserve the engage state and re-evaluate next tick.
+		return OpResult{}
+	}
+	var ack []byte
+	var runChanged bool
+	var movementRevision uint64
+	var movementState simulation.WorldState
+	rt.bindResidentRegion(worldKey, nowMs)
+	if !doors.update(character, "basic-attack-approach", func() bool {
+		if character.DeletePending {
+			return false
+		}
+		state := rt.Worlds.Update(simulation.WorldKey(intent.DivisionID, character.Name),
+			func() simulation.WorldState { return simulation.SeedWorldState(character) },
+			func(world *simulation.WorldState) {
+				request := simulation.MovementRequest{Mode: simulation.MovementAckDestinationMode,
+					RegionID: goal.RegionID, X: goal.X, Y: goal.Y, Z: goal.Z}
+				mode := world.MovementMode
+				if intent.FollowTarget && mode != simulation.RunMode {
+					mode = simulation.RunMode
+					runChanged = true
+				}
+				result := simulation.ApplyMove(world, enterworld.ObjectIDForCharacter(character), request, mode, nowMs)
+				if result.LiveBefore == from {
+					world.CommitWalk(walk.Spans, walk.Rest)
+				}
+				ack = result.AckPayload
+			})
+		writeBackWorld(character, state)
+		movementRevision = state.GroundRevision()
+		movementState = state
+		return true
+	}) || len(ack) == 0 {
+		rt.ClearCombatIntent(intent.DivisionID, intent.CharacterName)
+		return OpResult{}
+	}
+	intent.ApproachTargetSample = target
+	intent.ApproachIssuedAtMs = nowMs
+	intent.HasApproach = true
+	intent.ApproachMovementRevision = movementRevision
+	rt.setCombatIntent(intent)
+	frames := []wire.Frame{{Opcode: simulation.OpMovementAck, Payload: ack,
+		Current: func() bool { return rt.Worlds.GroundPathCurrent(worldKey, movementState) }}}
+	if runChanged {
+		// The reference server switches a pursuing walker to run after issuing its goal.
+		frames = append(frames, wire.Frame{Opcode: wire.OpObjectStateRefresh, Payload: wire.ObjectStateRefresh{
+			Gid: enterworld.ObjectIDForCharacter(character), StateType: wire.StateChannelMove, Value: simulation.RunMode,
+		}.Encode()})
+	}
+	return OpResult{Frames: frames, Broadcast: frames}
+}
+
+/*
+==================
+enterBasicAttackRange
+
+enterBasicAttackRange is the movement-to-combat ownership transfer. It
+samples no clock and consumes the same live target pose used by range
+admission. In one character-authority update it settles any pursuit leg,
+derives the region-aware target bearing, commits that yaw, then publishes
+B2F5 before B245. B2F5 owns path halt and peer correction, but the v1.150
+client deliberately skips its yaw write for the locally controlled actor.
+The stationary B245 that follows omits bit 3 because that bit starts actor
+movement. The new client consumes the authoritative heading from B2F5;
+original-client local facing requires a separate native-equivalence review.
+==================
+*/
+func (rt *Runtime) enterBasicAttackRange(
+	character, snapshot *enterworld.Character,
+	worldKey string,
+	target simulation.Spawn,
+	nowMs int64,
+	doors characterDoors,
+) (OpResult, bool) {
+	world := rt.Worlds.Snapshot(worldKey, func() simulation.WorldState { return simulation.SeedWorldState(snapshot) })
+	live := world.LiveSpawnAt(nowMs)
+	heading, hasHeading := simulation.HeadingFromMovement(live, target)
+	needsCorrection := world.MoveSegment.Valid() || (hasHeading && live.Angle != heading)
+	if !needsCorrection {
+		return OpResult{}, true
+	}
+	var committed simulation.Spawn
+	accepted := doors.update(character, "basic-attack-enter-range", func() bool {
+		if character.DeletePending {
+			return false
+		}
+		state := rt.Worlds.Update(worldKey,
+			func() simulation.WorldState { return simulation.SeedWorldState(character) },
+			func(current *simulation.WorldState) {
+				current.SettleLive(nowMs)
+				if nextHeading, ok := simulation.HeadingFromMovement(current.Spawn, target); ok {
+					current.Spawn.Angle = nextHeading
+				}
+				committed = current.Spawn
+			})
+		writeBackWorld(character, state)
+		return true
+	})
+	if !accepted {
+		return OpResult{}, false
+	}
+	rt.bindResidentRegion(worldKey, nowMs)
+	correction := sourceCorrectionFrame(snapshot, committed)
+	return OpResult{Frames: []wire.Frame{correction}, Broadcast: []wire.Frame{correction}}, true
+}
+
+/*
+==================
+prependOpResult
+
+prependOpResult composes two already-ordered authority transitions without
+allowing actor and peer routes to drift. Pending is owned by the tail
+operation; basic combat transitions never manufacture pending work.
+==================
+*/
+func prependOpResult(prefix, tail OpResult) OpResult {
+	return OpResult{
+		Frames:       append(append([]wire.Frame{}, prefix.Frames...), tail.Frames...),
+		Broadcast:    append(append([]wire.Frame{}, prefix.Broadcast...), tail.Broadcast...),
+		ActorPrivate: append(append([]wire.Frame{}, prefix.ActorPrivate...), tail.ActorPrivate...),
+		Recipients:   append(append([]RecipientFrames{}, prefix.Recipients...), tail.Recipients...),
+		Around:       append(append([]ObservedFrames{}, prefix.Around...), tail.Around...),
+		Pending:      tail.Pending,
+	}
+}

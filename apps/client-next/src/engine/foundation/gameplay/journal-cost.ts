@@ -1,0 +1,140 @@
+/*
+===========================================================================
+
+journal-cost.ts - the world journal's byte budget without serialising
+
+The reliable world journal bounds its backlog by the UTF-16 size of the
+events it holds (entities.ts). It used to measure each event with
+JSON.stringify, which built and dropped a full JSON string for every
+sampled pose of every moving entity on every tick: an allocation trace
+showed 57 MB of garbage in 12 s from that alone. This walks the value
+and returns the same estimate (2 bytes per JSON character) allocating
+nothing.
+
+The figure is a budget, not a wire size: strings are not scanned for
+escapes and a non-integer number counts as its widest JSON form.
+
+One batch is one postMessage, and structured clone sends a value that
+several events share once. An entity's walking path is such an array: every
+state event spread from the entity carries the same reference, and a burst
+of HP or LIFE changes on walking monsters charged the full path to each one
+(a 62 KB state each, 33 MB with 616 queued; the backlog failure of
+2026-10-14). Given the batch's `shared` set, a value already counted costs
+only a reference. Shared plain objects count the same way: a gameplay
+snapshot's catalogue rows are pointed at by its skill and quick-slot
+fields, and charging the rows per reference charged 33 MB for one snapshot
+(the cave-entry failure of 2026-10-19, F11-DC1).
+
+Given the journal's `flat` map, a flat value - an array or object holding
+only strings, numbers, booleans and nulls - keeps its size once measured
+(the map is the journal's: a shared module holds no state). Journal values are immutable once
+published (readonly in the contracts, never written in place), and a
+gameplay snapshot or an entity row is mostly made of the previous one's
+values: chat lines, inventory rows, walking path points, effect rows.
+Every gameplay publication (about 8 a second) walked them all again: half
+of a hunting session's active time went into sizing. A flat value holds no
+reference, so its size does not depend on `shared`; whether it is itself a
+repeat is still asked first, so the shared count is unchanged.
+
+===========================================================================
+*/
+
+// "-1.2345678901234567e-123" is the widest a double prints in JSON.
+const WIDEST_NUMBER_CHARS = 24;
+// A repeated array within one structured clone: a back-reference, not a copy.
+const SHARED_REFERENCE_CHARS = 4;
+const MAX_DEPTH = 64;
+
+/*
+================
+journalCost
+
+UTF-16 bytes of the JSON a value would serialise to, as estimated above.
+With `shared`, an array or object already in it costs a reference, and
+every array or object counted is added to it. Without a set, every
+occurrence counts in full. With `flat`, a flat value's JSON characters are
+read from it when measured before, and written to it when first measured.
+================
+*/
+export function journalCost( value: unknown, shared?: WeakSet<object>, flat?: WeakMap<object, number> ): number {
+	return jsonChars( value, 0, shared, flat ) * 2;
+}
+
+/*
+================
+jsonChars
+================
+*/
+function jsonChars( value: unknown, depth: number, shared?: WeakSet<object>, flat?: WeakMap<object, number> ): number {
+	switch ( typeof value ) {
+		case "string":
+			return value.length + 2;
+		case "number":
+			return numberChars( value );
+		case "boolean":
+			return value ? 4 : 5;
+		case "bigint":
+			// Stall rows carry u64 price and serial. An estimator must not
+			// refuse what the journal carries: count the decimal digits.
+			return value.toString().length;
+		case "undefined":
+		case "function":
+		case "symbol":
+			return 0;
+	}
+	if ( value === null ) return 4;
+	if ( depth > MAX_DEPTH ) throw RangeError( "World journal event nests too deeply" );
+	if ( ArrayBuffer.isView( value ) ) {
+		// JSON writes a typed array as an object of index keys.
+		const length = (value as unknown as ArrayLike<number>).length ?? value.byteLength;
+		return 2 + length * (WIDEST_NUMBER_CHARS + 8);
+	}
+	if ( shared ) {
+		if ( shared.has( value as object ) ) return SHARED_REFERENCE_CHARS;
+		shared.add( value as object );
+	}
+	const known = flat?.get( value as object );
+	if ( known !== undefined ) return known;
+	let isFlat = true;
+	if ( Array.isArray( value ) ) {
+		let chars = 2 + Math.max( 0, value.length - 1 );
+		for ( let i = 0; i < value.length; i++ ) {
+			const item = value[i];
+			// JSON writes null for array holes and unserialisable items.
+			if ( item === undefined || typeof item === "function" || typeof item === "symbol" ) chars += 4;
+			else {
+				if ( item !== null && typeof item === "object" ) isFlat = false;
+				chars += jsonChars( item, depth + 1, shared, flat );
+			}
+		}
+		if ( isFlat ) flat?.set( value, chars );
+		return chars;
+	}
+	const toJSON = (value as { toJSON?: unknown; }).toJSON;
+	if ( typeof toJSON === "function" ) return jsonChars( toJSON.call( value ), depth + 1, shared, flat );
+	let chars = 2, members = 0;
+	for ( const key in value as object ) {
+		if ( !Object.prototype.hasOwnProperty.call( value, key ) ) continue;
+		const item = (value as Record<string, unknown>)[key];
+		if ( item === undefined || typeof item === "function" || typeof item === "symbol" ) continue;
+		if ( item !== null && typeof item === "object" ) isFlat = false;
+		chars += key.length + 3 + jsonChars( item, depth + 1, shared, flat );
+		members++;
+	}
+	chars += Math.max( 0, members - 1 );
+	if ( isFlat ) flat?.set( value as object, chars );
+	return chars;
+}
+
+/*
+================
+numberChars
+================
+*/
+function numberChars( value: number ): number {
+	if ( !Number.isFinite( value ) ) return 4;
+	if ( !Number.isInteger( value ) || Math.abs( value ) >= 1e21 ) return WIDEST_NUMBER_CHARS;
+	let chars = value < 0 ? 2 : 1;
+	for ( let n = Math.abs( value ); n >= 10; n = Math.floor( n / 10 ) ) chars++;
+	return chars;
+}

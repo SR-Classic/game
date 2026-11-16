@@ -1,0 +1,1244 @@
+/*
+===========================================================================
+
+loader.ts - the asset worker's request dispatcher
+
+Receives load, cancel and install requests from the main thread. Each load
+reads verified bytes through the pack reader, decodes them for the
+requested kind (image, model, character, world, effects, navigation) and
+transfers the result back. Foreground loads hold one of four capacity
+slots; the background installer runs only while none is held.
+
+Demand and execution are separate counts. A cancellation is acknowledged
+("released") when it is received: nothing is delivered for the id again
+and the main thread may reuse its slot at once. The execution keeps its
+capacity slot until its promise settles - a native decode AbortSignal
+cannot stop still owns its buffers - and demand that arrives while every
+execution slot is held waits, so a load submitted behind a draining
+cancellation is admitted as the drain settles, never refused.
+
+===========================================================================
+*/
+
+import { decodeGuildCrest } from "@/engine/foundation/ui/guild-crest";
+import { assetRequestBudget } from "@/engine/foundation/assets/asset-budget";
+import { prepareWorldScene, worldSceneTransfers } from "@/engine/foundation/rendering/world-scene";
+import { createNavigationResources } from "./navigation/navigation";
+import { decodeDxt1 } from "@/engine/foundation/assets/dds";
+import { createEffectDecoder } from "./effects/effects";
+import {
+	decodeNativeTexture,
+	NATIVE_TEXTURE_MIME,
+	validateNativeTexture
+} from "@/engine/foundation/assets/native-texture";
+import type { WorldTexture } from "@/engine/contracts/texture";
+import { pngBytes, DECODED_IMAGE_BYTES } from "@/engine/foundation/assets/image-budget";
+import { createWorldDecoder } from "./world/world";
+import { createModelDecoder } from "./model/model";
+import { AssetAbsentError, createPacks } from "./packs/packs";
+import { createBackgroundInstaller } from "./install";
+import { pageEntryBundle } from "@/engine/foundation/assets/page-entry";
+import { readBytes } from "@/engine/foundation/assets/read-bytes";
+import { assetFailure, transientAssetFailure } from "@/engine/foundation/assets/asset-recovery";
+import type { AssetRequest, AssetWorkerMessage } from "@/engine/contracts/assets";
+import { rgbaPickAlpha, bitmapPickAlpha } from "@/engine/foundation/rendering/pick-alpha";
+import type { TextureVariant } from "@/engine/foundation/assets/texture-variants";
+type ResolvedWorld = Awaited<ReturnType<ReturnType<typeof createWorldDecoder>["resolve"]>>;
+// Loading-screen progress publications are coalesced to this interval.
+const PROGRESS_INTERVAL_MS = 150;
+const DOWNLOAD_RETRY_DELAYS_MS = [ 250, 1000 ] as const;
+// A download that receives nothing for this long, waiting for headers or in
+// a stalled body, is abandoned as a transport failure and retried. Headers
+// and each non-empty chunk restart the window. A request silent from the
+// start settles in 46.25 s (three windows plus backoff); one whose headers
+// arrive just before the window and whose body then stalls, in about 91 s.
+// Both come before the 120 s worker watchdog, so callers see a typed
+// transient failure, not a dead worker. Bytes that keep trickling in extend
+// a download until navigation's 60 s load deadline (also transient) or the
+// watchdog. A retry resumes after the bytes earlier attempts kept
+// (PartialRead, #3354), and an attempt that carried the read further than
+// any before it spends no retry: a path that delivers in bursts finishes,
+// one that never delivers still fails after the three attempts above.
+const DOWNLOAD_NO_PROGRESS_MS = 15000;
+const TRANSIENT_HTTP_STATUS = new Set( [ 408, 429, 500, 502, 503, 504 ] );
+// Stands in for the effect catalog's bytes once the decoder holds it parsed.
+const PARSED_EFFECT_CATALOG = new Uint8Array( 0 );
+// Stands in for a world bundle's bytes once they are parsed.
+const RELEASED_WORLD_BYTES = new Uint8Array( 0 );
+/*
+================
+listedFileGone
+
+A 404 for a path the manifest listed (an absent path is AssetAbsentError):
+the published files belong to a newer release than this page's manifest.
+================
+*/
+function listedFileGone( error: unknown ) {
+	return !(error instanceof AssetAbsentError) && error instanceof Error && "status" in error &&
+		Number( error.status ) === 404;
+}
+
+/*
+================
+transientAssetFault
+
+Whether a failure's shape is a transient transport or device fault
+rather than a verdict on the content: an error already marked
+transient, an allocation the engine refused (a RangeError naming
+memory, or the bare "out of memory" string the #2299 incident threw -
+the same two shapes the simulation lane names in
+isOutOfMemoryFailure), or an I/O DOMException (NetworkError).
+Decode-shaped DOMExceptions (InvalidStateError) and cancellation
+(AbortError) stay out: those are content and caller facts, not
+transport (#2337).
+================
+*/
+export function transientAssetFault( error: unknown ): boolean {
+	if ( transientAssetFailure( error ) ) return true;
+	if ( error instanceof DOMException ) return error.name === "NetworkError";
+	return /^(RangeError: )?(out of memory|array buffer allocation failed)/i.test( String( error ) );
+}
+
+/*
+================
+createLoader
+
+Own decoders, foreground requests and the background installation scheduler.
+================
+*/
+export function createLoader( send: ( result: AssetWorkerMessage, transfer: Transferable[] ) => void ) {
+	const navigation = createNavigationResources();
+	const effects = createEffectDecoder();
+	const worlds = createWorldDecoder();
+	const models = createModelDecoder();
+	// Parsed immutable metadata belongs to this worker/manifest lifetime. Model
+	// buffers remain owned by individual decode transactions and are transferred.
+	const animationCatalogs = new Map<
+		string,
+		{ objects: Record<string, NonNullable<Awaited<ReturnType<typeof worlds.resolve>>["animated"]>[number]>; }
+	>();
+	// Demand can be cancelled immediately; execution holds capacity until its
+	// promise settles, including native decodes that AbortSignal cannot stop.
+	// pending maps every live demand (waiting or executing) to its controller;
+	// active counts only the executions holding a capacity slot.
+	const pending = new Map<number, AbortController>();
+	const active = new Set<AbortController>();
+	// Demand admitted while every execution slot is held. A waiting entry
+	// owns nothing but its controller; it starts as an execution settles.
+	const waiting: {
+		request: Extract<AssetRequest, { kind: "load"; }>;
+		controller: AbortController;
+	}[] = [];
+	// The effect program catalog is parsed once and kept parsed (program.ts);
+	// its 40 MB of source bytes are needed only for that first parse.
+	let disposed = false, effectCatalogParsed = false;
+	const files = new Map<string, number>(), readyFiles = new Set<string>();
+	let bytesRead = 0;
+	// The watchdog's per-job notes. Bytes cannot be attributed to one load:
+	// packed reads deduplicate shared downloads across co-waiting loads
+	// (packs.ts serves manifest, member and block reads from its own
+	// lifetime), so movement on the shared pipe is every active load's
+	// progress, and every load is credited. The absolute ceiling bounds a
+	// load that merely rides its siblings' traffic.
+	const jobProgress = new Map<number, {
+		id: number;
+		bytes: number;
+		sent: number;
+		primaryDone: boolean;
+		decoding: boolean;
+	}>();
+	// Foreground downloads in flight. The decoding mark waits for the pipe
+	// to drain: while a download can still deliver, a load is fetching.
+	let activeDownloads = 0;
+	// Stall windows of the downloads in flight, as their restart calls.
+	// A synchronous span (a world decode, a scene pack) parks the
+	// worker's loop for its whole length: no download can be read and no
+	// stall timer can run while it lasts, so when the span ends every
+	// in-flight window restarts (syncWork) - the parked time was never
+	// silence a download could have used (#2862).
+	const stallWindows = new Set<() => void>();
+	let received = 0, lastReceived = 0, lastProgress = performance.now(), speed = 0;
+	let progressTimer: ReturnType<typeof setTimeout> | null = null;
+	/*
+	================
+	syncWork
+
+	Run one synchronous stretch (a world decode, a scene pack). The
+	loop is parked for its whole length, so when it ends every
+	in-flight download's stall window restarts: a download whose
+	bytes were only queued behind the stretch must not be killed
+	for the wait.
+	================
+	*/
+	function syncWork<T>( run: () => T ): T {
+		try {
+			return run();
+		} finally {
+			for ( const restart of stallWindows ) restart();
+		}
+	}
+	/*
+	================
+	progress
+
+	Publish installation progress, at most once per PROGRESS_INTERVAL_MS.
+	A change inside the interval arms one trailing publication that carries
+	the latest state, so a settled queue still reaches the loading screen.
+	Publishing every settle instead posted a message per file read (0.8 s of
+	worker time in a 17 s streaming trace, plus its main-thread receipt).
+	================
+	*/
+	function progress() {
+		const elapsed = performance.now() - lastProgress;
+		if ( elapsed >= PROGRESS_INTERVAL_MS ) {
+			publishProgress();
+			return;
+		}
+		progressTimer ??= setTimeout( publishProgress, PROGRESS_INTERVAL_MS - elapsed );
+	}
+	/*
+	================
+	publishProgress
+	================
+	*/
+	function publishProgress() {
+		if ( progressTimer !== null ) clearTimeout( progressTimer );
+		progressTimer = null;
+		const now = performance.now(), elapsed = now - lastProgress;
+		if ( elapsed > 0 ) speed = (received - lastReceived) * 1000 / elapsed;
+		lastReceived = received;
+		lastProgress = now;
+		if ( !disposed ) {
+			send( {
+				kind: "progress",
+				progress: {
+					bytesRead,
+					bytesReceived: received,
+					bytesPerSecond: speed,
+					filesReady: readyFiles.size,
+					filesActive: files.size,
+					cacheHits: packs.stats().hits,
+					currentFile: [ ...files.keys() ].at( -1 ) ?? ""
+				}
+			}, [] );
+			// The watchdog's per-job notes ride the same coalesced beat, one
+			// per load whose stream moved since the last publication.
+			for ( const job of jobProgress.values() ) {
+				if ( job.bytes === job.sent ) continue;
+				job.sent = job.bytes;
+				send( { kind: "job-progress", id: job.id, bytes: job.bytes }, [] );
+			}
+		}
+	}
+	/*
+	================
+	markDecoding
+
+	The pipe has drained under every load whose primary bytes are in: what
+	remains for them is decode. Sent once per drain; a later download flips
+	the load back with markFetching, and the next drain marks it again.
+	================
+	*/
+	function markDecoding() {
+		for ( const job of jobProgress.values() ) {
+			if ( !job.primaryDone || job.decoding ) continue;
+			job.decoding = true;
+			if ( !disposed ) send( { kind: "job-decoding", id: job.id }, [] );
+		}
+	}
+	/*
+	================
+	markFetching
+
+	A download started, so marked loads are fetching again, not decoding:
+	the watchdog restores their download stall window.
+	================
+	*/
+	function markFetching() {
+		for ( const job of jobProgress.values() ) {
+			if ( !job.decoding ) continue;
+			job.decoding = false;
+			if ( !disposed ) send( { kind: "job-fetching", id: job.id }, [] );
+		}
+	}
+	/*
+	================
+	activity
+
+	Track foreground activity so installation cannot compete with an active load.
+	================
+	*/
+	function activity( path: string, event: "start" | "ready" | "end" ) {
+		if ( event === "start" ) files.set( path, (files.get( path ) ?? 0) + 1 );
+		else if ( event === "ready" ) readyFiles.add( path );
+		else {
+			const count = (files.get( path ) ?? 1) - 1;
+			if ( count ) files.set( path, count );
+			else files.delete( path );
+		}
+		progress();
+	}
+	/*
+	================
+	download
+
+	Read a bounded asset through the shared pack and network owner.
+	================
+	*/
+	async function download(
+		url: string,
+		limit: number,
+		signal: AbortSignal,
+		range?: import("./packs/packs").PackRange,
+		observeValidator?: ( validator: string | null ) => void
+	) {
+		// Every load in flight shares this pipe (packs.ts deduplicates its
+		// reads), so the download counts toward all of them: it flips any
+		// decoding-marked load back to fetching, and its chunks credit every
+		// load's byte note in downloadBytes.
+		activeDownloads++;
+		markFetching();
+		const partial: PartialRead = { chunks: [], size: 0, whole: null };
+		// failures counts the retries spent since the read last moved
+		// further; reached is the furthest byte any attempt kept.
+		let failures = 0, reached = 0;
+		try {
+			for ( ;; ) {
+				signal.throwIfAborted();
+				try {
+					return await downloadAttempt( { url, limit, signal, range, partial }, observeValidator );
+				} catch ( error ) {
+					const transient = error instanceof TypeError || error instanceof NoProgressError ||
+						transientAssetFault( error ) ||
+						(error instanceof Error && "status" in error &&
+							TRANSIENT_HTTP_STATUS.has( Number( error.status ) ));
+					if ( signal.aborted || !transient ) throw error;
+					// Bytes only a resumable read keeps count as progress; a
+					// whole read that cannot resume starts over, as before.
+					if ( !range && !partial.whole ) forgetPartial( partial );
+					if ( partial.size > reached ) {
+						reached = partial.size;
+						failures = 0;
+					}
+					const delay = DOWNLOAD_RETRY_DELAYS_MS[failures++];
+					if ( delay === undefined ) throw assetFailure( String( error ), true );
+					await retryDownloadAfter( delay, signal );
+				}
+			}
+		} finally {
+			activeDownloads--;
+			if ( activeDownloads === 0 ) markDecoding();
+		}
+	}
+	/*
+	================
+	retryDownloadAfter
+
+	Keep the existing request slot during backoff. Cancellation releases the
+	timer immediately; a disposed worker must never start another download.
+	================
+	*/
+	function retryDownloadAfter( delay: number, signal: AbortSignal ): Promise<void> {
+		return new Promise( ( resolve, reject ) => {
+			/*
+			================
+			cancel
+			================
+			*/
+			function cancel() {
+				clearTimeout( timer );
+				signal.removeEventListener( "abort", cancel );
+				reject( signal.reason );
+			}
+			const timer = setTimeout( () => {
+				signal.removeEventListener( "abort", cancel );
+				resolve();
+			}, delay );
+			signal.addEventListener( "abort", cancel, { once: true } );
+			if ( signal.aborted ) cancel();
+		} );
+	}
+	/*
+	================
+	downloadAttempt
+
+	Only transport failures are retried. Range validation and byte limits fail
+	immediately; manifest, hash and decoder validation stay with their owners.
+	================
+	*/
+	async function downloadAttempt( read: DownloadRead, observeValidator?: ( validator: string | null ) => void ) {
+		const { url, signal } = read;
+		// The attempt aborts on the caller's cancellation or on its own stall
+		// timer; only the stall becomes NoProgressError (transient). Every
+		// received chunk restarts the timer, and so does the end of a
+		// synchronous span that parked the loop (syncWork): silence is
+		// only ever time the worker could have read in.
+		const attempt = new AbortController(), stalled = new NoProgressError( url, DOWNLOAD_NO_PROGRESS_MS );
+		const forward = () => attempt.abort( signal.reason );
+		signal.addEventListener( "abort", forward, { once: true } );
+		let timer = setTimeout( () => attempt.abort( stalled ), DOWNLOAD_NO_PROGRESS_MS );
+		/*
+		================
+		restart
+
+		Restart the stall window.
+		================
+		*/
+		const restart = () => {
+			clearTimeout( timer );
+			timer = setTimeout( () => attempt.abort( stalled ), DOWNLOAD_NO_PROGRESS_MS );
+		};
+		stallWindows.add( restart );
+		try {
+			return await downloadBytes( { ...read, signal: attempt.signal }, restart, observeValidator );
+		} catch ( error ) {
+			// The caller's cancellation wins whatever else ended the attempt: a
+			// cancel racing the stall must surface its own reason, not the stall.
+			signal.throwIfAborted();
+			throw attempt.signal.reason === stalled ? stalled : error;
+		} finally {
+			stallWindows.delete( restart );
+			clearTimeout( timer );
+			signal.removeEventListener( "abort", forward );
+		}
+	}
+	/*
+	================
+	downloadBytes
+
+	One HTTP read under the attempt's signal; progressed runs on the headers
+	and on every body chunk.
+	================
+	*/
+	async function downloadBytes(
+		read: DownloadRead,
+		progressed: () => void,
+		observeValidator?: ( validator: string | null ) => void
+	) {
+		const { url, limit, signal, range, partial } = read;
+		const offset = partial.size;
+		// Every byte an earlier attempt kept is already here: a body that
+		// ended between its last chunk and its close needs no request.
+		if ( offset > 0 && offset === (range ? range.end - range.start + 1 : partial.whole?.total) ) {
+			return joinPartial( partial );
+		}
+		const started = performance.now();
+		// Cache Storage owns verified members. Keep partial HTTP responses out
+		// of the browser cache: different ranges share the container URL,
+		// and a resumed whole read asks for a range too.
+		const response = await fetch( url, {
+			signal,
+			credentials: "omit",
+			redirect: "error",
+			cache: range || offset > 0 ?
+				"no-store" :
+				/\/marks\/[GA][0-9_]+\.crb$/.test(
+						new URL( url ).pathname
+					) ?
+				"default" :
+				"no-cache",
+			headers: range ?
+				{ Range: `bytes=${range.start + offset}-${range.end}` } :
+				offset > 0 ?
+				{ Range: `bytes=${offset}-` } :
+				undefined
+		} );
+		progressed();
+		if ( response.ok && observeValidator ) observeValidator( response.headers.get( "etag" ) );
+		if ( offset > 0 && response.status === 416 ) {
+			// The kept bytes no longer fit the object (it changed under the
+			// read): a transport fact, and the next attempt starts over.
+			void response.body?.cancel().catch( () => {} );
+			forgetPartial( partial );
+			throw assetFailure( "Invalid asset range response", true );
+		}
+		if ( !response.ok || !response.body ) {
+			// Cleanup is not awaited: a cancel that never settles must not hold the slot.
+			void response.body?.cancel().catch( () => {} );
+			throw Object.assign( new Error( `Asset HTTP ${response.status}` ), { status: response.status } );
+		}
+		if (
+			range &&
+			(response.status !== 206 ||
+				response.headers.get( "content-range" ) !==
+					`bytes ${range.start + offset}-${range.end}/${range.total}`)
+		) {
+			void response.body.cancel().catch( () => {} );
+			// A middlebox that ignores Range - answering 200 with the whole
+			// object, or a 206 naming some other range - is a transport
+			// fact: the read retries, then enters the bounded recovery
+			// marked transient (#2337). What it kept is not trusted.
+			forgetPartial( partial );
+			throw assetFailure( "Invalid asset range response", true );
+		}
+		if ( !range && response.status === 200 ) {
+			// A whole answer starts the object over, whatever was kept: a
+			// server that ignored the resume, or a first attempt.
+			forgetPartial( partial );
+			partial.whole = resumableWhole( response.headers );
+		} else if ( !range && offset > 0 && !resumedWhole( response, partial, offset ) ) {
+			void response.body.cancel().catch( () => {} );
+			forgetPartial( partial );
+			throw assetFailure( "Invalid asset range response", true );
+		}
+		const prefix = partial.size;
+		// At least one byte: a kept prefix at the limit still reports the
+		// limit when one more byte arrives.
+		const bytes = await readBytes( response.body, Math.max( 1, limit - prefix ), {
+			kept: chunk => {
+				partial.chunks.push( chunk );
+				partial.size += chunk.byteLength;
+			},
+			received: size => {
+				// An empty chunk is not progress.
+				if ( size > 0 ) progressed();
+				bytesRead += size;
+				// The pipe is shared: its movement is every active load's
+				// progress (packs.ts deduplicates reads across loads).
+				for ( const job of jobProgress.values() ) job.bytes += size;
+				if ( range ) received += size;
+				progress();
+			},
+			signal
+		} );
+		// Ranges are identity bytes with no HTTP cache. For other responses,
+		// Resource Timing distinguishes compressed transfers from HTTP cache
+		// reads; counting decoded stream chunks would invent warm downloads.
+		if ( !range ) {
+			const timing = performance.getEntriesByName( url, "resource" ).filter( row => row.startTime >= started ).at(
+				-1
+			) as PerformanceResourceTiming | undefined;
+			if ( timing ) received += timing.transferSize;
+			progress();
+		}
+		return prefix === 0 ? bytes : joinPartial( partial );
+	}
+	/*
+	================
+	hdAvailability
+
+	The published build's word on the HD set (#2800), as the main pack
+	index carries it, posted to the page that lists the row.
+	================
+	*/
+	function hdAvailability( available: boolean ) {
+		send( { kind: "hd-availability", available }, [] );
+	}
+	/*
+	================
+	packGone
+
+	A pack this page's manifest names answered 404: the release moved
+	under the page (#3104). Posted at once, not attached to the job the
+	loose recovery may still satisfy.
+	================
+	*/
+	function packGone() {
+		send( { kind: "release-stale" }, [] );
+	}
+	/*
+	================
+	liveManifestValidator
+
+	The live packs manifest's HTTP validator, read with one HEAD so a
+	release check compares validators instead of downloading the whole
+	15 MB manifest again (#3104). Null when the server answers without
+	one (the caller then falls back to hashing the body); a failed read
+	throws, so a compare that never ran is never read as "unchanged".
+	================
+	*/
+	async function liveManifestValidator( url: string ): Promise<string | null> {
+		const response = await fetch( url, {
+			method: "HEAD",
+			credentials: "omit",
+			redirect: "error",
+			cache: "no-cache"
+		} );
+		if ( !response.ok ) {
+			throw Object.assign( new Error( `Asset HTTP ${response.status}` ), { status: response.status } );
+		}
+		return response.headers.get( "etag" );
+	}
+	const packs = createPacks( download, activity, hdAvailability, packGone, liveManifestValidator );
+	// The texture variant this device is served (texture-variants.ts): the
+	// page answers once its device knows its features; native texture reads
+	// wait for the answer.
+	let textureVariant: ( variant: TextureVariant | null ) => void = () => {};
+	packs.textureVariant(
+		new Promise( resolve => {
+			textureVariant = resolve;
+		} )
+	);
+	// Background work runs only while no foreground load holds capacity. The
+	// last foreground load to settle wakes it: an event, not a poll.
+	let idleWaiters: (() => void)[] = [];
+	/*
+	================
+	foregroundIdle
+
+	Wait until no foreground owner holds a request slot.
+	================
+	*/
+	function foregroundIdle(): Promise<void> {
+		if ( active.size === 0 || disposed ) return Promise.resolve();
+		return new Promise( ( resolve ) => idleWaiters.push( resolve ) );
+	}
+	/*
+	================
+	wakeIdleWaiters
+
+	Release installation waiters only after foreground work has settled.
+	================
+	*/
+	function wakeIdleWaiters() {
+		const waiters = idleWaiters;
+		idleWaiters = [];
+		for ( const resolve of waiters ) resolve();
+	}
+	// The install list describes this release, like the pack index itself.
+	// It is a release route rather than a member of the packs it enumerates;
+	// each listed asset still passes through packs.install and SHA verification.
+	const installer = createBackgroundInstaller( {
+		read: ( url, limit, signal ) => download( url.href, limit, signal ),
+		install: packs.install
+	}, foregroundIdle );
+	/*
+	================
+	pump
+
+	Start waiting demand while an execution slot is free. Called when
+	demand arrives and whenever an execution settles; a cancelled waiter
+	is skipped (its demand already left with the acknowledgement).
+	================
+	*/
+	function pump() {
+		while ( !disposed && waiting.length && active.size < 4 ) {
+			const next = waiting.shift()!;
+			if ( next.controller.signal.aborted ) continue;
+			active.add( next.controller );
+			void load( next.request, next.controller );
+		}
+	}
+	/*
+	================
+	load
+
+	Decode a bounded request and transfer resource ownership exactly once.
+	================
+	*/
+	async function load(
+		request: Extract<AssetRequest, {
+			kind: "load";
+		}>,
+		controller: AbortController
+	) {
+		const job = { id: request.id, bytes: 0, sent: 0, primaryDone: false, decoding: false };
+		jobProgress.set( request.id, job );
+		// Whether the primary bytes carry the pack reader's length-and-digest
+		// guarantee. A decoder refusal means broken content only when they do;
+		// on unverified bytes it means the body arrived wrong (#2337).
+		let primaryVerified = true;
+		try {
+			const url = new URL( request.url );
+			if ( ![ "http:", "https:" ].includes( url.protocol ) || url.username || url.password ) {
+				throw new Error( "Invalid asset URL" );
+			}
+			primaryVerified = url.pathname.startsWith( "/assets/" );
+			let bytes = request.decode === "effect" && effectCatalogParsed ?
+				PARSED_EFFECT_CATALOG :
+				primaryVerified ?
+				await packs.read( url, request.limit, controller.signal ) :
+				await download( url.href, request.limit, controller.signal );
+			job.primaryDone = true;
+			// The primary bytes are in. The decoding mark still waits for
+			// the pipe to drain (decode-phase reads flip the job back to
+			// fetching and re-mark it when they settle): only silence with
+			// no download in flight is decode, not a slow link.
+			if ( activeDownloads === 0 ) markDecoding();
+			if ( !disposed && pending.get( request.id ) === controller ) {
+				if ( request.decode === "navigation" ) {
+					let size = bytes.byteLength;
+					const product = await navigation.resolve( bytes, Number( url.hash.slice( 1 ) ), async path => {
+						if (
+							typeof path !== "string" || !path.startsWith( "/assets/" ) || path.includes( ".." ) ||
+							path.includes( "\\" )
+						) throw new Error( "Invalid navigation asset path" );
+						const data = await packs.read( new URL( path, url.origin ), 64 << 20, controller.signal );
+						size += data.byteLength;
+						if ( size > 128 << 20 ) throw new Error( "Navigation transaction budget" );
+						return data;
+					} );
+					if ( disposed || controller.signal.aborted || pending.get( request.id ) !== controller ) return;
+					pending.delete( request.id );
+					send( { kind: "navigation", id: request.id, product }, [] );
+				} else if ( request.decode === "effects" ) {
+					const catalog = effects.decode( bytes );
+					pending.delete( request.id );
+					send( { kind: "effects", id: request.id, catalog }, [] );
+				} else if ( (request.decode === "world" || request.decode === "frontend-world") ) {
+					let total = bytes.byteLength;
+					/*
+					================
+					readWorldResource
+
+					Resolve authored world dependencies through the same bounded asset reader.
+					================
+					*/
+					async function readWorldResource( path: string ) {
+						if ( !path.startsWith( "/assets/" ) || path.includes( ".." ) || path.includes( "\\" ) ) {
+							throw new Error( "Invalid world resource path" );
+						}
+						const resource = await packs.read( new URL( path, url.origin ), 128 << 20, controller.signal );
+						total += resource.byteLength;
+						if ( total > (128 << 20) ) throw new Error( "World resource transaction exceeds budget" );
+						return resource;
+					}
+					// The decoder's work notes, forwarded as this job's liveness:
+					// each decode call counts from zero, so a per-job base keeps
+					// the forwarded total monotonic across the call sequence.
+					let decodeBase = 0, decodeUnits = 0;
+					/*
+					================
+					noteDecodeWork
+					================
+					*/
+					const noteDecodeWork = ( units: number ) => {
+						const total = decodeBase + units;
+						if ( total <= decodeUnits ) return;
+						decodeUnits = total;
+						if ( !disposed ) send( { kind: "job-decoding-progress", id: request.id, units: total }, [] );
+					};
+					// An outdoor scene names its coordinate anchor and which part it
+					// wants (world.ts WorldDecodeOptions); a terrain part is one region.
+					const hash = new URLSearchParams( url.hash.slice( 1 ) ),
+						anchor = hash.get( "anchor" ),
+						part = (hash.get( "part" ) ?? "all") as import("./world/world").WorldDecodePart,
+						origin = anchor === null ? undefined : Number.parseInt( anchor, 16 );
+					if ( anchor !== null && !/^[0-9a-f]{1,4}$/.test( anchor ) ) {
+						throw new Error( "Invalid world anchor" );
+					}
+					if ( part === "terrain" ) {
+						const terrain = await worlds.resolveTerrain( bytes, readWorldResource, url.pathname );
+						if ( disposed || controller.signal.aborted || pending.get( request.id ) !== controller ) return;
+						const prepared = syncWork( () =>
+							prepareWorldScene(
+								worlds.decode( terrain, false, {
+									origin,
+									part,
+									onProgress: noteDecodeWork
+								} )
+							)
+						);
+						decodeBase = decodeUnits;
+						send( { kind: "world", id: request.id, prepared }, worldSceneTransfers( prepared.scene ) );
+						pending.delete( request.id );
+						return;
+					}
+					let resolved: ResolvedWorld | null = await worlds.resolve( bytes, readWorldResource, url.pathname );
+					// The source bytes and, below, the parsed bundle die before the
+					// scene is packed: a frontend stage holds them at several hundred
+					// MB, which otherwise all coexist with the packed arena.
+					bytes = RELEASED_WORLD_BYTES;
+					if ( disposed || controller.signal.aborted || pending.get( request.id ) !== controller ) return;
+					const placedIds = new Set( resolved.objects.placements.map( row => row.objectId ) );
+					const refs = new Set(
+						resolved.objects.resources.bsr.filter( row => placedIds.has( row.objectId ) ).flatMap( row =>
+							(row.branches ?? [ row ]).map( branch => branch.sourcePath?.toLowerCase() )
+						)
+					);
+					const animated = new Map<string, NonNullable<ResolvedWorld["animated"]>[number]>();
+					for ( const path of await packs.worldAnimationManifests( url.origin, refs ) ) {
+						let manifest = animationCatalogs.get( path );
+						if ( !manifest ) {
+							const document = JSON.parse(
+								new TextDecoder().decode( await readWorldResource( path ) )
+							) as {
+								objects: Record<
+									string,
+									Omit<NonNullable<ResolvedWorld["animated"]>[number], "sourcePath">
+								>;
+							};
+							manifest = {
+								objects: Object.fromEntries(
+									Object.entries( document.objects ).map( (
+										[sourcePath, entry]
+									) => [ sourcePath.toLowerCase(), { ...entry, sourcePath } ] )
+								)
+							};
+							animationCatalogs.set( path, manifest );
+						}
+						for ( const sourcePath of refs ) {
+							if ( sourcePath && manifest.objects[sourcePath] ) {
+								animated.set( sourcePath, manifest.objects[sourcePath] );
+							}
+						}
+					}
+					// GLBs provide geometry and animation only. Native BMTs own
+					// world texture identity and draw state, for both backends.
+					for ( const entry of animated.values() ) {
+						entry.model = {
+							...models.character( models.decode( await readWorldResource( entry.glbPublicPath ) ) ),
+							images: []
+						};
+						if ( disposed || controller.signal.aborted || pending.get( request.id ) !== controller ) return;
+					}
+					resolved.animated = [ ...animated.values() ];
+					// The decode closures below capture the bundle: narrowing
+					// does not reach into them, so name the non-null value.
+					const resolvedBundle = resolved;
+					let scene = syncWork( () =>
+						worlds.decode( resolvedBundle, request.decode === "frontend-world", {
+							origin,
+							part,
+							onProgress: noteDecodeWork
+						} )
+					);
+					decodeBase = decodeUnits;
+					const propsPath = new URLSearchParams( url.hash.slice( 1 ) ).get( "props" );
+					if ( propsPath && request.decode === "frontend-world" ) {
+						const manifest = JSON.parse(
+							new TextDecoder( "utf-8", { fatal: true } ).decode( await readWorldResource( propsPath ) )
+						) as {
+							props: {
+								objectId: number;
+								name: string;
+								position: { x: number; y: number; z: number; };
+								yaw: number;
+								scale: number;
+							}[];
+							resources: ResolvedWorld["objects"]["resources"];
+						};
+						const added = [], addedScenery: NonNullable<typeof scene.scenery>[number][] = [];
+						for ( const prop of manifest.props ) {
+							if ( prop.name === "idol_lizard" ) continue;
+							if ( prop.scale !== 1 ) throw Error( "Unsupported interface model scale" );
+							const region = resolvedBundle.source.sectorX | (resolvedBundle.source.sectorY << 8);
+							const product = syncWork( () =>
+								worlds.decode(
+									{
+										source: resolvedBundle.source,
+										terrain: { blocks: [] },
+										terrainTextures: { tileCatalog: { referencedTiles: [] } },
+										objects: {
+											resources: manifest.resources,
+											placements: [ { ...prop, uid: prop.objectId, regionId: String( region ) } ]
+										}
+									},
+									true,
+									{ onProgress: noteDecodeWork }
+								)
+							);
+							decodeBase = decodeUnits;
+							added.push(
+								...product.groups.map( group => ({
+									...group,
+									id: "interface:" + prop.objectId + ":" + group.id,
+									visibility: undefined,
+									material: { ...group.material, objectFade: false }
+								}) )
+							);
+							addedScenery.push(
+								...(product.scenery ?? []).map( emitter => ({
+									...emitter,
+									id: "interface:" + prop.objectId + ":" + emitter.id,
+									placement: "interface:" + prop.objectId + ":" + emitter.placement
+								}) )
+							);
+						}
+						scene = {
+							...scene,
+							groups: [ ...scene.groups, ...added ],
+							scenery: [ ...(scene.scenery ?? []), ...addedScenery ]
+						};
+					}
+					resolved = null;
+					if ( disposed || controller.signal.aborted || pending.get( request.id ) !== controller ) return;
+					const prepared = syncWork( () => prepareWorldScene( scene ) ),
+						transfer = worldSceneTransfers( prepared.scene );
+					send( { kind: "world", id: request.id, prepared }, transfer );
+					pending.delete( request.id );
+				} else if ( request.decode === "character" || request.decode === "effect" ) {
+					let model: import("@/engine/contracts/character").CharacterSource;
+					if ( request.decode === "effect" ) {
+						const decoded = effects.model( bytes, decodeURIComponent( url.hash.slice( 1 ) ) ), raw = [];
+						effectCatalogParsed = true;
+						let size = 0;
+						for ( const path of decoded.imagePaths ) {
+							if ( !path.startsWith( "/assets/" ) || path.includes( ".." ) ) {
+								throw new Error( "Invalid effect image path" );
+							}
+							const pixels = await packs.read( new URL( path, url.origin ), 16 << 20, controller.signal );
+							size += pixels.byteLength;
+							if ( size > (32 << 20) ) throw new Error( "Effect image transaction exceeds budget" );
+							raw.push( { bytes: pixels, mime: "image/png" } );
+						}
+						model = { ...decoded.model, images: raw };
+					} else model = models.character( models.decode( bytes ) );
+					const images: WorldTexture[] = [];
+					try {
+						const nativeImages = model.images.map( image =>
+							image.mime === NATIVE_TEXTURE_MIME ? decodeNativeTexture( image.bytes ) : null
+						);
+						const decoded = model.images.reduce(
+							( sum, image, index ) =>
+								sum + (nativeImages[index] ?
+									validateNativeTexture( nativeImages[index]! ) :
+									pngBytes( image.bytes )),
+							0
+						);
+						if ( decoded > DECODED_IMAGE_BYTES ) {
+							throw new Error( "Character images exceed decoded image budget" );
+						}
+						for ( const [index, image] of model.images.entries() ) {
+							const bitmap = nativeImages[index] ?? await createImageBitmap(
+								new Blob( [ image.bytes as Uint8Array<ArrayBuffer> ], { type: image.mime } ),
+								{ premultiplyAlpha: "none", colorSpaceConversion: "none" }
+							);
+							images.push( bitmap );
+							if ( disposed || controller.signal.aborted ) {
+								for ( const bitmap of images ) if ( !("kind" in bitmap) ) bitmap.close();
+								return;
+							}
+						}
+						const transfers = new Set<Transferable>();
+						for ( const image of images ) {
+							if ( "kind" in image ) {
+								for ( const level of image.levels ) transfers.add( level.buffer as ArrayBuffer );
+							} else transfers.add( image );
+						}
+						for ( const p of model.primitives ) {
+							for (
+								const a of [
+									p.inverseBind,
+									p.geometry.positions,
+									p.geometry.normals,
+									p.geometry.uvs,
+									p.geometry.indices,
+									p.geometry.joints,
+									p.geometry.weights,
+									p.geometry.transform
+								]
+							) if ( a ) transfers.add( a.buffer as ArrayBuffer );
+						}
+						for ( const clip of model.clips ) {
+							for ( const channel of clip.channels ) {
+								transfers.add( channel.times.buffer as ArrayBuffer );
+								transfers.add( channel.values.buffer as ArrayBuffer );
+							}
+						}
+						// The page retains either native mip blocks or decoded bitmaps.
+						// Encoded PNGs stay in the worker and become collectible.
+						const delivered: import("@/engine/contracts/character").CharacterModel = {
+							...model,
+							images: images.map( bitmap => ({ width: bitmap.width, height: bitmap.height }) )
+						};
+						pending.delete( request.id );
+						send( { kind: "character", id: request.id, model: delivered, images }, [ ...transfers ] );
+					} catch ( error ) {
+						for ( const image of images ) if ( !("kind" in image) ) image.close();
+						throw error;
+					}
+				} else if ( request.decode === "glb" ) {
+					const model = models.decode( bytes );
+					pending.delete( request.id );
+					send( { kind: "model", id: request.id, model }, [ model.binary ] );
+				} else if ( request.decode === "crest" ) {
+					const image = await createImageBitmap( new ImageData( decodeGuildCrest( bytes ), 16, 16 ), {
+						premultiplyAlpha: "none",
+						colorSpaceConversion: "none"
+					} );
+					if ( disposed || controller.signal.aborted ) {
+						image.close();
+						return;
+					}
+					pending.delete( request.id );
+					send( { kind: "image", id: request.id, image }, [ image ] );
+				} else if ( request.decode === "dds" ) {
+					const decoded = decodeDxt1( bytes, DECODED_IMAGE_BYTES ),
+						alpha = request.pickAlpha ?
+							rgbaPickAlpha( decoded.width, decoded.height, decoded.pixels ) :
+							undefined,
+						image = await createImageBitmap(
+							new ImageData( decoded.pixels, decoded.width, decoded.height ),
+							{ premultiplyAlpha: "none", colorSpaceConversion: "none" }
+						);
+					if ( disposed || controller.signal.aborted ) {
+						image.close();
+						return;
+					}
+					pending.delete( request.id );
+					send(
+						{ kind: "image", id: request.id, image, ...(alpha ? { alpha } : {}) },
+						alpha ? [ image, alpha.pixels.buffer ] : [ image ]
+					);
+				} else if ( request.decode === "png" ) {
+					pngBytes( bytes );
+					const image = await createImageBitmap( new Blob( [ bytes ], { type: "image/png" } ), {
+						premultiplyAlpha: "none",
+						colorSpaceConversion: "none"
+					} );
+					if ( disposed || controller.signal.aborted ) {
+						image.close();
+						return;
+					}
+					// World textures read their picking mask here, off the main thread.
+					const alpha = request.pickAlpha ? bitmapPickAlpha( image ) : undefined;
+					pending.delete( request.id );
+					send(
+						{ kind: "image", id: request.id, image, ...(alpha ? { alpha } : {}) },
+						alpha ? [ image, alpha.pixels.buffer ] : [ image ]
+					);
+				} else if ( request.decode === "release" ) {
+					// The live page (fetched no-cache): report the entry bundle it names,
+					// and whether the live packs manifest moved (a data publish keeps
+					// the entry, so the bundle alone cannot see it, #3104).
+					const html = new TextDecoder( "utf-8" ).decode( bytes );
+					// A compare that could not run is its own answer on the
+					// result (packsCheckFailed), never a silent "unchanged".
+					let packsChanged = false, packsCheckFailed = false;
+					try {
+						packsChanged = await packs.liveManifestChanged( url.origin );
+					} catch {
+						packsCheckFailed = true;
+					}
+					pending.delete( request.id );
+					send( {
+						kind: "release",
+						id: request.id,
+						entry: pageEntryBundle( html, url.origin ),
+						...(packsChanged ? { packsChanged: true } : {}),
+						...(packsCheckFailed ? { packsCheckFailed: true } : {})
+					}, [] );
+				} else {
+					pending.delete( request.id );
+					send( { kind: "bytes", id: request.id, buffer: bytes.buffer }, [ bytes.buffer ] );
+				}
+			}
+		} catch ( error ) {
+			if ( !disposed && pending.get( request.id ) === controller ) {
+				pending.delete( request.id );
+				// A refusal past the primary bytes on a read no digest vouches
+				// for is a transport verdict (the body arrived cut or
+				// substituted), never a content verdict; AssetAbsentError
+				// keeps its own meaning either way (#2337).
+				const unverifiedRefusal = !primaryVerified && job.primaryDone &&
+					!(error instanceof AssetAbsentError);
+				send( {
+					kind: "error",
+					id: request.id,
+					error: String( error ),
+					...(transientAssetFault( error ) || unverifiedRefusal ? { transient: true as const } : {}),
+					...(error instanceof AssetAbsentError ? { absent: true as const } : {}),
+					// The live-page check is not a manifest file; its own 404 is no news.
+					...(request.decode !== "release" && listedFileGone( error ) ? { stale: true as const } : {})
+				}, [] );
+			}
+		} finally {
+			jobProgress.delete( request.id );
+			active.delete( controller );
+			if ( active.size === 0 ) wakeIdleWaiters();
+			if ( pending.get( request.id ) === controller ) pending.delete( request.id );
+			// The execution slot frees only here. A cancelled execution was
+			// already acknowledged when its cancel arrived and sends
+			// nothing more; the freed slot admits the next waiting demand.
+			pump();
+		}
+	}
+	return {
+		/*
+		================
+		receive
+
+		Dispatch load, cancellation and installation messages to their owning state.
+		================
+		*/
+		receive( request: AssetRequest ) {
+			if ( disposed ) {
+				return;
+			}
+			if ( request.kind === "cancel" ) {
+				const controller = pending.get( request.id );
+				if ( controller ) {
+					controller.abort();
+					pending.delete( request.id );
+					const queued = waiting.findIndex( entry => entry.request.id === request.id );
+					if ( queued >= 0 ) waiting.splice( queued, 1 );
+				}
+				// Acknowledged on receipt, not on settlement: an execution
+				// AbortSignal cannot stop (a native decode) may drain long
+				// past the caller's acknowledgement window, but it delivers
+				// nothing more for this id; its slot frees when it settles.
+				// A cancel read after its execution settled is acknowledged
+				// too: the result already crossed, and the caller's slot is
+				// freed by this message - dropping it strands the slot on a
+				// healthy worker (#2871). The caller ignores an
+				// acknowledgement for a job it no longer holds.
+				send( { kind: "released", id: request.id }, [] );
+				return;
+			}
+			if ( request.kind === "install" ) {
+				installer.start( request.url );
+				return;
+			}
+			if ( request.kind === "texture-variant" ) {
+				textureVariant( request.variant );
+				return;
+			}
+			if ( request.kind === "hd-textures" ) {
+				packs.hdTextures( request.format );
+				return;
+			}
+			if (
+				pending.has( request.id ) || !Number.isSafeInteger( request.limit ) ||
+				request.limit < 1 || request.limit > assetRequestBudget( request.decode )
+			) {
+				send( { kind: "error", id: request.id, error: "Asset request exceeds budget" }, [] );
+				return;
+			}
+			const controller = new AbortController();
+			pending.set( request.id, controller );
+			waiting.push( { request, controller } );
+			pump();
+		},
+		/*
+		================
+		dispose
+
+		Abort requests and release decoder state before terminating the worker.
+		================
+		*/
+		dispose() {
+			if ( disposed ) {
+				return;
+			}
+			disposed = true;
+			if ( progressTimer !== null ) clearTimeout( progressTimer );
+			progressTimer = null;
+			animationCatalogs.clear();
+			effectCatalogParsed = false;
+			effects.dispose();
+			installer.dispose();
+			wakeIdleWaiters();
+			packs.dispose();
+			for ( const controller of pending.values() ) {
+				controller.abort();
+			}
+			pending.clear();
+			waiting.length = 0;
+		}
+	};
+}
+
+/*
+================
+DownloadRead
+
+One HTTP read under the attempt's signal. The progress callback that
+restarts its no-progress window is passed beside it.
+================
+*/
+interface DownloadRead {
+	readonly url: string;
+	readonly limit: number;
+	readonly signal: AbortSignal;
+	readonly range?: import("./packs/packs").PackRange;
+	readonly partial: PartialRead;
+}
+
+/*
+================
+PartialRead
+
+What one download kept across its attempts (#3354): the chunks received
+so far, in order, and their total. A ranged read resumes by narrowing its
+range. A whole read resumes only when its full answer named the object
+(whole): a strong ETag, its length, byte ranges, and no content coding,
+so a stream offset is a file offset. Without that, a retry starts over.
+================
+*/
+interface PartialRead {
+	chunks: Uint8Array[];
+	size: number;
+	whole: { readonly validator: string; readonly total: number; } | null;
+}
+
+/*
+================
+forgetPartial
+
+Drops the kept bytes; a whole read's resume terms go with them.
+================
+*/
+function forgetPartial( partial: PartialRead ) {
+	partial.chunks = [];
+	partial.size = 0;
+	partial.whole = null;
+}
+
+/*
+================
+joinPartial
+
+The kept chunks as one buffer: the read's bytes, across its attempts.
+================
+*/
+function joinPartial( partial: PartialRead ): Uint8Array<ArrayBuffer> {
+	const bytes = new Uint8Array( partial.size );
+	let at = 0;
+	for ( const chunk of partial.chunks ) {
+		bytes.set( chunk, at );
+		at += chunk.byteLength;
+	}
+	return bytes;
+}
+
+/*
+================
+resumableWhole
+
+A whole answer's resume terms, or null when a later attempt could not
+ask for its tail safely. A weak or missing ETag cannot prove the tail
+belongs to the same bytes; a content coding makes stream offsets differ
+from file offsets; a server that does not announce byte ranges may
+answer a resume with the whole object anyway. Headers a cross-origin
+server does not expose read as absent, so such a read starts over.
+================
+*/
+function resumableWhole( headers: Headers ): PartialRead["whole"] {
+	const validator = headers.get( "etag" ), total = Number( headers.get( "content-length" ) );
+	const coding = headers.get( "content-encoding" );
+	if ( !validator || validator.startsWith( "W/" ) ) return null;
+	if ( coding && coding !== "identity" ) return null;
+	if ( headers.get( "accept-ranges" ) !== "bytes" ) return null;
+	if ( !Number.isSafeInteger( total ) || total <= 0 ) return null;
+	return { validator, total };
+}
+
+/*
+================
+resumedWhole
+
+Whether a whole read's resumed answer is exactly the tail it asked for,
+of the same object: 206, the range from offset to the end, and the
+validator the first answer named.
+================
+*/
+function resumedWhole( response: Response, partial: PartialRead, offset: number ): boolean {
+	const whole = partial.whole;
+	return !!whole && response.status === 206 && response.headers.get( "etag" ) === whole.validator &&
+		response.headers.get( "content-range" ) === `bytes ${offset}-${whole.total - 1}/${whole.total}`;
+}
+
+/*
+================
+NoProgressError
+
+A download that received nothing for its no-progress window: a transport
+failure, retried like a network error and never a validation failure.
+================
+*/
+class NoProgressError extends Error {
+	constructor( url: string, ms: number ) {
+		super( `No download progress for ${ms} ms: ${url}` );
+	}
+}

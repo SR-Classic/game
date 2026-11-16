@@ -1,0 +1,299 @@
+/*
+===========================================================================
+
+skilltrap.go - complete quest-trap programs from the native skill table
+
+The indirect item path creates a stationary skill object, not a resident
+character buff. Keep its authored targets and lifetime together so admission,
+world scans and quest dispatch cannot disagree about the same skill.
+
+===========================================================================
+*/
+package enterworld
+
+import "opensro.online/server/internal/game/abnormal"
+
+const (
+	questTrapTag     = 0x74726170
+	questTrapQuest   = 0x71657374
+	questTrapLink    = 0x6c6e6b73
+	questTrapDura    = 0x64757261
+	questTrapScanMs  = 300
+	questTrapMobMask = 16
+)
+
+/*
+================
+SkillQuestTrap
+
+The server's skill-object tick stops matching at the first zero target. Preserve all three words,
+including empty lists used by the promotion item rows in v1.150 media.
+================
+*/
+type SkillQuestTrap struct {
+	Present    bool
+	DurationMs uint32
+	ScanMs     uint32
+	Radius     uint32
+	Targets    [3]uint32
+}
+
+/*
+================
+compileQuestTrap
+
+The server's skill-object spawn and tick own qest mode 1, stationary monster scans and expiry.
+Require the complete shipped program. Unknown instructions cannot be ignored
+just because a familiar trap tag appears elsewhere in the row.
+================
+*/
+func compileQuestTrap(fields []string) SkillQuestTrap {
+	program, err := CompileSkillProgram(fields)
+	if err != nil || program.Len() != 5 {
+		return SkillQuestTrap{}
+	}
+	var trap SkillQuestTrap
+	seen := make(map[uint32]bool)
+	for index := 0; index < program.Len(); index++ {
+		instruction := program.Instruction(index)
+		if seen[instruction.Tag] {
+			return SkillQuestTrap{}
+		}
+		seen[instruction.Tag] = true
+		words := instruction.Arguments
+		switch instruction.Tag {
+		case questTrapQuest:
+			if words[0] != 1 {
+				return SkillQuestTrap{}
+			}
+			trap.Targets = [3]uint32{words[1], words[2], words[3]}
+		case questTrapDura:
+			if words[0] == 0 {
+				return SkillQuestTrap{}
+			}
+			trap.DurationMs = words[0]
+		case tagEfr:
+			if words[0] != 3 || words[1] != 1 || words[2] == 0 || words[3] != 1 ||
+				words[4] != 0 || words[5] != questTrapMobMask {
+				return SkillQuestTrap{}
+			}
+			trap.Radius = words[2]
+		case questTrapLink:
+			if words[0] != 0 || words[1] != questTrapScanMs || words[2] != 1 || words[3] != 0 {
+				return SkillQuestTrap{}
+			}
+			trap.ScanMs = words[1]
+		case questTrapTag:
+		default:
+			return SkillQuestTrap{}
+		}
+	}
+	trap.Present = true
+	return trap
+}
+
+//============================================================================
+
+const (
+	combatTrapHide = 0x68696465
+	// combatTrapScanMs reuses the quest trap's stationary update cadence;
+	// the combat trap's lnks second word is its owner distance.
+	CombatTrapScanMs = questTrapScanMs
+	// SkillFieldScanMs is the same skill-object tick pass for a buff field (efr kind 3).
+	SkillFieldScanMs = questTrapScanMs
+	// att flag lanes (combat/formula.go): 0x04 physical, 0x08 magical.
+	physicalAttackFlagBit = 0x04
+	magicalAttackFlagBit  = 0x08
+)
+
+/*
+================
+SkillCombatTrap
+
+A planted skill object that strikes the first hostile monster to enter its
+trigger radius (efr kind 3), then retires. Attack and Area are the authored
+att and kind-1 efr of the explosion; statuses come from the row's blocks.
+lnks is read as the timed-effect link: group, owner distance, live traps
+per owner, board. The description ("When the planter goes beyond a certain
+distance from the traps, they cease to exist") names the distance word.
+================
+*/
+type SkillCombatTrap struct {
+	Pinned           bool
+	DurationMs       uint32
+	TriggerRadius    uint32
+	LinkGroup        uint32
+	OwnerDistance    uint32
+	MaxLive          uint32
+	Attack           SkillAttack
+	Area             SkillOffensiveArea
+	Hidden           bool
+	HideMask, HideLv uint32
+}
+
+/*
+================
+compileCombatTrap
+
+Admit the Wizard's Fire Trap shape: an untargeted prepared cast with dura,
+lnks, trap, a kind-3 trigger area, one att, one kind-1 explosion area,
+status blocks, hide and caster getv modifiers. Anything else refuses.
+================
+*/
+func compileCombatTrap(fields []string, row SkillRow) SkillCombatTrap {
+	if len(fields) != 118 || fields[0] != "1" || fields[8] != "2" || fields[68] != "3" ||
+		row.TargetRequired || row.ChainSub || row.ChainNext != 0 || !row.TimingPinned ||
+		!row.Consumption.Pinned || row.ActionCastingTimeMs == 0 || row.Consumption.HP != 0 || row.Consumption.HPPercent != 0 {
+		return SkillCombatTrap{}
+	}
+	for _, column := range []int{15, 16, 17, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 56} {
+		if fields[column] != "0" {
+			return SkillCombatTrap{}
+		}
+	}
+	program, err := CompileSkillProgram(fields)
+	if err != nil {
+		return SkillCombatTrap{}
+	}
+	var trap SkillCombatTrap
+	seen := make(map[uint32]bool)
+	for i := 0; i < program.Len(); i++ {
+		op := program.Instruction(i)
+		a := op.Arguments
+		if seen[op.Tag] && op.Tag != tagGetv && op.Tag != tagEfr {
+			return SkillCombatTrap{}
+		}
+		seen[op.Tag] = true
+		if _, found := abnormal.SourceIndex(op.Tag); found {
+			continue
+		}
+		switch op.Tag {
+		case questTrapDura:
+			trap.DurationMs = a[0]
+		case questTrapLink:
+			trap.LinkGroup, trap.OwnerDistance, trap.MaxLive = a[0], a[1], a[2]
+		case questTrapTag:
+		case tagEfr:
+			switch {
+			case a[0] == 3 && a[1] == 1 && a[2] != 0 && a[3] == 1 && a[4] == 0 && a[5] == statusCastSelect && trap.TriggerRadius == 0:
+				trap.TriggerRadius = a[2]
+			case a[0] == 1 && a[1] == 1 && a[2] != 0 && a[2] <= 0xffff && a[3] != 0 && a[3] <= 255 && a[4] <= 100 &&
+				a[5] == statusCastSelect && trap.Area.Radius == 0:
+				trap.Area = SkillOffensiveArea{Shape: 1, Radius: a[2], MaxTargets: uint8(a[3]), ReductionPercent: uint8(a[4]), Select: statusCastSelect}
+			default:
+				return SkillCombatTrap{}
+			}
+		case uint32(skillAttackTag):
+			if a[0]&(physicalAttackFlagBit|magicalAttackFlagBit) == 0 || a[1] == 0 || a[2] > a[3] || a[4] != 0 {
+				return SkillCombatTrap{}
+			}
+			trap.Attack = SkillAttack{Present: true, Flags: a[0], Percent: int64(a[1]), Min: int64(a[2]), Max: int64(a[3]),
+				ImpactCount: 1, Parameters: encodedAttackParameters(fields)}
+		case combatTrapHide:
+			trap.Hidden, trap.HideMask, trap.HideLv = true, a[0], a[1]
+		case tagGetv:
+			if _, known := SkillParameterFromKey(a[0]); !known {
+				return SkillCombatTrap{}
+			}
+		default:
+			return SkillCombatTrap{}
+		}
+	}
+	if trap.DurationMs == 0 || trap.TriggerRadius == 0 || trap.Area.Radius == 0 || !trap.Attack.Present ||
+		trap.OwnerDistance == 0 || trap.MaxLive == 0 || !seen[questTrapTag] {
+		return SkillCombatTrap{}
+	}
+	trap.Pinned = true
+	return trap
+}
+
+//============================================================================
+
+/*
+================
+SkillTrapField
+
+A planted skill object in object mode 1 without the trap word (the Rogue's
+Poison Trap): the server's spawn picks mode 1 for a
+hostile execution selector, and each tick pass collects up to MaxTargets
+hostiles within Radius of the object. Its collected-attack execution
+strikes the collection once PulseMs has passed since its last
+strike; the row's status blocks are the strike. Without trap (+0x4A0) the
+object never detonates: it lives its dura.
+================
+*/
+type SkillTrapField struct {
+	Pinned     bool
+	DurationMs uint32
+	PulseMs    uint32
+	Radius     uint32
+	MaxTargets uint32
+	// Select is the efr +0x14 mask (24: hostile characters and objects).
+	Select uint8
+}
+
+/*
+================
+compileTrapField
+
+Admit the Poison Trap shape: an untargeted prepared cast with dura, puls,
+one kind-3 caster-centred area with the hostile selector and no reduction,
+status blocks, caster getv modifiers and reqi pairs. No att, lnks or trap:
+those belong to compileCombatTrap. Anything else refuses.
+================
+*/
+func compileTrapField(fields []string, row SkillRow) SkillTrapField {
+	if len(fields) != 118 || fields[0] != "1" || fields[8] != "2" || fields[68] != "3" ||
+		row.TargetRequired || row.ChainSub || row.ChainNext != 0 || !row.TimingPinned || !row.Consumption.Pinned ||
+		row.ActionCastingTimeMs == 0 || row.Consumption.HP != 0 || row.Consumption.HPPercent != 0 || !row.Abnormal.Present() {
+		return SkillTrapField{}
+	}
+	for _, column := range []int{15, 16, 17, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 56} {
+		if fields[column] != "0" {
+			return SkillTrapField{}
+		}
+	}
+	program, err := CompileSkillProgram(fields)
+	if err != nil {
+		return SkillTrapField{}
+	}
+	var trap SkillTrapField
+	statuses := 0
+	seen := make(map[uint32]bool)
+	for i := 0; i < program.Len(); i++ {
+		op := program.Instruction(i)
+		a := op.Arguments
+		if seen[op.Tag] && op.Tag != tagGetv && op.Tag != tagReqi {
+			return SkillTrapField{}
+		}
+		seen[op.Tag] = true
+		if _, found := abnormal.SourceIndex(op.Tag); found {
+			statuses++
+			continue
+		}
+		switch op.Tag {
+		case tagDura:
+			trap.DurationMs = a[0]
+		case tagPulsePeriod:
+			trap.PulseMs = a[0]
+		case tagEfr:
+			if a[0] != 3 || a[1] != 1 || a[2] == 0 || a[2] > 0xffff || a[3] == 0 || a[3] > 255 || a[4] != 0 ||
+				a[5] != statusCastSelect {
+				return SkillTrapField{}
+			}
+			trap.Radius, trap.MaxTargets, trap.Select = a[2], a[3], uint8(a[5])
+		case tagReqi: // row.Reqi; admitted before dispatch
+		case tagGetv:
+			if _, known := SkillParameterFromKey(a[0]); !known {
+				return SkillTrapField{}
+			}
+		default:
+			return SkillTrapField{}
+		}
+	}
+	if trap.DurationMs == 0 || trap.PulseMs == 0 || trap.Radius == 0 || statuses == 0 {
+		return SkillTrapField{}
+	}
+	trap.Pinned = true
+	return trap
+}

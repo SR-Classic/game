@@ -1,0 +1,633 @@
+/*
+===========================================================================
+
+loading.css - startup and native scene loading feedback
+
+Loaded from index.html before the application. Native scene art keeps a
+compact live status strip; startup retains the full loading shell.
+
+===========================================================================
+*/
+
+html,
+body,
+#root {
+	width: 100%;
+	height: 100%;
+	margin: 0;
+	background: #020202;
+}
+
+.sro-boot-loading {
+	position: fixed;
+	inset: 0;
+	display: grid;
+	overflow: hidden;
+	place-items: center;
+	padding: 24px;
+	background: radial-gradient(circle at 50% 42%, rgba(116, 88, 31, 0.1), transparent 34%),
+		#020202;
+	box-sizing: border-box;
+	color: #d8c8a7;
+	font: 14px/1.4 "Segoe UI", Arial, sans-serif;
+}
+
+.sro-boot-loading__inner {
+	display: flex;
+	width: min(680px, 100%);
+	min-height: 320px;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+}
+
+.sro-boot-loading__logo {
+	display: block;
+	width: min(620px, 86vw);
+	height: auto;
+	aspect-ratio: 870 / 320;
+	margin-bottom: 14px;
+	object-fit: contain;
+}
+
+.sro-boot-loading__native-label {
+	display: block;
+	width: 144px;
+	height: 20px;
+	margin-bottom: 12px;
+	object-fit: contain;
+	transition: opacity 160ms ease;
+}
+
+.sro-boot-loading__copy {
+	position: relative;
+	width: min(560px, 100%);
+	min-height: 48px;
+	margin-bottom: 4px;
+	text-align: center;
+}
+
+.sro-boot-loading__copy::before,
+.sro-boot-loading__copy::after {
+	position: absolute;
+	top: 10px;
+	display: none;
+	width: calc(50% - 26px);
+	height: 1px;
+	background: linear-gradient(90deg, transparent, rgba(202, 165, 82, 0.48));
+	content: "";
+}
+
+.sro-boot-loading__copy::before {
+	left: 0;
+}
+
+.sro-boot-loading__copy::after {
+	right: 0;
+	transform: scaleX(-1);
+}
+
+.sro-boot-loading__label {
+	overflow: hidden;
+	color: #f0dfb7;
+	font-size: 15px;
+	font-weight: 600;
+	letter-spacing: 0;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sro-boot-loading__detail {
+	overflow: hidden;
+	margin-top: 4px;
+	color: #8ea7b7;
+	font-size: 12px;
+	letter-spacing: 0;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sro-boot-loading__bar {
+	position: relative;
+	width: min(720px, 100%);
+	aspect-ratio: 720 / 40;
+	overflow: hidden;
+	background: url("/assets/images/Media_extracted/interface/loading/loading_form.png") center top / 100% 100% no-repeat;
+}
+
+.sro-boot-loading__bar-track {
+	position: absolute;
+	top: 20%;
+	left: 2.1%;
+	width: 95.8%;
+	height: 30%;
+	overflow: hidden;
+}
+
+/*
+The project credit (LICENSE section 4: notices stay): a quiet line at the
+foot of the startup screen, linking the source. Native scene loading art
+stays as retail drew it.
+*/
+.sro-boot-loading__credit {
+	position: absolute;
+	bottom: 14px;
+	left: 50%;
+	transform: translateX(-50%);
+	color: #6f7f88;
+	font-size: 11px;
+	text-decoration: none;
+	opacity: .7;
+	white-space: nowrap;
+}
+
+.sro-boot-loading__credit:hover,
+.sro-boot-loading__credit:focus-visible {
+	color: #d8c8a7;
+	opacity: 1;
+}
+
+.sro-boot-loading[data-native="true"] .sro-boot-loading__credit {
+	display: none;
+}
+
+.sro-boot-loading__bar-fill {
+	width: calc(var(--loading-progress, 0) * 100%);
+	height: 100%;
+	background: url("/assets/images/Media_extracted/interface/loading/gauge_loading.png") left center / auto 100% repeat-x;
+	transition: width 100ms linear;
+}
+
+#root[data-sro-startup-stop="compiling"] .sro-boot-loading__native-label {
+	display: none;
+}
+
+#root[data-sro-startup-stop="compiling"] .sro-boot-loading__copy {
+	min-height: 70px;
+	margin-bottom: 8px;
+	padding-top: 22px;
+	background: radial-gradient(ellipse at center, rgba(166, 126, 45, 0.08), transparent 68%);
+}
+
+#root[data-sro-startup-stop="compiling"] .sro-boot-loading__copy::before,
+#root[data-sro-startup-stop="compiling"] .sro-boot-loading__copy::after {
+	display: block;
+}
+
+#root[data-sro-startup-stop="compiling"] .sro-boot-loading__label {
+	color: #ead69c;
+	font-family: Georgia, "Times New Roman", serif;
+	font-size: 18px;
+	font-weight: 400;
+	letter-spacing: 0.18em;
+	text-shadow: 0 1px 12px rgba(196, 149, 51, 0.22);
+	text-transform: uppercase;
+}
+
+#root[data-sro-startup-stop="compiling"] .sro-boot-loading__detail {
+	margin-top: 7px;
+	color: #9d9a91;
+	font-size: 11px;
+	letter-spacing: 0.06em;
+}
+
+#root[data-sro-startup-stop="compiling"] .sro-boot-loading__bar-fill {
+	width: 100%;
+	animation: none;
+	filter: brightness(1.15) saturate(0.85);
+	transform: none;
+}
+
+@keyframes sro-boot-loading-pulse {
+
+	0% {
+		transform: translateX(-120%);
+	}
+
+	100% {
+		transform: translateX(300%);
+	}
+}
+
+.sro-boot-loading {
+	z-index: 1000;
+	transition: opacity 400ms ease,visibility 400ms;
+}
+
+.sro-boot-loading[data-active="false"] {
+	opacity: 0;
+	visibility: hidden;
+	pointer-events: none;
+}
+
+.sro-boot-loading[data-error="true"] .sro-boot-loading__bar-fill {
+	animation: none;
+	filter: saturate(.4);
+}
+
+/*
+Port-only report/telemetry tools for index.html. The platform follows the HUD's
+reserved row beside the map. Compact translucent controls brighten on hover
+or focus; only their own hit targets intercept the game. Above the boot
+overlay so startup frames remain measurable.
+*/
+
+.sro-fps-chip {
+	--hud-tools-height: 18px;
+	position: fixed;
+	z-index: 1001;
+	top: 8px;
+	right: 8px;
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	max-width: calc(100vw - var(--telemetry-right, 8px) - 8px);
+	gap: 4px;
+	pointer-events: none;
+	color: #d7e8ed;
+	font: 10px/1.35 ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+.sro-fps-chip__toggle {
+	flex-shrink: 0;
+	width: var(--hud-tools-height);
+	height: var(--hud-tools-height);
+	padding: 0;
+	border: 1px solid rgba(202, 165, 82, 0.38);
+	border-radius: 3px;
+	background: rgba(6, 10, 14, 0.62);
+	color: #cba85e;
+	pointer-events: auto;
+	cursor: pointer;
+	font: inherit;
+	font-weight: 700;
+	line-height: 16px;
+	opacity: 0.55;
+	transition: opacity 120ms ease;
+}
+
+.sro-fps-chip__toggle:hover,
+.sro-fps-chip__toggle:focus-visible {
+	opacity: 1;
+}
+
+.sro-fps-chip[data-expanded="true"] .sro-fps-chip__toggle {
+	opacity: 1;
+}
+
+.sro-fps-chip__toggle:focus-visible {
+	outline: 2px solid #f0dca8;
+	outline-offset: 2px;
+}
+
+.sro-fps-chip__readout {
+	position: absolute;
+	right: 0;
+	top: calc(100% + 4px);
+	min-width: 116px;
+	padding: 5px 7px;
+	border: 1px solid rgba(202, 165, 82, 0.28);
+	border-radius: 3px;
+	background: rgba(6, 10, 14, 0.78);
+	text-align: right;
+	white-space: pre-line;
+	pointer-events: auto;
+}
+
+/* One transfer readout accompanies boot and the native scene artwork. */
+
+.loading-transfer {
+	position: fixed;
+	z-index: 1002;
+	left: 50%;
+	bottom: 24px;
+	transform: translateX(-50%);
+	width: min(560px,calc(100vw - 40px));
+	box-sizing: border-box;
+	padding: 18px 22px;
+	border: 1px solid #b59a5c66;
+	border-radius: 12px;
+	background: #0b1119ee;
+	box-shadow: 0 12px 48px #0008;
+	color: #e9dfc9;
+	font: 13px/1.5 "Segoe UI",sans-serif;
+	pointer-events: none;
+}
+
+.loading-transfer[hidden] {
+	display: none;
+}
+
+.loading-transfer__header {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	font-weight: 600;
+	letter-spacing: .02em;
+}
+
+.loading-transfer__pulse {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: #dfbd74;
+	box-shadow: 0 0 12px #dfbd7477;
+}
+
+.loading-transfer__file {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: #a7b7c8;
+	margin: 7px 0 14px;
+	font-size: 12px;
+}
+
+.loading-transfer__metrics {
+	display: grid;
+	grid-template-columns: repeat(4,1fr);
+	gap: 12px;
+	margin: 0;
+	padding-top: 12px;
+	border-top: 1px solid #ffffff12;
+	font-variant-numeric: tabular-nums;
+}
+
+.loading-transfer__metrics dt {
+	font-size: 10px;
+	text-transform: uppercase;
+	letter-spacing: .07em;
+	color: #9aabbc;
+}
+
+.loading-transfer__metrics dd {
+	margin: 3px 0 0;
+	font-size: 18px;
+	font-weight: 500;
+	color: #f0dfb7;
+}
+
+.loading-transfer__queue {
+	margin-top: 12px;
+	color: #94a3b5;
+	font-size: 11px;
+}
+
+@media(max-width:420px) {
+
+	.loading-transfer {
+		padding: 12px 16px;
+		bottom: 12px;
+	}
+
+	.loading-transfer__metrics {
+		gap: 8px;
+	}
+
+	.loading-transfer__metrics dd {
+		font-size: 15px;
+	}
+
+	.loading-transfer__metrics dt {
+		font-size: 9px;
+	}
+}
+
+.loading-transfer[data-connecting="true"] {
+	bottom: 110px;
+	width: min(440px,calc(100vw - 40px));
+}
+
+.loading-transfer[data-connecting="true"] .loading-transfer__metrics {
+	display: none;
+}
+
+/*
+The login screen's project credit (platform.ts presentUi, titleCredit). The
+title keeps its controls between 172/1200 and 1030/1200 of the height
+(title.ts); the credit sits centred in the lower letterbox band, so it is
+placed in percentages of the viewport and follows the band at every size,
+including a phone whose viewport shrinks under the keyboard. It stays
+under every loading layer (1000-1003).
+*/
+
+.sro-title-credit {
+	position: fixed;
+	bottom: calc(85 / 1200 * 100%);
+	left: 50%;
+	z-index: 10;
+	padding: 4px 10px;
+	transform: translate(-50%, 50%);
+	color: #a89a7c;
+	font: 11px/1.4 "Segoe UI", Arial, sans-serif;
+	text-decoration: none;
+	text-shadow: 0 1px 2px #000;
+	white-space: nowrap;
+	opacity: .75;
+}
+
+.sro-title-credit[hidden] {
+	display: none;
+}
+
+.sro-title-credit:hover,
+.sro-title-credit:focus-visible {
+	color: #f0dca8;
+	opacity: 1;
+}
+
+/* Touch: a finger-sized target, and clear of a home indicator. */
+@media (pointer: coarse) {
+	.sro-title-credit {
+		padding: 8px 14px;
+		margin-bottom: calc(env(safe-area-inset-bottom, 0px) / 2);
+		font-size: 12px;
+	}
+}
+
+/*
+The release-skew update prompt (platform.ts presentUpdate): shown once a
+newer client release is live. An outdated page cannot keep playing, so it
+covers the whole game, above every loading layer (1000-1002), and takes the
+keys; the player's click on Refresh reloads. It keeps the boot overlay's
+palette.
+*/
+
+.sro-update-notice {
+	position: fixed;
+	inset: 0;
+	z-index: 1003;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 12px;
+	padding: 16px;
+	background: rgba(2, 2, 2, 0.86);
+	box-sizing: border-box;
+	color: #d8c8a7;
+	font: 13px/1.4 "Segoe UI", Arial, sans-serif;
+	text-align: center;
+}
+
+.sro-update-notice[hidden] {
+	display: none;
+}
+
+.sro-update-notice button {
+	padding: 4px 12px;
+	border: 1px solid rgba(202, 165, 82, 0.72);
+	background: #1a140a;
+	color: #f0dca8;
+	font: inherit;
+	cursor: pointer;
+}
+
+.sro-update-notice button:hover,
+.sro-update-notice button:focus-visible {
+	background: #2a2010;
+}
+
+/*
+The native control group uses a bottom-centered 1600 by 1200 canvas.
+Keep status beside Now Loading (x268..520, y1025..1060), below the gauge.
+The same uniform scale as loadingScreenQuads keeps both owners aligned.
+*/
+
+.sro-boot-loading[data-native="true"] {
+	--native-loading-unit: min(calc(100vw / 1600), calc(100vh / 1200));
+	inset: auto;
+	left: calc(50% - 250 * var(--native-loading-unit));
+	top: calc(100vh - 175 * var(--native-loading-unit));
+	width: calc(782 * var(--native-loading-unit));
+	padding: 0;
+	background: transparent;
+	pointer-events: none;
+	overflow: visible;
+}
+
+.sro-boot-loading[data-native="true"] .sro-boot-loading__inner {
+	min-height: 0;
+	width: 100%;
+	background: transparent;
+	border: 0;
+	padding: 0;
+}
+
+.sro-boot-loading[data-native="true"] .sro-boot-loading__logo,
+.sro-boot-loading[data-native="true"] .sro-boot-loading__native-label,
+.sro-boot-loading[data-native="true"] .sro-boot-loading__bar {
+	display: none;
+}
+
+.sro-boot-loading[data-native="true"] .sro-boot-loading__copy {
+	min-height: 0;
+	width: 100%;
+	margin: 0;
+	text-align: right;
+	text-shadow: 0 1px 2px #000;
+}
+
+.sro-boot-loading[data-native="true"] .sro-boot-loading__label {
+	color: #c4af79;
+	font-family: Georgia, "Times New Roman", serif;
+	font-size: clamp(10px, calc(19 * var(--native-loading-unit)), 15px);
+	font-weight: 400;
+	line-height: 1.2;
+}
+
+.sro-boot-loading[data-native="true"] .sro-boot-loading__detail {
+	margin-top: calc(5 * var(--native-loading-unit));
+	color: #a99c7e;
+	font-size: clamp(9px, calc(15 * var(--native-loading-unit)), 12px);
+	font-weight: 400;
+	line-height: 1.2;
+	font-variant-numeric: tabular-nums;
+}
+
+/*
+Port-only, owner-approved compact loading footer. mission-loading.ts reserves
+150 UI pixels: the gauge frame, then Now Loading ending 85 pixels above the
+bottom. The status takes the strip below it (12..80 pixels from the bottom,
+at most one label row and three detail rows), so wrapped detail can never
+climb into the Now Loading art.
+*/
+@media (width < 800px), (height < 600px) {
+	.sro-boot-loading[data-native="true"] {
+		left: 16px;
+		top: auto;
+		bottom: 12px;
+		width: calc(100% - 32px);
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.sro-boot-loading[data-native="true"] .sro-boot-loading__inner,
+	.sro-boot-loading[data-native="true"] .sro-boot-loading__copy {
+		min-width: 0;
+		text-align: center;
+	}
+
+	.sro-boot-loading[data-native="true"] .sro-boot-loading__label {
+		font-size: 13px;
+	}
+
+	.sro-boot-loading[data-native="true"] .sro-boot-loading__detail {
+		font-size: 12px;
+		margin-top: 3px;
+	}
+
+	/* A phone is too narrow for the step, the file group, the bytes read and
+	   the rate on one line ("Loading scene models · world terrain · 8.9 MB
+	   read · 6 files ready"), so the detail wraps instead of ending in an
+	   ellipsis. Two lines stay reserved: the text changes several times a
+	   second and must not make the panel jump. */
+	.sro-boot-loading__detail {
+		min-height: 2.8em;
+		max-height: 3.6em;
+		overflow: hidden;
+		overflow-wrap: anywhere;
+		white-space: normal;
+	}
+}
+
+/*
+GH #1247: on a short viewport (a landscape phone) the boot column is
+taller than the screen. The centered grid pushes the gauge past the
+bottom edge, where the bottom-anchored credit prints on top of it.
+Shrink the logo to fit the height, drop the inner floor, and put the
+credit in flow below the gauge so every row keeps its own strip.
+Tall portrait phones and the desktop are untouched.
+*/
+@media (height < 600px) {
+	.sro-boot-loading {
+		padding: 16px;
+	}
+
+	.sro-boot-loading__inner {
+		min-height: 0;
+	}
+
+	.sro-boot-loading__logo {
+		width: min(400px, 86vw);
+		margin-bottom: 10px;
+	}
+
+	.sro-boot-loading__credit {
+		position: static;
+		margin-top: 10px;
+		transform: none;
+	}
+}
+
+/* Developer diagnostics are a separate, console-enabled neighbor of FPS. */
+#developer-toggle { width: 24px; }
+.sro-developer-readout {
+	width: max-content;
+	max-width: min(280px, calc(100vw - var(--telemetry-right, 8px) - 8px));
+	max-height: min(480px, calc(100vh - var(--telemetry-top, 8px) - var(--hud-tools-height) - 12px));
+	overflow: auto;
+	box-sizing: border-box;
+	text-align: left;
+	overflow-wrap: anywhere;
+	user-select: text;
+}

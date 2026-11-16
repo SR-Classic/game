@@ -1,0 +1,908 @@
+/*
+===========================================================================
+
+accounts.go - the live global account authority
+
+The Agent is the only holder of login credentials. Accounts live in one
+SQLite database the Agent owns, so a new account (a website signup) takes
+effect at once, with no redeploy. The deploy-time catalog (catalog.go) is a
+seed: its rows are inserted when absent and never overwrite a stored
+account, so a password changed here is not reverted by the next deploy.
+
+Account ids are stored exactly as created, and lookups are exact, because
+characters are owned by the exact id. A unique index on the ASCII-folded id
+stops a second account that differs only in case ("Bob" beside "bob").
+
+A disabled account keeps its row (its characters still have an owner) but
+cannot log in: PasswordHash reports it absent, which also ends its browser
+sessions at their next check (browser_session.go).
+
+A blocked account is a disabled account with a staff reason and an
+optional end time (block_reason / block_until_ms, added by
+ensureAccountBlock): the client shows both after the password verifies
+(#2271). The columns are additive and the schema stamp stays at
+version 1, so an older Agent opens a database that carries them and
+simply never reads them.
+
+===========================================================================
+*/
+package auth
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"golang.org/x/crypto/bcrypt"
+	_ "modernc.org/sqlite"
+	"opensro.online/server/internal/domain"
+)
+
+const (
+	// AccountBcryptCost is the cost of hashes this store creates. It stays
+	// inside the catalog's accepted range so a store row can always be
+	// exported back into a seed catalog.
+	AccountBcryptCost = MaxBcryptCost
+
+	// MinPasswordBytes and MaxPasswordBytes bound new passwords. bcrypt
+	// ignores bytes past 72, so a longer password would silently truncate.
+	MinPasswordBytes = 8
+	MaxPasswordBytes = 72
+
+	// AgentProvisioningTokenFile is the cluster-state file holding the
+	// provisioning API bearer token (internal/agent/provisioning), and
+	// MinProvisioningTokenBytes the shortest token the API accepts.
+	AgentProvisioningTokenFile = "agent-provisioning-token"
+	MinProvisioningTokenBytes  = 32
+
+	// PublicAPITokenFile is the cluster-state file holding the GameWorld
+	// public API's privacy-write bearer token (internal/agent/publicstats).
+	// It is its own secret, never the provisioning token, so a leak of one
+	// does not open the other.
+	PublicAPITokenFile = "public-api-token"
+
+	accountsSchemaVersion = 1
+	accountsBusyTimeoutMS = 5000
+)
+
+var (
+	ErrAccountExists    = errors.New("account already exists")
+	ErrAccountNotFound  = errors.New("account not found")
+	ErrAccountIDInvalid = errors.New("account id is invalid")
+	ErrPasswordInvalid  = fmt.Errorf("password must be %d to %d bytes", MinPasswordBytes, MaxPasswordBytes)
+	ErrBlockInvalid     = errors.New("block reason must be 1 to 200 characters without '#', and its end must not be negative")
+)
+
+// MaxBlockReasonChars bounds a staff block reason: the native client
+// renders it into a fixed message box after the ACCOUNT_STOP line.
+const MaxBlockReasonChars = 200
+
+// AccountInfo is the public view of one account: never its hash.
+type AccountInfo struct {
+	ID        string
+	CreatedAt time.Time
+	Disabled  bool
+	// The staff block's reason and end (0 = permanent), #2271. Both
+	// stay empty unless the account was blocked with detail.
+	BlockReason  string
+	BlockUntilMs int64
+}
+
+// Accounts is the SQLite-backed account authority.
+type Accounts struct {
+	db *sql.DB
+
+	// hashing bounds concurrent bcrypt work so account creation cannot
+	// starve logins of CPU.
+	hashing chan struct{}
+
+	// cost is the bcrypt cost of the hashes this store creates, and of its
+	// unknown-account dummy (AccountsOptions).
+	cost      int
+	dummyOnce sync.Once
+	dummy     []byte
+
+	revokeMu sync.RWMutex
+	onRevoke func(accountID string, epoch uint64)
+
+	closeOnce sync.Once
+}
+
+/*
+================
+AccountsOptions
+
+How OpenAccountsWith opens a store. The zero value is production's.
+================
+*/
+type AccountsOptions struct {
+	// BcryptCost is the cost of new hashes; zero is AccountBcryptCost.
+	// Tests pass bcrypt.MinCost so a login does not cost a production hash
+	// under the race detector; production never sets it.
+	BcryptCost int
+}
+
+const accountsSchema = `
+CREATE TABLE IF NOT EXISTS accounts (
+	id            TEXT    NOT NULL PRIMARY KEY,
+	password_hash BLOB    NOT NULL,
+	created_at_ms INTEGER NOT NULL,
+	disabled      INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0, 1)),
+	block_reason  TEXT    NOT NULL DEFAULT '',
+	block_until_ms INTEGER NOT NULL DEFAULT 0,
+	session_epoch INTEGER NOT NULL DEFAULT 1
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS accounts_folded_id ON accounts (lower(id));
+`
+
+/*
+================
+OpenAccounts
+
+Opens (creating when absent) the account database at path. The database is
+the login authority, so it must be a regular file: symlinks are refused as
+catalog.go refuses them.
+================
+*/
+func OpenAccounts(path string) (*Accounts, error) {
+	return OpenAccountsWith(path, AccountsOptions{})
+}
+
+/*
+================
+OpenAccountsWith
+
+OpenAccounts with explicit options.
+================
+*/
+func OpenAccountsWith(path string, options AccountsOptions) (*Accounts, error) {
+	cost := options.BcryptCost
+	if cost == 0 {
+		cost = AccountBcryptCost
+	}
+	if cost < bcrypt.MinCost || cost > MaxBcryptCost {
+		return nil, fmt.Errorf("account bcrypt cost %d is outside %d..%d", cost, bcrypt.MinCost, MaxBcryptCost)
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("account database path is empty")
+	}
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("account database %s is not a regular file", path)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	// One connection serializes writers; account traffic is tiny.
+	db.SetMaxOpenConns(1)
+	pragmas := []string{
+		fmt.Sprintf("PRAGMA busy_timeout=%d", accountsBusyTimeoutMS),
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=FULL",
+		"PRAGMA foreign_keys=ON",
+	}
+	for _, pragma := range pragmas {
+		if _, err := db.Exec(pragma); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("%s: %w", pragma, err)
+		}
+	}
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if version > accountsSchemaVersion {
+		_ = db.Close()
+		return nil, fmt.Errorf(
+			"account database schema %d is newer than this Agent (%d)",
+			version,
+			accountsSchemaVersion,
+		)
+	}
+	if _, err := db.Exec(accountsSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("account schema: %w", err)
+	}
+	if err := ensureAccountSessionEpoch(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := ensureAccountBlock(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", accountsSchemaVersion)); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &Accounts{
+		db:      db,
+		hashing: make(chan struct{}, 2),
+		cost:    cost,
+	}, nil
+}
+
+/*
+================
+Close
+================
+*/
+func (accounts *Accounts) Close() error {
+	var err error
+	accounts.closeOnce.Do(func() {
+		err = accounts.db.Close()
+	})
+	return err
+}
+
+/*
+================
+ensureAccountSessionEpoch
+
+Upgrades an existing accounts.db written before session_epoch was added so
+every account starts at epoch 1 without requiring a manual migration.
+================
+*/
+func ensureAccountSessionEpoch(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM pragma_table_info('accounts') WHERE name = 'session_epoch'`,
+	).Scan(&count); err != nil {
+		return fmt.Errorf("account schema inspect: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	if _, err := db.Exec(
+		`ALTER TABLE accounts ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1`,
+	); err != nil {
+		return fmt.Errorf("account schema session_epoch: %w", err)
+	}
+	return nil
+}
+
+/*
+================
+ensureAccountBlock
+
+Adds the #2271 block columns to an existing accounts.db. Deliberately
+not a user_version bump: Open refuses a newer stamp, so a bumped
+database would crash-loop a reverted Agent. Additive columns with
+defaults are invisible to the older binary, whose queries all name
+their columns, so a rollback keeps opening the same file.
+================
+*/
+func ensureAccountBlock(db *sql.DB) error {
+	for _, column := range []struct{ name, ddl string }{
+		{"block_reason", `ALTER TABLE accounts ADD COLUMN block_reason TEXT NOT NULL DEFAULT ''`},
+		{"block_until_ms", `ALTER TABLE accounts ADD COLUMN block_until_ms INTEGER NOT NULL DEFAULT 0`},
+	} {
+		var count int
+		if err := db.QueryRow(
+			`SELECT count(*) FROM pragma_table_info('accounts') WHERE name = ?`,
+			column.name,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("account schema inspect: %w", err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.Exec(column.ddl); err != nil {
+			return fmt.Errorf("account schema %s: %w", column.name, err)
+		}
+	}
+	return nil
+}
+
+/*
+================
+SetRevokeObserver
+
+Installs an observer called whenever an account's session epoch advances
+(SetPassword, SetDisabled, RevokeSessions).
+================
+*/
+func (accounts *Accounts) SetRevokeObserver(fn func(accountID string, epoch uint64)) {
+	accounts.revokeMu.Lock()
+	accounts.onRevoke = fn
+	accounts.revokeMu.Unlock()
+}
+
+/*
+================
+notifyRevoke
+================
+*/
+func (accounts *Accounts) notifyRevoke(accountID string, epoch uint64) {
+	accounts.revokeMu.RLock()
+	fn := accounts.onRevoke
+	accounts.revokeMu.RUnlock()
+	if fn != nil {
+		fn(accountID, epoch)
+	}
+}
+
+/*
+================
+Seed
+
+Inserts every catalog account the store does not already hold, under its
+catalog hash. Existing rows, including any whose id differs only in case,
+are left alone. Returns how many rows were inserted.
+================
+*/
+func (accounts *Accounts) Seed(catalog *Catalog) (int, error) {
+	if catalog == nil {
+		return 0, nil
+	}
+	tx, err := accounts.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := time.Now().UnixMilli()
+	inserted := 0
+	for _, id := range catalog.IDs() {
+		hash, _ := catalog.PasswordHash(id)
+		result, err := tx.Exec(
+			`INSERT INTO accounts (id, password_hash, created_at_ms)
+			 SELECT ?, ?, ?
+			 WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE lower(id) = lower(?))`,
+			id, hash, now, id,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("seed account %q: %w", id, err)
+		}
+		if rows, _ := result.RowsAffected(); rows == 1 {
+			inserted++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return inserted, nil
+}
+
+/*
+================
+PasswordHash
+
+The login hash for an enabled account. A missing or disabled account, or a
+database error, reports false: the authority fails closed.
+================
+*/
+func (accounts *Accounts) PasswordHash(accountID string) ([]byte, bool) {
+	var hash []byte
+	err := accounts.db.QueryRow(
+		`SELECT password_hash FROM accounts WHERE id = ? AND disabled = 0`,
+		accountID,
+	).Scan(&hash)
+	if err != nil {
+		return nil, false
+	}
+	return hash, true
+}
+
+/*
+================
+SessionEpoch
+
+The current session epoch for an enabled account. A missing or disabled
+account, or a database error, reports false: the authority fails closed.
+================
+*/
+func (accounts *Accounts) SessionEpoch(accountID string) (uint64, bool) {
+	var epoch int64
+	err := accounts.db.QueryRow(
+		`SELECT session_epoch FROM accounts WHERE id = ? AND disabled = 0`,
+		accountID,
+	).Scan(&epoch)
+	if err != nil || epoch < 1 {
+		return 0, false
+	}
+	return uint64(epoch), true
+}
+
+/*
+================
+RevokedEpochs
+
+Returns every account whose session epoch has advanced past the initial
+epoch (1), including disabled accounts whose sessions were revoked when
+they were disabled.
+================
+*/
+func (accounts *Accounts) RevokedEpochs() map[string]uint64 {
+	rows, err := accounts.db.Query(
+		`SELECT id, session_epoch FROM accounts WHERE session_epoch >= 2`,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	epochs := make(map[string]uint64)
+	for rows.Next() {
+		var id string
+		var epoch int64
+		if err := rows.Scan(&id, &epoch); err == nil && epoch >= 2 {
+			epochs[id] = uint64(epoch)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil
+	}
+	return epochs
+}
+
+/*
+================
+readEpoch
+================
+*/
+func (accounts *Accounts) readEpoch(ctx context.Context, accountID string) (uint64, error) {
+	var epoch int64
+	if err := accounts.db.QueryRowContext(
+		ctx,
+		`SELECT session_epoch FROM accounts WHERE id = ?`,
+		accountID,
+	).Scan(&epoch); err != nil {
+		return 0, err
+	}
+	if epoch < 1 {
+		return 1, nil
+	}
+	return uint64(epoch), nil
+}
+
+/*
+================
+Credential
+
+Resolves the id a player typed at login to the stored account and its login
+hash. The match ignores ASCII case, as the accounts_folded_id index already
+makes ids unique that way, so the website's lowercase "demiurgs" and a typed
+"Demiurgs" are one account. The stored id is returned: characters are
+owned by it, so the session must carry it, never the typed spelling.
+A missing or disabled account, or a database error, reports false.
+================
+*/
+func (accounts *Accounts) Credential(typedID string) (string, []byte, bool) {
+	return accounts.credential(typedID, false)
+}
+
+/*
+================
+CredentialAny
+
+Credential without the enabled filter: the login flow verifies a
+blocked account's password against its real hash so the block refusal
+can follow (#2271). A hit is NOT an enabled account - callers check
+Block before treating it as one.
+================
+*/
+func (accounts *Accounts) CredentialAny(typedID string) (string, []byte, bool) {
+	return accounts.credential(typedID, true)
+}
+
+// credential is the shared resolve behind Credential and CredentialAny.
+func (accounts *Accounts) credential(typedID string, anyState bool) (string, []byte, bool) {
+	query := `SELECT id, password_hash FROM accounts WHERE lower(id) = lower(?)`
+	if !anyState {
+		query += ` AND disabled = 0`
+	}
+	var id string
+	var hash []byte
+	err := accounts.db.QueryRow(query, typedID).Scan(&id, &hash)
+	if err != nil {
+		return "", nil, false
+	}
+	return id, hash, true
+}
+
+/*
+================
+IDs
+
+Every account id, disabled ones included: GameWorld uses the set to prove
+each durable character has an owner, and a disabled owner still owns.
+Returns nil on a database error, which GameWorld treats as a refusal.
+================
+*/
+func (accounts *Accounts) IDs() []string {
+	rows, err := accounts.db.Query(`SELECT id FROM accounts`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil
+		}
+		ids = append(ids, id)
+	}
+	if rows.Err() != nil {
+		return nil
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+/*
+================
+Len
+================
+*/
+func (accounts *Accounts) Len() int {
+	var count int
+	if err := accounts.db.QueryRow(`SELECT count(*) FROM accounts`).Scan(&count); err != nil {
+		return 0
+	}
+	return count
+}
+
+/*
+================
+Lookup
+================
+*/
+func (accounts *Accounts) Lookup(accountID string) (AccountInfo, error) {
+	var createdAt int64
+	var disabled int
+	info := AccountInfo{ID: accountID}
+	err := accounts.db.QueryRow(
+		`SELECT created_at_ms, disabled, block_reason, block_until_ms FROM accounts WHERE id = ?`,
+		accountID,
+	).Scan(&createdAt, &disabled, &info.BlockReason, &info.BlockUntilMs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AccountInfo{}, ErrAccountNotFound
+	}
+	if err != nil {
+		return AccountInfo{}, err
+	}
+	info.CreatedAt = time.UnixMilli(createdAt).UTC()
+	info.Disabled = disabled == 1
+	return info, nil
+}
+
+/*
+================
+Create
+
+Creates an enabled account. The id must satisfy domain.AccountIDValid, must
+not be reserved, and must not match an existing id case-insensitively.
+================
+*/
+func (accounts *Accounts) Create(ctx context.Context, accountID, password string) (AccountInfo, error) {
+	if !domain.AccountIDValid(accountID) || accountID == domain.ReservedAccountID {
+		return AccountInfo{}, ErrAccountIDInvalid
+	}
+	hash, err := accounts.hash(ctx, password)
+	if err != nil {
+		return AccountInfo{}, err
+	}
+	now := time.Now().UTC()
+	result, err := accounts.db.ExecContext(
+		ctx,
+		`INSERT INTO accounts (id, password_hash, created_at_ms)
+		 SELECT ?, ?, ?
+		 WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE lower(id) = lower(?))`,
+		accountID, hash, now.UnixMilli(), accountID,
+	)
+	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		// Another writer won the race the NOT EXISTS guard could not see.
+		return AccountInfo{}, ErrAccountExists
+	}
+	if err != nil {
+		return AccountInfo{}, err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return AccountInfo{}, ErrAccountExists
+	}
+	return AccountInfo{ID: accountID, CreatedAt: time.UnixMilli(now.UnixMilli()).UTC()}, nil
+}
+
+/*
+================
+Verify
+
+Whether password opens an enabled account. A missing account still pays
+one bcrypt comparison so response time does not reveal which ids exist.
+================
+*/
+func (accounts *Accounts) Verify(ctx context.Context, accountID, password string) (bool, error) {
+	if len(password) == 0 || len(password) > MaxPasswordBytes {
+		return false, nil
+	}
+	if err := accounts.acquire(ctx); err != nil {
+		return false, err
+	}
+	defer accounts.release()
+	hash, found := accounts.PasswordHash(accountID)
+	if !found {
+		hash = accounts.dummyHash()
+	}
+	return found && bcrypt.CompareHashAndPassword(hash, []byte(password)) == nil, nil
+}
+
+/*
+================
+SetPassword
+================
+*/
+func (accounts *Accounts) SetPassword(ctx context.Context, accountID, password string) error {
+	hash, err := accounts.hash(ctx, password)
+	if err != nil {
+		return err
+	}
+	result, err := accounts.db.ExecContext(
+		ctx,
+		`UPDATE accounts SET password_hash = ?, session_epoch = session_epoch + 1 WHERE id = ?`,
+		hash, accountID,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return ErrAccountNotFound
+	}
+	if epoch, err := accounts.readEpoch(ctx, accountID); err == nil {
+		accounts.notifyRevoke(accountID, epoch)
+	}
+	return nil
+}
+
+/*
+================
+UpgradePasswordHash
+
+Rehashes password at the store's cost only while the stored hash is still
+verified, the one the caller checked password against. A password change
+that landed in between wins: the swap matches no row and reports false.
+================
+*/
+func (accounts *Accounts) UpgradePasswordHash(ctx context.Context, accountID string, verified []byte, password string) (bool, error) {
+	hash, err := accounts.hash(ctx, password)
+	if err != nil {
+		return false, err
+	}
+	result, err := accounts.db.ExecContext(
+		ctx,
+		`UPDATE accounts SET password_hash = ? WHERE id = ? AND password_hash = ?`,
+		hash, accountID, verified,
+	)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
+}
+
+/*
+================
+SetDisabled
+================
+*/
+func (accounts *Accounts) SetDisabled(ctx context.Context, accountID string, disabled bool) error {
+	flag := 0
+	if disabled {
+		flag = 1
+	}
+	statement := `UPDATE accounts SET disabled = ?, session_epoch = session_epoch + 1 WHERE id = ?`
+	if !disabled {
+		// Enabling clears any block detail: an enabled account carries none.
+		statement = `UPDATE accounts SET disabled = ?, block_reason = '', block_until_ms = 0, session_epoch = session_epoch + 1 WHERE id = ?`
+	}
+	result, err := accounts.db.ExecContext(
+		ctx,
+		statement,
+		flag, accountID,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return ErrAccountNotFound
+	}
+	if epoch, err := accounts.readEpoch(ctx, accountID); err == nil {
+		accounts.notifyRevoke(accountID, epoch)
+	}
+	return nil
+}
+
+/*
+================
+SetBlock
+
+Blocks the account with the staff reason and optional end (untilMs 0
+is permanent) the title screen shows after the password verifies
+(#2271). Blocking disables the account and revokes its sessions,
+exactly like SetDisabled(true). The '#' is refused because the native
+client splits a reason on it into structured fields.
+================
+*/
+func (accounts *Accounts) SetBlock(ctx context.Context, accountID, reason string, untilMs int64) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" || strings.ContainsRune(reason, '#') ||
+		utf8.RuneCountInString(reason) > MaxBlockReasonChars || untilMs < 0 {
+		return ErrBlockInvalid
+	}
+	result, err := accounts.db.ExecContext(
+		ctx,
+		`UPDATE accounts SET disabled = 1, block_reason = ?, block_until_ms = ?, session_epoch = session_epoch + 1 WHERE id = ?`,
+		reason, untilMs, accountID,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return ErrAccountNotFound
+	}
+	if epoch, err := accounts.readEpoch(ctx, accountID); err == nil {
+		accounts.notifyRevoke(accountID, epoch)
+	}
+	return nil
+}
+
+/*
+================
+ClearBlock
+
+Lifts a block: the account is enabled and its block detail is gone.
+================
+*/
+func (accounts *Accounts) ClearBlock(ctx context.Context, accountID string) error {
+	result, err := accounts.db.ExecContext(
+		ctx,
+		`UPDATE accounts SET disabled = 0, block_reason = '', block_until_ms = 0, session_epoch = session_epoch + 1 WHERE id = ?`,
+		accountID,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return ErrAccountNotFound
+	}
+	if epoch, err := accounts.readEpoch(ctx, accountID); err == nil {
+		accounts.notifyRevoke(accountID, epoch)
+	}
+	return nil
+}
+
+/*
+================
+Block
+
+The account's disabled flag and block detail exactly as stored, for
+the login flow (#2271 PR-B): the caller verifies the password first
+and only then reads this, so a block is never revealed to a wrong
+password. Whether an end time has passed is the caller's judgment.
+================
+*/
+func (accounts *Accounts) Block(accountID string) (disabled bool, reason string, untilMs int64, found bool) {
+	var off int
+	err := accounts.db.QueryRow(
+		`SELECT disabled, block_reason, block_until_ms FROM accounts WHERE id = ?`,
+		accountID,
+	).Scan(&off, &reason, &untilMs)
+	if err != nil {
+		return false, "", 0, false
+	}
+	return off == 1, reason, untilMs, true
+}
+
+/*
+================
+RevokeSessions
+
+Advances the account's session epoch, invalidating all previously minted
+sessions and notifying the revocation observer.
+================
+*/
+func (accounts *Accounts) RevokeSessions(ctx context.Context, accountID string) (uint64, error) {
+	if !domain.AccountIDValid(accountID) || accountID == domain.ReservedAccountID {
+		return 0, ErrAccountIDInvalid
+	}
+	result, err := accounts.db.ExecContext(
+		ctx,
+		`UPDATE accounts SET session_epoch = session_epoch + 1 WHERE id = ?`,
+		accountID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return 0, ErrAccountNotFound
+	}
+	epoch, err := accounts.readEpoch(ctx, accountID)
+	if err != nil {
+		return 0, err
+	}
+	accounts.notifyRevoke(accountID, epoch)
+	return epoch, nil
+}
+
+//============================================================================
+
+/*
+================
+hash
+================
+*/
+func (accounts *Accounts) hash(ctx context.Context, password string) ([]byte, error) {
+	if len(password) < MinPasswordBytes || len(password) > MaxPasswordBytes {
+		return nil, ErrPasswordInvalid
+	}
+	if err := accounts.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer accounts.release()
+	return bcrypt.GenerateFromPassword([]byte(password), accounts.cost)
+}
+
+/*
+================
+BcryptCost
+
+The cost of the hashes this store creates.
+================
+*/
+func (accounts *Accounts) BcryptCost() int {
+	return accounts.cost
+}
+
+/*
+================
+acquire
+================
+*/
+func (accounts *Accounts) acquire(ctx context.Context) error {
+	select {
+	case accounts.hashing <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+/*
+================
+release
+================
+*/
+func (accounts *Accounts) release() {
+	<-accounts.hashing
+}
+
+/*
+================
+dummyHash
+
+A hash at the store's cost that no password matches.
+================
+*/
+func (accounts *Accounts) dummyHash() []byte {
+	accounts.dummyOnce.Do(func() {
+		accounts.dummy, _ = bcrypt.GenerateFromPassword([]byte("\x00unmatchable\x00"), accounts.cost)
+	})
+	return accounts.dummy
+}

@@ -1,0 +1,473 @@
+/*
+===========================================================================
+petbond.go - port-only Guardian's Bond admission, HP transfer and auto revival
+
+Resolve other actors before a character write; debit the bear after it closes.
+Transferred damage never re-enters combat counters or another damage link.
+===========================================================================
+*/
+package action
+
+import (
+	"sort"
+
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/companion"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/pk"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+const petBondRange = 120.0          // 12 metres.
+const petBondOpcode uint16 = 0x3fb4 // [recipient u32, bear u32, kind u8: transfer=1/revive=2].
+
+/*
+================
+petBondRuntime / petBondPlan
+================
+*/
+type petBondRuntime struct {
+	window int64
+	spent  uint32
+}
+type petBondPlan struct {
+	owner           *enterworld.Character
+	state           *petSession
+	division        string
+	bear, recipient uint32
+	percent         float64
+	budget, moved   uint32
+	now             int64
+}
+
+/*
+================
+petBondFrame
+================
+*/
+func petBondFrame(recipient, bear uint32, kind uint8) wire.Frame {
+	return wire.Frame{Opcode: petBondOpcode, Payload: wire.NewWriter(9).U32(recipient).U32(bear).U8(kind).Payload()}
+}
+
+/*
+================
+bondSourceRefused
+
+The bond source's refusal judged on door-read values (#2030), so an
+owner whose record already refuses - deletion-pending, no live
+summoned bear under this gid, the expansion's owner half refused, or
+no Guardian's Bond passive slotted - never pays for the pet-owner
+copy bondSource used to take first. Every input weighs the same facts
+the copy path weighs: the admission's own bear test, the summoned
+flag, petExpansionAllowed's owner half (its pet half is the bear kind
+the admission already enforced), and the passive scan over a detached
+row - CharacterCOS's only deep children are its container and its
+rentals, neither of which makes a Guardian's Bond verdict, so the row
+rides out with both nil. A source the facts admit still takes the
+copy: transfer and revival read its owner and pet roots, and only a
+refusal is provable from values. The companionCopy seam abstains the
+same way petjudged's does.
+================
+*/
+func (rt *Runtime) bondSourceRefused(key petOwnerKey, state *petSession) (refused, judged bool) {
+	if rt.companionCopy != nil {
+		return false, false
+	}
+	guard := rt.deps.AcquireRead(key.division)
+	owner := state.character
+	pet := owner.CompanionByGID(key.gid)
+	if owner.DeletePending || pet == nil || pet.CurrentHP == 0 || companion.PetKind(pet.Codename) != "Bear" || !pet.Summoned {
+		refused = true
+	} else if rt.inFreeBattle(owner) || wearsJobSuit(owner, rt.deps.ItemReferences()) ||
+		domain.CharacterWorldInstance(owner) != domain.DefaultWorldInstance {
+		refused = true
+	} else {
+		row := *pet
+		row.Container, row.Rentals = nil, nil
+		_, _, slotted := companion.Passive(&row, "Guardian's Bond", companion.ModifiersFor(&row))
+		refused = !slotted
+	}
+	guard.Release()
+	return refused, true
+}
+
+/*
+================
+bondRevivalTarget
+
+Whether a candidate record is one the revival walk could take:
+dead by a monster and inside the bear's level band. These are
+the target admission's own tests, read on the live record the
+walk itself would find.
+================
+*/
+func bondRevivalTarget(target *enterworld.Character, band int64) bool {
+	return target != nil && !enterworld.CharacterAlive(target) &&
+		target.DeathKind == uint8(pk.DeathMonster) && rewardLevel(target) <= band
+}
+
+/*
+================
+bondRevivalIdle
+
+Whether this tick's revival provably cannot fire, judged on
+door-read facts before bondSource's companion copy is taken
+(#2033): the bear's rank never fires, its saved cooldown is
+still running, or no candidate - the owner, and at tier III the
+party - is a dead, monster-killed, in-band record. The copy was
+the tick's top flat allocator, and on nearly every tick of a
+bond bear's life one of the three holds (the cooldown alone
+runs for minutes after a revival), so the walk below discarded
+what the copy bought. The detached row answers the bear's half
+exactly: GuardianRevival's rank and the passive ready stamp
+read Training alone (ModifiersFor walks gear and slotted rows),
+never the container or rentals the row detaches. The candidate
+half is the target admission's own tests on the records
+findCharacterByGid returns. Anything the facts cannot prove -
+the forced-copy seam, no live bear, no slotted passive, a
+ready-stamp index outside the training rows - abstains and the
+copy judges as before; a tick the facts prove live also falls
+through, so the copy's own read still owns the firing verdict.
+================
+*/
+func (rt *Runtime) bondRevivalIdle(key petOwnerKey, state *petSession, now int64) (idle, judged bool) {
+	if rt.companionCopy != nil {
+		return false, false
+	}
+	guard := rt.deps.AcquireRead(key.division)
+	owner := state.character
+	pet := owner.CompanionByGID(key.gid)
+	if pet == nil {
+		guard.Release()
+		return false, false
+	}
+	row := *pet
+	row.Container, row.Rentals = nil, nil
+	skill, _, slotted := companion.Passive(&row, "Guardian's Bond", companion.ModifiersFor(&row))
+	if !slotted {
+		guard.Release()
+		return false, false
+	}
+	rank, _ := companion.GuardianRevival(&row)
+	if rank == 0 {
+		guard.Release()
+		return true, true
+	}
+	index := skill.Row - companion.ActiveRowCount
+	if index < 0 || index >= len(row.Training.PassiveReadyAtMs) {
+		guard.Release()
+		return false, false
+	}
+	if row.Training.PassiveReadyAtMs[index] > now {
+		guard.Release()
+		return true, true
+	}
+	ownerGID := enterworld.ObjectIDForCharacter(owner)
+	band := int64(row.Level) + 10
+	party := skill.Option == 3
+	// The owner candidate is the session's own live record - the
+	// record the revival closure itself writes through - so it is
+	// judged in hand; party members resolve through the store.
+	ownerTarget := bondRevivalTarget(owner, band)
+	guard.Release()
+	if ownerTarget {
+		return false, true
+	}
+	if party {
+		// The party scan runs with no guard held: findCharacterByGid
+		// takes the store's own read lock per lookup, exactly as
+		// the revival walk below runs it.
+		for gid := range rt.auraParty(key.division, owner) {
+			if gid != ownerGID && bondRevivalTarget(rt.findCharacterByGid(key.division, gid), band) {
+				return false, true
+			}
+		}
+	}
+	return true, true
+}
+
+/*
+================
+bondSource
+
+The same opt-in, session, job, world and town gates protect transfer and revival.
+Owner death is allowed here so a living bear can revive its own owner.
+================
+*/
+func (rt *Runtime) bondSource(key petOwnerKey, state *petSession) (*enterworld.Character, *domain.CharacterCOS, companion.SkillDef, uint8, bool) {
+	if !rt.AttackPetExpansion || state == nil || !state.ready || state.mover.AnyFollower() == nil {
+		return nil, nil, companion.SkillDef{}, 0, false
+	}
+	// A refusal the door-read facts already decide never reaches the
+	// copy below (#2030); an admitted source judges as before.
+	if refused, judged := rt.bondSourceRefused(key, state); judged && refused {
+		return nil, nil, companion.SkillDef{}, 0, false
+	}
+	// Runs for every bear source per bond plan: copy the owner only when
+	// the record still holds a live summoned bear under this gid. The
+	// copy is the companion copy: the bear below resolves through the
+	// owner's companion rows, which that copy keeps, where the #1943
+	// equipment copy dropped the pet it just admitted (#2030;
+	// TestBondSourceReadsNothingOutsideTheCompanionCopy).
+	owner := rt.characterSnapshotCompanionAdmitted(key.division, state.character, func(c *enterworld.Character) bool {
+		pet := c.CompanionByGID(key.gid)
+		return !c.DeletePending && pet != nil && pet.CurrentHP != 0 && companion.PetKind(pet.Codename) == "Bear"
+	})
+	if owner == nil || owner.DeletePending {
+		return nil, nil, companion.SkillDef{}, 0, false
+	}
+	pet := owner.CompanionByGID(key.gid)
+	if pet == nil || !pet.Summoned || pet.CurrentHP == 0 || companion.PetKind(pet.Codename) != "Bear" || !rt.petExpansionAllowed(owner, pet) || rt.inTown(key.division, owner) {
+		return nil, nil, companion.SkillDef{}, 0, false
+	}
+	skill, level, ok := companion.Passive(pet, "Guardian's Bond", companion.ModifiersFor(pet))
+	return owner, pet, skill, level, ok
+}
+
+/*
+================
+bondRecipient
+================
+*/
+func (rt *Runtime) bondRecipient(key petOwnerKey, owner, recipient *enterworld.Character, pet *domain.CharacterCOS, skill companion.SkillDef, now int64) bool {
+	if recipient == nil || recipient.DeletePending || !rt.petExpansionAllowed(recipient, pet) || rt.inTown(key.division, recipient) {
+		return false
+	}
+	if recipient.Name != owner.Name && (skill.Option < 3 || !rt.auraParty(key.division, owner)[enterworld.ObjectIDForCharacter(recipient)]) {
+		return false
+	}
+	session := rt.petSessionFor(key.division, recipient.Name, 0)
+	if session == nil || !session.ready {
+		return false
+	}
+	a := rt.companionLiveSpawn(key.division, owner, pet, now)
+	b := rt.liveSpawn(simulation.WorldKey(key.division, recipient.Name), recipient, now)
+	return samePlaneAdjacent(a, b) && areaDistance(a, b) <= petBondRange
+}
+
+/*
+================
+planPetBond
+
+One strongest bond, never stacked. The party shares a 20%-of-bear-max-HP/sec
+budget, and transferred HP costs cannot kill the bear. No nested store reads.
+================
+*/
+func (rt *Runtime) planPetBond(division string, victim *enterworld.Character, now int64) *petBondPlan {
+	if !rt.AttackPetExpansion || victim == nil {
+		return nil
+	}
+	type source struct {
+		key   petOwnerKey
+		state *petSession
+	}
+	var sources []source
+	rt.petMu.Lock()
+	for key, state := range rt.petSessions {
+		if key.division == division && key.gid != 0 && state.ready {
+			sources = append(sources, source{key, state})
+		}
+	}
+	rt.petMu.Unlock()
+	sort.Slice(sources, func(i, j int) bool { return sources[i].key.gid < sources[j].key.gid })
+	var best *petBondPlan
+	for _, source := range sources {
+		owner, pet, skill, level, ok := rt.bondSource(source.key, source.state)
+		if !ok || skill.Option < 2 || !enterworld.CharacterAlive(owner) || !rt.bondRecipient(source.key, owner, victim, pet, skill, now) {
+			continue
+		}
+		percent := min(float64(skill.Option)*10, skill.ValueAt(min(level, skill.MaxLevel)))
+		ref, found := rt.cosReference(pet)
+		if !found || pet.CurrentHP <= 1 {
+			continue
+		}
+		spent := uint32(0)
+		rt.petMu.Lock()
+		if now-source.state.bond.window < 1000 {
+			spent = source.state.bond.spent
+		}
+		rt.petMu.Unlock()
+		cap := max(uint32(1), ref.MaxHP/5)
+		if spent >= cap {
+			continue
+		}
+		budget := min(cap-spent, pet.CurrentHP-1)
+		if best == nil || percent > best.percent {
+			best = &petBondPlan{owner: source.state.character, state: source.state, division: division, bear: pet.GID, recipient: enterworld.ObjectIDForCharacter(victim), percent: percent, budget: budget, now: now}
+		}
+	}
+	return best
+}
+
+/*
+================
+sharePetBond
+
+Called only for monster damage remaining after shields and mana redirection.
+================
+*/
+func sharePetBond(plan *petBondPlan, damage uint32) uint32 {
+	if plan == nil || plan.moved >= plan.budget {
+		return damage
+	}
+	moved := min(uint32(float64(damage)*plan.percent/100), plan.budget-plan.moved)
+	plan.moved += moved
+	return damage - moved
+}
+
+/*
+================
+commitPetBond
+================
+*/
+func (rt *Runtime) commitPetBond(plan *petBondPlan) []wire.Frame {
+	if plan == nil || plan.moved == 0 {
+		return nil
+	}
+	moved := plan.moved
+	plan.moved = 0 // Publication may be requested more than once.
+	// The bear's HP may have fallen since the plan: debit only what it
+	// can still pay, and never to death - the booked spent and the
+	// published debit are the clamped amount, not the planned share
+	// (checklist item 5's fatal over-charge).
+	var hp uint32
+	paid := uint32(0)
+	if !rt.deps.UpdateDeferred(plan.owner, "pet-bond-transfer", func() bool {
+		pet := plan.owner.CompanionByGID(plan.bear)
+		if pet == nil || !pet.Summoned || pet.CurrentHP <= 1 {
+			return false
+		}
+		paid = min(moved, pet.CurrentHP-1)
+		pet.CurrentHP -= paid
+		hp = pet.CurrentHP
+		return true
+	}) {
+		return nil
+	}
+	rt.petMu.Lock()
+	if plan.now-plan.state.bond.window >= 1000 {
+		plan.state.bond = petBondRuntime{window: plan.now}
+	}
+	plan.state.bond.spent += paid
+	rt.petMu.Unlock()
+	pulse := petBondFrame(plan.recipient, plan.bear, 1)
+	pulse.Payload = append(pulse.Payload, wire.NewWriter(4).U32(paid).Payload()...)
+	return []wire.Frame{{Opcode: simulation.OpVitalsUpdate, Payload: simulation.HPRefreshPayload(plan.bear, 0, hp)}, pulse}
+}
+
+/*
+================
+advancePetBond
+
+Every tier revives the owner; III also revives party members. Tier-I ranks
+scale HP/EXP recovery and the saved shared cooldown, surviving resummon.
+================
+*/
+func (rt *Runtime) advancePetBond(key petOwnerKey, state *petSession, now int64) []simulation.Frame {
+	// Judge every cheap verdict before taking bondSource's answer
+	// home: the SkillDef it returns escapes in this frame, so an
+	// owner who pays the call at all pays ~160 B a tick even when
+	// the admission refuses (#2030). bondSource's own first gates
+	// - expansion off, no ready session - refuse here; the refusal
+	// facts and the idle facts (bondRevivalIdle) judge next, and
+	// none of the three needs the follower the copy path does, so
+	// an owner whose pet is not even out no longer pays for the
+	// call either. An admitted, live tick still takes the copy
+	// and bondSource re-judges everything on it; behind the
+	// companionCopy seam the facts abstain (judged false) and the
+	// copy judges as before. Nothing about any verdict moves.
+	if !rt.AttackPetExpansion || state == nil || !state.ready {
+		return nil
+	}
+	if refused, judged := rt.bondSourceRefused(key, state); judged && refused {
+		return nil
+	}
+	if idle, judged := rt.bondRevivalIdle(key, state, now); judged && idle {
+		return nil
+	}
+	owner, pet, skill, _, ok := rt.bondSource(key, state)
+	if !ok {
+		return nil
+	}
+	rank, cooldown := companion.GuardianRevival(pet)
+	if rank == 0 || pet.Training.PassiveReadyAtMs[skill.Row-companion.ActiveRowCount] > now {
+		return nil
+	}
+	gids := []uint32{enterworld.ObjectIDForCharacter(owner)}
+	var party []uint32
+	for gid := range rt.auraParty(key.division, owner) {
+		if skill.Option == 3 && gid != gids[0] {
+			party = append(party, gid)
+		}
+	}
+	sort.Slice(party, func(i, j int) bool { return party[i] < party[j] })
+	gids = append(gids, party...)
+	for _, gid := range gids {
+		target := rt.findCharacterByGid(key.division, gid)
+		// Revival weighs a dead, monster-killed, in-band target; all
+		// three are record fields, so a living or out-of-band member
+		// never pays for its detached copy (#1943). The copy is the
+		// combat copy: the recipient gate reads equipment and scalars,
+		// and the revival stats walk equipment rows plus the avatar
+		// inventory's option rows (combat avatarOptionWrites), so a
+		// plain bag row is all it may drop - the pet-owner view would
+		// revive a member without their avatar HP/MP options (#2030;
+		// TestBondRevivalTakesTheCombatCopy).
+		snapshot := rt.characterSnapshotCombatAdmitted(key.division, target, func(live *enterworld.Character) bool {
+			return !enterworld.CharacterAlive(live) && live.DeathKind == uint8(pk.DeathMonster) &&
+				rewardLevel(live) <= int64(pet.Level)+10
+		})
+		if snapshot == nil || !rt.bondRecipient(key, owner, snapshot, pet, skill, now) {
+			continue
+		}
+		stats, _, err := rt.playerCombatStats(key.division, snapshot)
+		if err != nil {
+			continue
+		}
+		maxHP, _, _, _ := keeperVitalsFrom(snapshot, stats, nil)
+		actors := []*enterworld.Character{state.character}
+		if target != state.character {
+			actors = append(actors, target)
+		}
+		var revived revivedWhereDead
+		if !rt.deps.UpdateManyDeferred(actors, "pet-bond-revival", func() bool {
+			live := state.character.CompanionByGID(pet.GID)
+			if live == nil || !live.Summoned || live.CurrentHP == 0 || live.Training.PassiveReadyAtMs[skill.Row-companion.ActiveRowCount] > now || target.DeletePending || enterworld.CharacterAlive(target) {
+				return false
+			}
+			live.Training.PassiveReadyAtMs[skill.Row-companion.ActiveRowCount] = now + cooldown
+			loss := max(int64(0), target.LastExpLoss)
+			refund := loss/10*int64(rank) + loss%10*int64(rank)/10
+			revived = rt.reviveWhereDead(key.division, target, resurrectionOffer{hp: max(int64(0), maxHP*int64(rank)/10-1), exp: refund}, now)
+			return true
+		}) {
+			return nil
+		}
+		// A bond revival settles the target's death: any pending
+		// resurrection offer for it is stale from here and must not
+		// overwrite the revival's vitals/position (checklist item 4).
+		rt.resurrections.drop(key.division, target.Name)
+		actor, peers := rt.revivalFrames(key.division, target, revived, now)
+		pulse := petBondFrame(gid, pet.GID, 2)
+		actor = append(actor, pulse)
+		if target.ID != state.character.ID {
+			// Party revival: the revived member gets only its private
+			// set plus the pulse; the peer set plus pulse broadcasts to
+			// the bear's owner and every other observer exactly once
+			// (the public lane would exclude the owner and double-send
+			// to the revived member).
+			state.routed = append(state.routed, simulation.DivisionFrames{
+				DivisionID:        key.division,
+				SourceGID:         pet.GID,
+				ExceptCharacterID: target.ID,
+				Frames:            simFrames(append(peers, pulse)),
+			})
+		} else {
+			state.public = append(state.public, append(peers, pulse)...)
+		}
+		state.others = append(state.others, RecipientFrames{CharacterID: target.ID, Frames: actor})
+		return simFrames(rt.petTrainingStateFrames(state.character.CompanionByGID(pet.GID), now))
+	}
+	return nil
+}

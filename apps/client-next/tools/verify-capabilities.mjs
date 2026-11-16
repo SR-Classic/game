@@ -1,0 +1,554 @@
+/*
+===========================================================================
+
+verify-capabilities.mjs - who may touch the GPU, the network, time and async
+
+Walks the client sources and rejects any use of a guarded capability (GPU
+device, command encoders, timers, network, workers, dynamic execution,
+asynchronous code) outside the module that owns it. The owners are declared
+here, in `rules` and ASYNC_OWNERS; adding one is a reviewed change.
+
+===========================================================================
+*/
+
+import fs from "node:fs";
+import path from "node:path";
+import { project, root, visit, ts, main } from "./project.mjs";
+const runtime = "src/engine/runtime/";
+
+// Modules whose job is asynchronous I/O. Everything else runs synchronously
+// inside the frame or its owner's step.
+const ASYNC_OWNERS = [
+	runtime + "simulation/worker/session/http/http.ts",
+	// The WebTransport attempt (#1448): connect, stream pump and cert fetch.
+	runtime + "simulation/worker/network/network.ts",
+	runtime + "assets/worker/loader.ts",
+	"src/engine/foundation/assets/read-bytes.ts",
+	runtime + "assets/worker/packs/packs.ts",
+	runtime + "assets/worker/packs/blocks.ts",
+	runtime + "assets/worker/packs/persistent.ts",
+	runtime + "assets/worker/world/resources/resources.ts",
+	runtime + "assets/worker/navigation/navigation.ts",
+	// Background install of the combat presentation set; worker-only I/O.
+	runtime + "assets/worker/install.ts",
+	// navigator.storage.persist(): a Window-only call the asset worker cannot make.
+	"src/engine/foundation/assets/persistent-storage.ts",
+	// The bug reporter: its settings and upload, the capture stream's
+	// playback and the report window's send (issue #90).
+	runtime + "bug-report/bug-report.ts",
+	runtime + "bug-report/recorder.ts",
+	runtime + "bug-report/dialog.ts",
+	runtime + "bug-report/trimmer.ts",
+	runtime + "bug-report/transcode.ts",
+	runtime + "bug-report/archive.ts",
+	runtime + "bug-report/journal.ts",
+	// The 3D viewer's still: one GPU copy mapped back, then encoded to a
+	// PNG and posted to the embedding page (docs/guides/VIEWER.md).
+	runtime + "renderer/device/portrait-readback.ts",
+	runtime + "viewer/viewer.ts"
+];
+const device = runtime + "renderer/device/device.ts",
+	frame = runtime + "renderer/frame/frame.ts",
+	surface = runtime + "renderer/surface/surface.ts";
+const pipelines = runtime + "renderer/device/pipelines.ts",
+	images = runtime + "renderer/device/images.ts",
+	geometry = runtime + "renderer/device/geometry.ts";
+const ui = runtime + "renderer/device/ui.ts", uiBridge = runtime + "platform/ui/ui.ts";
+const flares = runtime + "renderer/device/flares.ts";
+const bugReport = runtime + "bug-report/bug-report.ts",
+	buildInfo = runtime + "build-info/build-info.ts",
+	bugRecorder = runtime + "bug-report/recorder.ts",
+	bugDialog = runtime + "bug-report/dialog.ts",
+	bugTrimmer = runtime + "bug-report/trimmer.ts",
+	bugTranscode = runtime + "bug-report/transcode.ts",
+	bugJournal = runtime + "bug-report/journal.ts";
+const thunder = runtime + "renderer/device/thunder.ts";
+const timing = runtime + "renderer/device/timing.ts";
+const waterReflection = runtime + "renderer/device/water-reflection.ts";
+const bloom = runtime + "renderer/device/bloom.ts";
+const finish = runtime + "renderer/device/finish.ts";
+const shadows = runtime + "renderer/device/character-shadows.ts";
+const sunShadow = runtime + "renderer/device/sun-shadow.ts";
+const hdr = runtime + "renderer/device/hdr.ts";
+const ambientOcclusion = runtime + "renderer/device/ambient-occlusion.ts";
+// Port-only: the experimental 4x multisampled scene buffers (device/msaa.ts).
+const msaa = runtime + "renderer/device/msaa.ts";
+const animation = runtime + "renderer/device/animation.ts";
+const particleQuery = runtime + "renderer/device/particle-query.ts";
+// Port-only: the 3D viewer's still readback (docs/guides/VIEWER.md).
+const portraitReadback = runtime + "renderer/device/portrait-readback.ts";
+// The device's bundle-encoder wrapper: finishes the raw encoder it wraps (#2560).
+const bundleEncoder = runtime + "renderer/device/bundle-encoder.ts";
+const particles = runtime + "renderer/device/particles.ts";
+const geometryUploads = runtime + "renderer/device/geometry-uploads.ts";
+// Slabs of geometry's small buffers (uniforms, instances, vertex and index ranges).
+const bufferSlabs = runtime + "renderer/device/buffer-slabs.ts";
+const deviceInternals = [
+	waterReflection,
+	bloom,
+	finish,
+	device,
+	pipelines,
+	images,
+	geometry,
+	geometryUploads,
+	bufferSlabs,
+	ui,
+	flares,
+	thunder,
+	timing,
+	animation,
+	particleQuery,
+	portraitReadback,
+	particles,
+	shadows,
+	sunShadow,
+	hdr,
+	ambientOcclusion,
+	msaa
+];
+export const rules = {
+	createQuerySet: [ timing ],
+	resolveQuerySet: [ frame ],
+	mapAsync: [ timing ],
+	getMappedRange: [ timing ],
+	Audio: [ runtime + "audio/music/music.ts" ],
+	createElement: [
+		runtime + "platform/telemetry.ts",
+		uiBridge,
+		runtime + "platform/ui/cursor.ts",
+		runtime + "platform/ui/drag-shield.ts",
+		bugRecorder,
+		bugDialog,
+		bugTrimmer
+	],
+	// The picking mask readback, shared by the renderer and the asset worker.
+	// The viewer encodes its still to a PNG (docs/guides/VIEWER.md).
+	OffscreenCanvas: [ "src/engine/foundation/rendering/pick-alpha.ts", bugRecorder, runtime + "viewer/viewer.ts" ],
+	AudioContext: [ runtime + "audio/audio.ts" ],
+	decodeAudioData: [ runtime + "audio/audio.ts" ],
+	createPanner: [ runtime + "audio/audio.ts" ],
+	createBufferSource: [ runtime + "audio/audio.ts" ],
+	createGain: [ runtime + "audio/audio.ts" ],
+	requestAnimationFrame: [ runtime + "runtime.ts" ],
+	cancelAnimationFrame: [ runtime + "runtime.ts" ],
+	// The asset loader owns progress/retry timers; persistent storage owns bounded
+	// optional-cache deadlines, cleared on settlement or owner timeout. The
+	// network owner arms the WebTransport connect and WELCOME deadlines (#1448),
+	// cleared on establishment, welcome, disconnect or disposal.
+	setTimeout: [
+		runtime + "simulation/worker/clock/clock.ts",
+		runtime + "assets/worker/loader.ts",
+		runtime + "assets/worker/packs/persistent.ts",
+		runtime + "simulation/worker/network/network.ts",
+		uiBridge
+	],
+	clearTimeout: [
+		runtime + "simulation/worker/clock/clock.ts",
+		runtime + "assets/worker/loader.ts",
+		runtime + "assets/worker/packs/persistent.ts",
+		runtime + "simulation/worker/network/network.ts",
+		uiBridge
+	],
+	setInterval: [],
+	createRenderBundleEncoder: [ device ],
+	createBundleEncoder: [ device, frame ],
+	executeBundles: [ frame ],
+	requestAdapter: [ device ],
+	requestDevice: [ device ],
+	createCommandEncoder: [ device ],
+	createEncoder: [ frame, device ],
+	beginRenderPass: [ frame, device ],
+	beginComputePass: [ frame ],
+	finish: [ frame, device ],
+	submit: [ frame, device ],
+	createImageBitmap: [ runtime + "assets/worker/loader.ts" ],
+	createSampler: [ device ],
+	getContext: [
+		surface,
+		"src/engine/foundation/rendering/pick-alpha.ts",
+		bugRecorder,
+		bugTrimmer,
+		runtime + "viewer/viewer.ts"
+	],
+	createBuffer: [ device ],
+	createTexture: [ device ],
+	createBindGroup: [ device ],
+	createBindGroupLayout: [ device ],
+	createPipelineLayout: [ device ],
+	createShaderModule: [ device ],
+	createRenderPipeline: [ device ],
+	createRenderPipelineAsync: [ device ],
+	createComputePipeline: [ device ],
+	createComputePipelineAsync: [ device ],
+	writeBuffer: [ device ],
+	writeTexture: [ device ],
+	copyExternalImageToTexture: [ device ],
+	pushErrorScope: [ device ],
+	popErrorScope: [ device ],
+	getCurrentTexture: [ surface ],
+	// The recorder and transcoder configure WebCodecs, not a canvas.
+	configure: [ surface, device, bugRecorder, bugTranscode ],
+	unconfigure: [ surface ],
+	addEventListener: [
+		runtime + "assets/worker/loader.ts", // AbortSignal releases a pending download backoff.
+		runtime + "assets/worker/packs/persistent.ts", // Cancellation releases a cache waiter, retaining native admission.
+		// Cancellation releases a read waiting on a shared pack or manifest
+		// download (untilCancelled); the listener is removed on every exit.
+		runtime + "assets/worker/packs/packs.ts",
+		// AbortSignal cancels a stalled body read; the listener is removed on every exit.
+		"src/engine/foundation/assets/read-bytes.ts",
+		runtime + "platform/telemetry.ts",
+		runtime + "platform/platform.ts",
+		device,
+		uiBridge,
+		runtime + "platform/ui/cursor.ts",
+		// The drag shield's gesturestart refusal, live only while a drag runs (GH #1242).
+		runtime + "platform/ui/drag-shield.ts",
+		// A touch tap's held hover ends on the next touch, wheel or scroll (GH #1243).
+		runtime + "platform/ui/touch-inspect.ts",
+		bugReport,
+		bugDialog,
+		bugTrimmer,
+		bugTranscode,
+		bugJournal,
+		// The 3D viewer's drag and wheel on its picture canvas (docs/guides/VIEWER.md).
+		runtime + "viewer/viewer.ts"
+	],
+	fetch: [
+		runtime + "simulation/worker/session/http/http.ts",
+		runtime + "assets/worker/loader.ts",
+		// The transport's cert-hash document before a WebTransport attempt (#1448).
+		runtime + "simulation/worker/network/network.ts",
+		bugReport,
+		// The Agent's one GET /title/build for the FPS chip.
+		buildInfo
+	],
+	WebSocket: [ runtime + "simulation/worker/network/network.ts" ],
+	WebTransport: [ runtime + "simulation/worker/network/network.ts" ],
+	Worker: [ runtime + "simulation/host.ts", runtime + "assets/assets.ts" ]
+};
+// A geometry pipeline for a native state no scene precompiles is compiled
+// at its first upload, as D3D9 applies any render state at once.
+for ( const name of [ "createShaderModule", "createRenderPipeline", "createRenderPipelineAsync", "createSampler" ] ) {
+	rules[name].push( pipelines );
+}
+for (
+	const name of [
+		"createTexture",
+		"createBindGroup",
+		"writeTexture",
+		"copyExternalImageToTexture",
+		"pushErrorScope",
+		"popErrorScope"
+	]
+) rules[name].push( images );
+for (
+	const name of [
+		"createBuffer",
+		"createTexture",
+		"createBindGroup",
+		"writeBuffer",
+		"writeTexture",
+		"pushErrorScope",
+		"popErrorScope"
+	]
+) rules[name].push( geometry );
+// The sun cascade's comparison sampler (bindings 13/14) is geometry-owned:
+// every world draw binds it, so it lives with the draws' other samplers.
+rules.createSampler.push( geometry );
+for ( const name of [ "createBuffer", "writeBuffer", "createCommandEncoder", "finish", "submit" ] ) {
+	rules[name].push( geometryUploads );
+}
+// A staged set (createStagedSlabs) uploads its mirrors' dirty spans itself.
+for ( const name of [ "createBuffer", "writeBuffer" ] ) rules[name].push( bufferSlabs );
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipelineAsync",
+		"createBindGroupLayout",
+		"createPipelineLayout",
+		"createBuffer",
+		"createTexture",
+		"createSampler",
+		"createBindGroup",
+		"writeBuffer",
+		"writeTexture",
+		"copyExternalImageToTexture"
+	]
+) rules[name].push( ui );
+for (
+	const name of [
+		"createShaderModule",
+		"createComputePipelineAsync",
+		"createRenderPipelineAsync",
+		"createBuffer",
+		"createSampler",
+		"createBindGroup",
+		"createBindGroupLayout",
+		"createPipelineLayout",
+		"writeBuffer"
+	]
+) rules[name].push( flares );
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipelineAsync",
+		"createRenderPipeline",
+		"createBuffer",
+		"createBindGroup",
+		"writeBuffer"
+	]
+) rules[name].push( thunder );
+for (
+	const name of [
+		"createShaderModule",
+		"createComputePipelineAsync",
+		"createBuffer",
+		"createBindGroup",
+		"writeBuffer",
+		"beginComputePass"
+	]
+) rules[name].push( animation );
+// The particle presentation pass, like skinning, is encoded by geometry
+// preparation on the frame encoder into the draws' own buffers.
+for (
+	const name of [
+		"createShaderModule",
+		"createComputePipelineAsync",
+		"createBuffer",
+		"createBindGroup",
+		"writeBuffer",
+		"beginComputePass"
+	]
+) rules[name].push( particles );
+// Geometry preparation encodes device-owned skinning and shadow prepasses on
+// the frame encoder; it cannot create, submit, or finish an encoder.
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipeline",
+		"createSampler",
+		"createBuffer",
+		"createTexture",
+		"createBindGroup",
+		"writeBuffer",
+		"beginRenderPass"
+	]
+) rules[name].push( shadows );
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipeline",
+		"createSampler",
+		"createTexture",
+		"createBindGroup",
+		"createBindGroupLayout",
+		"createPipelineLayout",
+		"beginRenderPass"
+	]
+) rules[name].push( bloom );
+// The presentation pass owns its encoder and submission, like the particle
+// query: it runs after the frame submit, from ColorTarget.present.
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipeline",
+		"createSampler",
+		"createBindGroup",
+		"createBindGroupLayout",
+		"createPipelineLayout",
+		"createCommandEncoder",
+		"beginRenderPass",
+		"submit",
+		"finish"
+	]
+) rules[name].push( finish );
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipeline",
+		"createSampler",
+		"createTexture",
+		"createBindGroup",
+		"beginRenderPass"
+	]
+) rules[name].push( hdr );
+// The experimental occlusion owner (#2094): it totals the frame's
+// stored depth into the half-resolution factor the surfaces sample.
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipeline",
+		"createTexture",
+		"createBindGroup",
+		"createBuffer",
+		"writeBuffer",
+		"beginRenderPass"
+	]
+) rules[name].push( ambientOcclusion );
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipeline",
+		"createTexture",
+		"createBindGroup",
+		"beginRenderPass"
+	]
+) rules[name].push( msaa );
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipeline",
+		"createTexture",
+		"writeTexture",
+		"createSampler",
+		"createBuffer",
+		"createBindGroup",
+		"writeBuffer",
+		"beginRenderPass"
+	]
+) rules[name].push( sunShadow );
+for ( const name of [ "createBuffer", "createTexture", "writeBuffer", "beginRenderPass" ] ) {
+	rules[name].push( waterReflection );
+}
+rules.createBuffer.push( timing );
+for (
+	const name of [
+		"createShaderModule",
+		"createRenderPipelineAsync",
+		"createBuffer",
+		"createQuerySet",
+		"createBindGroup",
+		"writeBuffer",
+		"createCommandEncoder",
+		"beginRenderPass",
+		"resolveQuerySet",
+		"submit",
+		"finish",
+		"mapAsync",
+		"getMappedRange"
+	]
+) rules[name].push( particleQuery );
+for ( const name of [ "createBuffer", "createCommandEncoder", "submit", "finish", "mapAsync", "getMappedRange" ] ) {
+	rules[name].push( portraitReadback );
+}
+for ( const name of [ "finish" ] ) {
+	rules[name].push( bundleEncoder );
+}
+/*
+================
+verifyCapabilities
+================
+*/
+export function verifyCapabilities( base = root ) {
+	const model = project( base ), issues = [];
+	const contractPath = path.join( base, "execution-contract.json" ),
+		barriers = fs.existsSync( contractPath ) ?
+			JSON.parse( fs.readFileSync( contractPath, "utf8" ) ).frameBarriers ?? [] :
+			[];
+	/*
+	================
+	nativeBarrier
+	================
+	*/
+	function nativeBarrier( file, n ) {
+		let fn = n;
+		while ( fn && !ts.isFunctionLike( fn ) ) fn = fn.parent;
+		return barriers.some( b => b.file === file && b.function === fn?.name?.getText() );
+	}
+	for ( const [file, source] of model.files ) {
+		visit( source, n => {
+			const neutral = file.startsWith( "src/engine/contracts/" ) || file.startsWith( "src/engine/foundation/" );
+			if ( neutral && ts.isIdentifier( n ) && /^GPU[A-Z]/.test( n.text ) ) {
+				issues.push( `${file}: backend GPU type in renderer-neutral contract` );
+			}
+			if (
+				ts.isElementAccessExpression( n ) && ts.isIdentifier( n.expression ) &&
+				[ "globalThis", "window", "self", "navigator" ].includes( n.expression.text ) &&
+				!ts.isStringLiteralLike( n.argumentExpression )
+			) {
+				issues.push( `${file}: computed global capability access forbidden` );
+			}
+			if (
+				ts.isPropertyAccessExpression( n ) && ts.isIdentifier( n.expression ) &&
+				n.expression.text === "navigator" && n.name.text === "gpu" && file !== device
+			) {
+				issues.push( `${file}: navigator.gpu belongs to the device owner` );
+			}
+			// Reject captured aliases and destructuring as well as direct calls.
+			if (
+				(ts.isIdentifier( n ) || ts.isStringLiteralLike( n )) && Object.hasOwn( rules, n.text ) &&
+				!rules[n.text].includes( file )
+			) {
+				const parent = n.parent;
+				const capabilityReference =
+					ts.isIdentifier( n ) && !ts.isPropertySignature( parent ) && !ts.isMethodSignature( parent ) ||
+					ts.isStringLiteralLike( n ) && ts.isElementAccessExpression( parent ) &&
+						parent.argumentExpression === n;
+				if ( capabilityReference && !file.endsWith( "/internal/gpu-contract.ts" ) ) {
+					issues.push( `${file}: reference to ${n.text} escapes its owner` );
+				}
+			}
+			if (
+				ts.isIdentifier( n ) && [ "GPUDevice", "GPUQueue", "GPUAdapter" ].includes( n.text ) &&
+				!(n.text === "GPUDevice" ? deviceInternals.includes( file ) : file === device)
+			) {
+				issues.push( `${file}: raw ${n.text} outside device owner` );
+			}
+			if (
+				ts.isIdentifier( n ) && [ "GPUCanvasContext" ].includes( n.text ) &&
+				![ device, surface, runtime + "renderer/internal/gpu-contract.ts" ].includes( file )
+			) {
+				issues.push( `${file}: raw canvas context outside surface capability` );
+			}
+			if (
+				ts.isIdentifier( n ) && [ "GPUCommandEncoder", "GPURenderBundleEncoder" ].includes( n.text ) &&
+				!([
+					animation,
+					particles,
+					geometry,
+					shadows,
+					sunShadow,
+					waterReflection,
+					msaa,
+					finish,
+					device,
+					runtime + "renderer/surface/surface.ts"
+				].includes( file ) &&
+					n.text === "GPUCommandEncoder") &&
+				![ frame, runtime + "renderer/internal/gpu-contract.ts" ].includes( file )
+			) {
+				issues.push( `${file}: raw command encoder outside frame capability` );
+			}
+			if (
+				!nativeBarrier( file, n ) &&
+				!ASYNC_OWNERS.includes( file ) &&
+				(ts.isAwaitExpression( n ) ||
+					ts.isFunctionLike( n ) && n.modifiers?.some( m => m.kind === ts.SyntaxKind.AsyncKeyword ))
+			) {
+				issues.push( `${file}: asynchronous execution requires an explicit owner contract` );
+			}
+			if ( ts.isIdentifier( n ) && [ "eval", "Function" ].includes( n.text ) ) {
+				issues.push( `${file}: dynamic execution forbidden` );
+			}
+			if ( ts.isCallExpression( n ) || ts.isNewExpression( n ) ) {
+				const e = n.expression;
+				const name = ts.isIdentifier( e ) ?
+					e.text :
+					ts.isPropertyAccessExpression( e ) ?
+					e.name.text :
+					ts.isElementAccessExpression( e ) && ts.isStringLiteralLike( e.argumentExpression ) ?
+					e.argumentExpression.text :
+					null;
+				if ( name && Object.hasOwn( rules, name ) && !rules[name].includes( file ) ) {
+					issues.push( `${file}: ${name} belongs to a different owner` );
+				}
+			}
+		} );
+	}
+	return issues;
+}
+if ( process.argv[1] === import.meta.filename ) {
+	main( () => verifyCapabilities() );
+}

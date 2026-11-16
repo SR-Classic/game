@@ -1,0 +1,394 @@
+/*
+===========================================================================
+
+wiring_runtime.go - long-lived world services and authentication admission.
+
+===========================================================================
+*/
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+	agentapi "opensro.online/server/internal/agent/api"
+	"opensro.online/server/internal/data/store"
+	"opensro.online/server/internal/game/action"
+	"opensro.online/server/internal/game/world/monster"
+	"opensro.online/server/internal/game/world/movement"
+	"opensro.online/server/internal/game/world/simulation"
+	"opensro.online/server/internal/security/auth"
+	"opensro.online/server/internal/transport"
+	"opensro.online/server/internal/transport/worldsession"
+)
+
+/*
+================================================================================
+Long-lived runtime services
+
+The simulation ticker derives from the process context and is joined during
+shutdown. Enter-world authentication is installed before listeners start.
+================================================================================
+*/
+
+/*
+================
+newMissionTicker
+
+Compose action, transient-object, quest and party phases before admission.
+All world lifetimes share the coordinator's simulation clock.
+================
+*/
+func (game *gameplayPlane) newMissionTicker(peerReferences *action.PeerReferenceCatalog) *simulation.Ticker {
+	// The ticker and bootstrap must see the same NPC roster. Shipped static
+	// rows have Patrol=false; this also prevents the old three-fixture ticker
+	// from broadcasting movements for objects production never spawned.
+	var ticker *simulation.Ticker
+	// A slow action tick names its sub-step on /transport/metrics slow_hooks.
+	game.items.Steps.Slow = func(name string, elapsed time.Duration) {
+		game.hub.RecordSlowStep("action.TickHook/"+name, elapsed)
+	}
+	// Each action step is also a zone on the tick's timeline (#2301);
+	// the ticker is composed below, so the seam resolves it per step.
+	// Unarmed, Ticker.TraceZone answers the shared no-op.
+	game.items.Steps.Zone = func(name string) func() {
+		if ticker == nil {
+			return func() {}
+		}
+		return ticker.TraceZone(name)
+	}
+	// Every step's exact time also lands in the ticker's zone ledger
+	// (tick_zones, #2824), slow or not, so the budget read sees the
+	// whole action hook and not only what crossed 100 ms.
+	game.items.Steps.Total = func(name string, elapsed time.Duration) {
+		if ticker != nil {
+			ticker.Zones.AddStep(name, elapsed)
+		}
+	}
+	// A slow publication-gate hold names its holder there too
+	// (publication_holds), so a waiting step is not mistaken for the stall.
+	game.items.PublicationHold = game.hub.RecordPublicationHold
+	// Every hook carries the name slow-hook reports print (#2294): the
+	// closures below would otherwise report as newMissionTicker.funcN.
+	hooks := []simulation.NamedTickHook{
+		{Name: "movement-ground", Hook: game.movement.GroundTickHook()},
+		{Name: "action", Hook: game.items.TickHook()},
+		// Direction walks continue leg by leg on the mission clock.
+		{Name: "movement-direction", Hook: game.movement.DirectionTickHook()},
+		{Name: "skill-objects", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			return game.items.AdvanceSkillObjects(nowMs, sessionViews(ticker.Source))
+		}},
+		// Drops enter and leave each scene with its range (#617).
+		{Name: "ground-scope", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			game.items.AdvanceGroundScope(nowMs, sessionViews(ticker.Source), ticker.Source.(*worldsession.Bridge).SceneSession)
+			return nil
+		}},
+		// A marked player's moves reach its hunter out of sight (hntp).
+		{Name: "hunting-points", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			return game.items.AdvanceHuntingPoints(nowMs, sessionViews(ticker.Source))
+		}},
+		{Name: "quest-markers", Hook: game.questMarkerTick()},
+		// The Academy cumulated-buff windows count down on the minute
+		// pulse (#2270); the runtime gates itself to the native cadence.
+		{Name: "academy-buff-pulse", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			game.mentorInvites.BuffPulse(nowMs)
+			return nil
+		}},
+		{Name: "parties", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			game.parties.ExpireInvitations(nowMs)
+			return game.parties.MemberUpdates(sessionViews(ticker.Source), nowMs)
+		}},
+		// The fortress war's schedule edges run on the mission clock.
+		{Name: "siege", Hook: game.siege.Tick},
+		{Name: "guild-wars", Hook: game.guildWars.Tick},
+		// The job guilds' week closes on the mission clock (jobrank.go).
+		{Name: "job-week", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			game.items.JobWeekTick(game.divisionID, nowMs)
+			return nil
+		}},
+		// Port-only (#2675): the periodic time-online credit; the
+		// session-close credit in sessionClosed covers the tail.
+		{Name: "online-credit", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			game.creditOnlineSessions(sessionViews(ticker.Source), nowMs)
+			return nil
+		}},
+	}
+	// Native/off installs no hook and takes no extra session snapshots.
+	if game.betaSilk != nil {
+		hooks = append(hooks, simulation.NamedTickHook{Name: "beta-silk", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			return game.betaSilkTick(ticker, nowMs)
+		}})
+	}
+	// Port-only (#2958): the division's clients learn which transports
+	// carry a 5-star caravan, for the nameplate star; the runtime paces
+	// and gates the push itself.
+	if game.items.TradeTiers {
+		hooks = append(hooks, simulation.NamedTickHook{Name: "caravan-stars", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			frames := game.items.CaravanStarFrames(game.divisionID, sessionViews(ticker.Source), nowMs)
+			if len(frames) != 0 {
+				ticker.Push.PushToDivision(game.divisionID, frames, "")
+			}
+			return nil
+		}})
+	}
+	// Port-only (#3358): the shown Contributor roster; the registry
+	// paces the pass and sends only what changed or who is new.
+	if game.contributors != nil {
+		hooks = append(hooks, simulation.NamedTickHook{Name: "contributor-titles", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			return game.contributorRosterTick(ticker, nowMs)
+		}})
+	}
+	if game.caravanAgents != nil {
+		hooks = append(hooks, simulation.NamedTickHook{Name: "caravan-ai", Hook: func(nowMs int64) []simulation.DivisionFrames {
+			return game.caravanAgentsTick(ticker, nowMs)
+		}})
+	}
+	ticker = worldsession.NewTicker(game.hub, game.items.NpcRoster, hooks...)
+	// Port-only (killstats.go): online time accrues to the entered
+	// characters only - the session views at each accrual instant,
+	// never the division roster of everyone who exists (#2479).
+	if game.items.KillStats {
+		game.items.OnlineSessions = func() []simulation.SessionView {
+			return sessionViews(ticker.Source)
+		}
+	}
+	ticker.Source.(*worldsession.Bridge).PopulationLease = game.items.CharacterPopulationLease
+	// A quest instance's exit gate joins its world's NPC scope pass.
+	ticker.WorldNpcs = game.items.QuestGateNpcs
+	// A seasonal look (Santa So-Ok, port-only) changes which reference
+	// the static roster spawns under for its window.
+	if look, ok := game.deps.NpcSpawns.Looks.Look(); ok && look.RefObjID != 0 {
+		spawns := game.deps.NpcSpawns
+		ticker.RosterAt = func(nowMs int64) []simulation.NpcDef {
+			return spawns.RosterAt(time.UnixMilli(nowMs))
+		}
+	}
+	ticker.BeforeHooks = []simulation.NamedTickHook{{Name: "monster-actions", Hook: game.items.MonsterActionTickHook()}}
+	// A peer's spawn row is preceded by the item references it names (#340).
+	ticker.ItemReferences = peerReferences.Frames
+	// A deadlocked tick dumps its stacks and exits for the supervisor to
+	// restart (tick_watchdog.go); the dumps sit beside the authority store.
+	ticker.StallExit = simulation.TickStallExitFromEnv()
+	ticker.StallDumpDir = os.Getenv(simulation.EnvTickStallDumpDir)
+	if ticker.StallDumpDir == "" {
+		ticker.StallDumpDir = filepath.Join(".state", "stall-dumps")
+		if dir := store.DirFromEnv(); dir != "" {
+			ticker.StallDumpDir = filepath.Join(dir, "stall-dumps")
+		}
+	}
+	log.Infof("simulation: a tick stuck %v dumps to %s and exits for restart (%s, 0 = never)", ticker.StallExit, ticker.StallDumpDir, simulation.EnvTickStallExit)
+	ticker.PlayerMap = simulation.BetaPlayerMapEnabled()
+	if ticker.PlayerMap {
+		log.Infof("simulation: beta world map roster ON (%s)", simulation.EnvBetaPlayerMap)
+	}
+	if game.deps.MonsterState != nil {
+		navigation := &simulation.NavigationMetrics{}
+		game.hub.SetNavigationMetrics(navigation.Snapshot)
+		// The leg census publishes its own block beside navigation's (#3119).
+		game.hub.SetMonsterLegMetrics(navigation.LegSnapshot)
+		// The mover's routes come from the plane that owns the
+		// region: the open-terrain search outdoors, the cave's
+		// region route inside a dungeon floor (#1645/#1646).
+		planes := movement.NewPlanes(game.movement, game.water)
+		ticker.Monsters = &simulation.MonsterMoverOps{
+			Navigation: navigation,
+			Monsters:   game.deps.MonsterState,
+			// TacticsFor stays unset: the step then resolves through
+			// monster.ResolveTactics, the resolver the scheduler's idle
+			// due mirrors (idleBehaviorDue). A replacement here would
+			// put every idle monster back on the conservative wake.
+			// #1695: live heights come from the plane that owns the
+			// region (the deck/cave-floor surface nearest the caller),
+			// not the bare terrain sampler.
+			GroundHeight: func(pose monster.Pose) (float64, bool) {
+				return planes.For(pose.RegionID).HeightAt(simulation.Spawn{
+					RegionID: pose.RegionID, X: pose.X, Y: pose.Y, Z: pose.Z,
+				})
+			},
+			PlanPath:     game.water.PlanMonsterPath,
+			PlanPathFrom: game.water.PlanMonsterPathFrom,
+			PlanRoute: func(from monster.Pose, fromOwner simulation.NavOwner, goal monster.Pose) *monster.NavigationRoute {
+				plane, ok := planes.Between(from.RegionID, goal.RegionID)
+				if !ok {
+					// No plane owns a route across the outdoor/cave
+					// boundary: the mover waits and replans, as it
+					// does for any unresolved route.
+					return monster.UnresolvedNavigationRoute(goal, monster.NavigationRouteBlocked)
+				}
+				return plane.NextWaypoint(from, fromOwner, goal)
+			},
+			// The failed-route memo may answer a retry only where the
+			// plane's routes are pure (#1820 part B).
+			RouteMemo: func(from, goal monster.Pose) bool {
+				plane, ok := planes.Between(from.RegionID, goal.RegionID)
+				return ok && plane.PureRoutes()
+			},
+			// Slow-leg attribution diffs this per leg; a nonzero delta
+			// is a first-use load the boot preload missed (#1820 C).
+			NavCacheMisses: game.water.NavCacheMisses,
+			MessageBlockAt: game.water.MessageBlockAt,
+			Rand:           rand.Float64,
+			AttackPlan:     game.items.MonsterAttackPlan,
+			RunAction:      game.items.RunMonsterAction,
+			// The Bard's Noise: the acquisition scan reads each player's
+			// first-attack protection from the effect owner.
+			FirstAttackGuard: game.items.FirstAttackGuard,
+			// The server's target picker: a candidate player's companions are weighed with it.
+			Companions: game.items.CompanionTargets,
+		}
+		// Port-only, not native: the monster leg's worker pool
+		// (#2205). Unset keeps the serial leg; the pool only changes
+		// which goroutine plans, never what commits.
+		ticker.Monsters.LegWorkers = simulation.MonsterLegWorkersFromEnv()
+		if ticker.Monsters.LegWorkers >= 1 {
+			log.Infof(
+				"simulation: monster leg worker pool ON, up to %d workers (%s)",
+				ticker.Monsters.LegWorkers, simulation.EnvMonsterLegWorkers,
+			)
+		}
+		log.Infof(
+			"simulation: monster mover wired with %d template nest row(s)",
+			game.deps.MonsterState.TemplateSize(),
+		)
+	}
+
+	return ticker
+}
+
+/*
+================
+sessionViews
+
+The hooks' light session views: the bridge builds them without the peer
+presentation (worldsession.Bridge.SnapshotSessionViews); any other source
+is viewed through its full snapshots.
+================
+*/
+func sessionViews(source simulation.SessionSource) []simulation.SessionView {
+	if viewer, ok := source.(interface {
+		SnapshotSessionViews() []simulation.SessionView
+	}); ok {
+		return viewer.SnapshotSessionViews()
+	}
+	snaps := source.SnapshotSessions()
+	views := make([]simulation.SessionView, len(snaps))
+	for i := range snaps {
+		views[i] = snaps[i].View()
+	}
+	return views
+}
+
+/*
+================
+installEnterWorldVerifier
+================
+*/
+func installEnterWorldVerifier(
+	hub *transport.Hub,
+	ownedShardID string,
+	secret []byte,
+	api *agentapi.API,
+) error {
+	if ownedShardID == "" {
+		return fmt.Errorf("EnterWorld authentication: worker shard id is required")
+	}
+	if err := auth.ValidateSecret(secret); err != nil {
+		return fmt.Errorf("EnterWorld authentication: %w", err)
+	}
+	verifier := auth.Verifier(secret, time.Now)
+	if api != nil {
+		verifier = api.WrapEnterWorldVerifier(verifier)
+	}
+	hub.SetEnterWorldAuth(enterWorldVerifierForShard(ownedShardID, verifier))
+	log.Info("transport: EnterWorld verifier uses a process-local one-use key")
+	return nil
+}
+
+/*
+================
+installTransportAdmissionVerifier
+================
+*/
+func installTransportAdmissionVerifier(
+	hub *transport.Hub,
+	ownedShardID string,
+	secret []byte,
+	api *agentapi.API,
+) error {
+	if ownedShardID == "" {
+		return fmt.Errorf("transport admission: worker shard id is required")
+	}
+	if err := auth.ValidateSecret(secret); err != nil {
+		return fmt.Errorf("transport admission: %w", err)
+	}
+	ledger := auth.NewTransportAdmissionLedger(secret, time.Now)
+	verify := ledger.Verify
+	if api != nil {
+		verify = api.WrapTransportAdmissionVerifier(verify)
+	}
+	hub.SetHelloCommitAuth(func(token []byte) (transport.AdmissionIdentity, func() error, error) {
+		claims, err := verify(string(token))
+		if err != nil {
+			return transport.AdmissionIdentity{}, nil, err
+		}
+		if claims.ShardID != ownedShardID {
+			return transport.AdmissionIdentity{}, nil, fmt.Errorf(
+				"transport admission shard %q does not match worker %q",
+				claims.ShardID,
+				ownedShardID,
+			)
+		}
+		commit := func() error {
+			// A revocation landing between HELLO and WELCOME still
+			// refuses: the check rides the commit, not only the verify.
+			if api != nil && api.TicketRevoked(string(token)) {
+				return auth.ErrTransportAdmissionExpired
+			}
+			return ledger.Consume(string(token))
+		}
+		return transport.AdmissionIdentity{
+			AccountID: claims.AccountID,
+			ShardID:   claims.ShardID,
+		}, commit, nil
+	})
+	log.Info("transport: authenticated HELLO verifier uses a process-local one-use key, consumed at WELCOME")
+	return nil
+}
+
+/*
+================
+enterWorldVerifierForShard
+================
+*/
+func enterWorldVerifierForShard(
+	ownedShardID string,
+	verifier auth.VerifyFunc,
+) transport.EnterWorldAuthFunc {
+	return func(session *transport.Session, enter transport.EnterWorld) (bool, uint32) {
+		if session != nil && session.Evicted() {
+			return false, auth.DenyCodeUnauthorized
+		}
+		if enter.Division != ownedShardID {
+			log.WithFields(log.Fields{
+				"workerShard": ownedShardID,
+				"division":    enter.Division,
+				"character":   enter.CharName,
+			}).Warn("auth: EnterWorld refused for foreign shard")
+			return false, auth.DenyCodeUnauthorized
+		}
+		err := verifier(string(enter.AuthToken), enter.Division, enter.CharName)
+		if err == nil {
+			return true, 0
+		}
+		log.WithFields(log.Fields{
+			"division":  enter.Division,
+			"character": enter.CharName,
+			"reason":    err,
+		}).Warn("auth: EnterWorld token refused")
+		return false, auth.DenyCodeUnauthorized
+	}
+}

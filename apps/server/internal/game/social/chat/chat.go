@@ -1,0 +1,583 @@
+/*
+===========================================================================
+
+chat.go - chat routing, native message composition and beta scope.
+
+===========================================================================
+*/
+package chat
+
+import (
+	"fmt"
+	"strings"
+
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/social/party"
+)
+
+// ClosedBetaGlobalChat sends ordinary chat across the shard during beta.
+// Set false to restore visibility-scoped retail All/GM chat.
+const ClosedBetaGlobalChat = true
+
+// ChatTypeGlobal is the native named broadcast channel (client 0x753848).
+const ChatTypeGlobal uint8 = 6
+
+// PresenceView is the live-peer predicate the whisper arm consults.
+type PresenceView interface {
+	OnlineByName(divisionID, name string) bool
+}
+
+// PartyView is the party-membership lookup the party arm consults -
+// *party.Registry satisfies it.
+type PartyView interface {
+	PartyOf(divisionID, name string) (party.Snapshot, bool)
+}
+
+// UnionView answers who a union line reaches - the guild lane's
+// *guild.UnionRuntime satisfies it. code is the refusal (0x0C no union,
+// 0x0E no union chat right).
+type UnionView interface {
+	UnionChatAudience(divisionID string, sender *enterworld.Character) (names []string, code uint8)
+}
+
+// StallView answers who a stall line reaches - *stall.Registry satisfies
+// it.
+type StallView interface {
+	Participants(divisionID, name string) ([]string, bool)
+}
+
+/*
+================
+Views
+
+The other lanes a chat line consults. A nil view answers as if the lane
+held nothing.
+================
+*/
+type Views struct {
+	Presence PresenceView
+	Parties  PartyView
+	Unions   UnionView
+	Stalls   StallView
+	// Links is the item-link switch (itemlinks.go); nil is native.
+	Links *ItemLinks
+}
+
+// Delivery is one presence-targeted 0x3667 send. The register glue resolves
+// TargetName through the shared live-session directory and drops it silently
+// when the target went offline in between.
+/*
+================
+Delivery
+================
+*/
+type Delivery struct {
+	TargetName string
+	Payload    []byte
+}
+
+// Outcome is one handled 0x7367 request. Ack is the 0xB367 body for the
+// sending session (nil = SILENT, the lane's decode-refusal posture -
+// only a non-retail client can compose a frame this lane refuses to
+// answer). Broadcast, when non-nil, is the 0x3667 body for the sender's
+// division cohort EXCLUDING the sender; Deliveries are targeted member/
+// whisper sends. Refusal carries the log-only reason.
+/*
+================
+Outcome
+================
+*/
+type Outcome struct {
+	Ack        []byte
+	Refusal    string
+	Broadcast  []byte
+	Deliveries []Delivery
+	// PlainText is the line as text consumers store it (the moderation
+	// log, the website feed): item-link markers replaced by labels.
+	PlainText string
+	// Prelude is sent to every recipient of Broadcast and Deliveries just
+	// before the line: the linked items' reference frames (itemlinks.go).
+	Prelude []wire.Frame
+}
+
+/*
+================
+refusedChat
+================
+*/
+func refusedChat(reason string) Outcome {
+	return Outcome{Refusal: reason}
+}
+
+/*
+================
+senderDisplayName
+
+The name a composed chat line carries for its author: the job alias
+while the author is dressed in a job suit, the character name otherwise
+(natively the player's nickname - the same identity the party roster
+writes via enterworld.PartyMemberName). Presence, party, stall and
+guild routing keep keying on the character name; only the payload's
+author field changes.
+================
+*/
+func senderDisplayName(sender *enterworld.Character) string {
+	return enterworld.PartyMemberName(sender)
+}
+
+// HandleChat routes one decoded 0x7367 request. Transport-free: the
+// register glue owns every Send/Broadcast.
+//
+// Beta scope is selected once below. The transport uses observed-object
+// delivery when disabled, so local GID-authored chat cannot escape visibility.
+//
+// NOT built, on purpose:
+//   - the cross-shard whisper forward (the dump's offline arm): no
+//     second shard exists; offline acks ChatErrCantFindTarget.
+//   - a GM bypass of the whisper block: the dump has none and the
+//     v1.150 client shows none.
+//   - a chat rate gate (the dump's vt+0x638): the transport already
+//     rate-limits inbound frames per session (hub ratelimit) and the
+//     retail client gates its own 0x7367 sends (CanSendOpcode,
+//     NetClient_CanSendOpcode direct-imported in the
+//     CIFChatViewer_HandleChatInputKey fold), so a third
+//     cap is speculative; ChatErr 0x0D is never composed.
+//   - an abuse/ban-word filter: retail's is config-loaded; no config
+//     exists here.
+/*
+================
+HandleChat
+================
+*/
+func HandleChat(deps Dependencies, views Views, divisionID string, sender *enterworld.Character, payload []byte) Outcome {
+	if sender == nil {
+		return refusedChat("characterNotFound")
+	}
+	// The store knows the live character only (item-link warehouse reads).
+	live := sender
+	sender = characterSnapshot(deps, divisionID, sender)
+	if sender == nil {
+		return refusedChat("characterNotFound")
+	}
+	if sender.DeletePending {
+		return refusedChat("deletePending")
+	}
+	decode := DecodeChatRequest
+	if views.Links != nil {
+		decode = DecodeChatRequestWithLinks
+	}
+	request, err := decode(payload)
+	if err != nil {
+		return refusedChat(err.Error())
+	}
+	var items []LinkedItem
+	if views.Links != nil {
+		// Port-only, not native: the stall window's box links nothing in
+		// v1, so its refs drop and its markers go with them.
+		refs := request.Links
+		if request.ChatType == ChatTypeStall {
+			refs = nil
+		}
+		storage := views.Links.Source.StorageLinks(divisionID, live, refs)
+		request.Message, items = ResolveLinks(views.Links, divisionID, sender, storage, request.Message, refs)
+	}
+	outcome := routeChat(deps, views, divisionID, sender, request)
+	if outcome.Broadcast != nil {
+		outcome.Broadcast = AppendLinkTail(outcome.Broadcast, items)
+	}
+	for i := range outcome.Deliveries {
+		outcome.Deliveries[i].Payload = AppendLinkTail(outcome.Deliveries[i].Payload, items)
+	}
+	outcome.PlainText = LabelText(request.Message, items)
+	outcome.Prelude = linkPrelude(items)
+	return outcome
+}
+
+/*
+================
+routeChat
+
+One decoded request to its channel's arm.
+================
+*/
+func routeChat(deps Dependencies, views Views, divisionID string, sender *enterworld.Character, request Request) Outcome {
+	switch request.ChatType {
+	case ChatTypeAll, ChatTypeGM:
+		return handleAllChat(request, sender, ClosedBetaGlobalChat)
+	case ChatTypeWhisper:
+		return handleWhisper(deps, views.Presence, divisionID, sender, request)
+	case ChatTypeParty:
+		return handlePartyChat(views.Parties, divisionID, sender, request)
+	case ChatTypeGuild:
+		return handleGuildChat(deps, divisionID, sender, request)
+	case ChatTypeUnion:
+		return handleUnionChat(deps, views.Unions, divisionID, sender, request)
+	case ChatTypeStall:
+		return handleStallChat(views.Stalls, divisionID, sender, request)
+	default:
+		// Only 1/2/3/4/5/0x0B are composable by the retail prefix
+		// switch and 9 by the stall window's chat box; anything else (a
+		// crafted notice 7, academy 0x10, ...) acks
+		// UIIT_CHATERR_INVALID_COMMAND - never
+		// broadcast, so a forged type-7 frame cannot drive the notice
+		// banner.
+		return Outcome{
+			Refusal: fmt.Sprintf("chat type 0x%02X not client-composable", request.ChatType),
+			Ack:     EncodeChatAckError(ChatErrInvalidCommand, request.ChatType, request.Second),
+		}
+	}
+}
+
+// handleAllChat is the shared All/GM arm (the v1.188 chat handler's shape:
+// requested types 1 and 3 land in one arm). The BROADCAST type byte is
+// server-forced: 3 for a privileged speaker (vt+0x53c()==1 in the dump;
+// our GMPrivilege flag - the same bit the client reads into
+// CICPlayer+0x1890), 1 for everyone else - a non-GM requesting type 3
+// broadcasts as plain All. The ACK echoes the REQUESTED type untouched
+// (the client's pending-record pop keys on it).
+/*
+================
+handleAllChat
+================
+*/
+func handleAllChat(request Request, sender *enterworld.Character, global bool) Outcome {
+	if global {
+		return Outcome{Ack: EncodeChatAckSuccess(request.ChatType, request.Second), Broadcast: EncodeChatBroadcastNamed(ChatTypeGlobal, senderDisplayName(sender), request.Message)}
+	}
+
+	broadcastType := ChatTypeAll
+	if sender.GMPrivilege {
+		broadcastType = ChatTypeGM
+	}
+	return Outcome{
+		Ack:       EncodeChatAckSuccess(request.ChatType, request.Second),
+		Broadcast: EncodeChatBroadcastGid(broadcastType, enterworld.ObjectIDForCharacter(sender), request.Message),
+	}
+}
+
+// handleWhisper is the whisper arm: resolve the target name to an online
+// division character, consult the TARGET's blocked-whisperer list, and
+// deliver the 0x3667 type-2 line - or don't.
+//
+// THE PRIVACY RULE (v1.188 chat handler, deliberate): a blocked whisper
+// acks SUCCESS to the sender and delivers NOTHING - the sender cannot
+// distinguish blocked from delivered. There is no GM bypass.
+//
+// The block match folds case (strings.EqualFold), CONSISTENT WITH OUR
+// REGISTER PATH (whisperblock.go): names are CI-unique (CreateCharacter
+// refuses case-insensitive duplicates) and every name path here folds
+// (presence keys, party keys, the friend/letter lookups), so a list
+// carrying "Berk" blocks a whisper from "berk" - the same documented
+// deviation from native's case-sensitive CompareStringA the register
+// path already made; a sensitive compare here would let the identical
+// character through on a casing technicality.
+//
+// Port-only, not native (SRO_WHISPER_JOB_ALIAS, default on - owner,
+// 2026-10-28; "off" restores the native name-only behaviour; see
+// whisperalias.go): with the switch on, a typed target that matches no
+// character name also tries the dressed-alias resolution, the self arm
+// covers the sender's own dressed alias, and the block match accepts
+// the sender's dressed alias beside the character name. Nothing the
+// sender receives ever names the resolved character: the ack bodies
+// carry no name (the client renders the typed string) and the refusal
+// log below prints only what the sender typed.
+/*
+================
+handleWhisper
+================
+*/
+func handleWhisper(deps Dependencies, presence PresenceView, divisionID string, sender *enterworld.Character, request Request) Outcome {
+	if request.TargetName == "" {
+		return Outcome{
+			Refusal: "whisper target empty",
+			Ack:     EncodeChatAckError(ChatErrCantFindTarget, request.ChatType, request.Second),
+		}
+	}
+	if strings.EqualFold(request.TargetName, sender.Name) || selfByDressedAlias(sender, request.TargetName) {
+		// Self-whisper: success with NO delivery (the dump's self arm).
+		// The ack presents the "To [name]" line locally; a delivered
+		// copy would be dropped by the client's own-name compare anyway.
+		return Outcome{Ack: EncodeChatAckSuccess(request.ChatType, request.Second)}
+	}
+	target := findCharacterByName(deps, divisionID, request.TargetName)
+	if target == nil && WhisperJobAliasEnabled() {
+		// Port-only: the typed string is nobody's name; it may still be
+		// the job alias of a player wearing the suit right now. A typed
+		// string that IS a character name never reaches this arm, so a
+		// name can never be shadowed by an alias.
+		target = findCharacterByDressedAlias(deps, divisionID, request.TargetName)
+	}
+	target = characterSnapshot(deps, divisionID, target)
+	if target == nil || target.DeletePending ||
+		presence == nil || !presence.OnlineByName(divisionID, target.Name) {
+		// Nonexistent AND offline share ChatErrCantFindTarget: the
+		// dump's offline arm is the cross-shard forward we have no
+		// equivalent for, and its terminal failure is the same code 3
+		// ("Cannot find [%s].").
+		return Outcome{
+			Refusal: fmt.Sprintf("whisper target %q not online in division %s", request.TargetName, divisionID),
+			Ack:     EncodeChatAckError(ChatErrCantFindTarget, request.ChatType, request.Second),
+		}
+	}
+	dressedAlias := senderDressedAlias(sender)
+	for _, blockedName := range target.BlockedWhisperers {
+		if strings.EqualFold(blockedName, sender.Name) ||
+			(dressedAlias != "" && strings.EqualFold(blockedName, dressedAlias)) {
+			return Outcome{
+				Refusal: fmt.Sprintf("whisper from %s to %s suppressed by the target's block list", sender.Name, target.Name),
+				Ack:     EncodeChatAckSuccess(request.ChatType, request.Second),
+			}
+		}
+	}
+	return Outcome{
+		Ack: EncodeChatAckSuccess(request.ChatType, request.Second),
+		Deliveries: []Delivery{{
+			TargetName: target.Name,
+			Payload:    EncodeChatBroadcastNamed(ChatTypeWhisper, senderDisplayName(sender), request.Message),
+		}},
+	}
+}
+
+// handlePartyChat fans the type-4 line to the sender's party members
+// (presence-targeted; the sender's own line came back on the ack). No
+// party acks ChatErrNotPartyMember (the dump's 0x200A low byte).
+/*
+================
+handlePartyChat
+================
+*/
+func handlePartyChat(parties PartyView, divisionID string, sender *enterworld.Character, request Request) Outcome {
+	var snapshot party.Snapshot
+	inParty := false
+	if parties != nil {
+		snapshot, inParty = parties.PartyOf(divisionID, sender.Name)
+	}
+	if !inParty {
+		return Outcome{
+			Refusal: fmt.Sprintf("%s is not in a party", sender.Name),
+			Ack:     EncodeChatAckError(ChatErrNotPartyMember, request.ChatType, request.Second),
+		}
+	}
+	payload := EncodeChatBroadcastNamed(ChatTypeParty, senderDisplayName(sender), request.Message)
+	outcome := Outcome{Ack: EncodeChatAckSuccess(request.ChatType, request.Second)}
+	for _, member := range snapshot.Members {
+		if strings.EqualFold(member.Name, sender.Name) {
+			continue
+		}
+		outcome.Deliveries = append(outcome.Deliveries, Delivery{TargetName: member.Name, Payload: payload})
+	}
+	return outcome
+}
+
+/*
+================
+handleStallChat
+
+Stall chat (type 9) reaches everyone at the sender's stall
+(the native stall chat broadcast: [9][name][message]); a player at no
+stall acks ChatErrNoStall. Native sends the author its own line too and
+the client drops it by name (753760); the author is left out here, as in
+the party arm.
+================
+*/
+func handleStallChat(stalls StallView, divisionID string, sender *enterworld.Character, request Request) Outcome {
+	var names []string
+	atStall := false
+	if stalls != nil {
+		names, atStall = stalls.Participants(divisionID, sender.Name)
+	}
+	if !atStall {
+		return Outcome{
+			Refusal: fmt.Sprintf("%s is at no stall", sender.Name),
+			Ack:     EncodeChatAckError(ChatErrNoStall, request.ChatType, request.Second),
+		}
+	}
+	payload := EncodeChatBroadcastNamed(ChatTypeStall, senderDisplayName(sender), request.Message)
+	outcome := Outcome{Ack: EncodeChatAckSuccess(request.ChatType, request.Second)}
+	for _, name := range names {
+		if strings.EqualFold(name, sender.Name) {
+			continue
+		}
+		outcome.Deliveries = append(outcome.Deliveries, Delivery{TargetName: name, Payload: payload})
+	}
+	return outcome
+}
+
+/*
+================
+handleGuildChat
+
+Guild chat (type 5) fans to the stored guild's members; no guild acks
+ChatErrNoGuild (0x0B).
+================
+*/
+func handleGuildChat(deps Dependencies, divisionID string, sender *enterworld.Character, request Request) Outcome {
+	guildID := int64(0)
+	inGuild := false
+	guilds := deps.GuildAuthority()
+	if guilds != nil {
+		guildID, inGuild = guilds.GuildOfCharacter(divisionID, sender.ID)
+	}
+	if !inGuild {
+		return Outcome{
+			Refusal: fmt.Sprintf("%s is not in a guild", sender.Name),
+			Ack:     EncodeChatAckError(ChatErrNoGuild, request.ChatType, request.Second),
+		}
+	}
+	_, members, ok := guilds.Guild(divisionID, guildID)
+	if !ok {
+		return Outcome{
+			Refusal: fmt.Sprintf("guild %d of %s vanished between lookup and read", guildID, sender.Name),
+			Ack:     EncodeChatAckError(ChatErrNoGuild, request.ChatType, request.Second),
+		}
+	}
+	payload := EncodeChatBroadcastNamed(ChatTypeGuild, senderDisplayName(sender), request.Message)
+	outcome := Outcome{Ack: EncodeChatAckSuccess(request.ChatType, request.Second)}
+	for _, member := range members {
+		if member.CharID == sender.ID {
+			continue
+		}
+		outcome.Deliveries = append(outcome.Deliveries, Delivery{TargetName: member.Name, Payload: payload})
+	}
+	return outcome
+}
+
+/*
+================
+handleUnionChat
+
+Union chat (type 0x0B, the native chat request's case 0xA): a
+guildless sender acks ChatErrNoGuild (0x0B), a guild outside a union
+ChatErrNoUnion (0x0C), a member without the union chat right 0x0E
+(UIIT_MSG_GUILD_UNION_CHAT_LIMIT); otherwise the line reaches the
+union's audience.
+================
+*/
+func handleUnionChat(deps Dependencies, unions UnionView, divisionID string, sender *enterworld.Character, request Request) Outcome {
+	if guilds := deps.GuildAuthority(); guilds == nil {
+		return Outcome{Refusal: "no guild store", Ack: EncodeChatAckError(ChatErrNoGuild, request.ChatType, request.Second)}
+	} else if _, inGuild := guilds.GuildOfCharacter(divisionID, sender.ID); !inGuild {
+		return Outcome{
+			Refusal: fmt.Sprintf("%s is not in a guild", sender.Name),
+			Ack:     EncodeChatAckError(ChatErrNoGuild, request.ChatType, request.Second),
+		}
+	}
+	names, code := []string(nil), ChatErrNoUnion
+	if unions != nil {
+		names, code = unions.UnionChatAudience(divisionID, sender)
+	}
+	if code != 0 {
+		return Outcome{
+			Refusal: fmt.Sprintf("%s may not speak in union chat (%#x)", sender.Name, code),
+			Ack:     EncodeChatAckError(code, request.ChatType, request.Second),
+		}
+	}
+	payload := EncodeChatBroadcastNamed(ChatTypeUnion, senderDisplayName(sender), request.Message)
+	outcome := Outcome{Ack: EncodeChatAckSuccess(request.ChatType, request.Second)}
+	for _, name := range names {
+		outcome.Deliveries = append(outcome.Deliveries, Delivery{TargetName: name, Payload: payload})
+	}
+	return outcome
+}
+
+// findCharacterByName resolves a division character record by name,
+// case-insensitively - the community lane's lookup, mirrored (theirs is
+// unexported): CreateCharacter refuses case-insensitive duplicates, so
+// the fold is unambiguous.
+/*
+================
+findCharacterByName
+================
+*/
+func findCharacterByName(deps Dependencies, divisionID, name string) *enterworld.Character {
+	for _, candidate := range deps.CharactersForDivision(divisionID) {
+		if candidate != nil && strings.EqualFold(candidate.Name, name) {
+			return candidate
+		}
+	}
+	return nil
+}
+
+/*
+================
+senderDressedAlias
+
+The alias the sender currently speaks under: their job alias while the
+suit is on, "" otherwise - and always "" while the port-only alias rules
+are off, so every caller stays native by construction.
+================
+*/
+func senderDressedAlias(sender *enterworld.Character) string {
+	if !WhisperJobAliasEnabled() || sender == nil || sender.Job.Alias == "" {
+		return ""
+	}
+	if enterworld.DressedJob(sender) == 0 {
+		return ""
+	}
+	return sender.Job.Alias
+}
+
+/*
+================
+selfByDressedAlias
+
+Port-only (SRO_WHISPER_JOB_ALIAS): the typed target is the sender's own
+dressed alias - the self-whisper arm, answered with the success ack and
+no delivery exactly as if the sender had typed their character name.
+With the switch off this is never true (senderDressedAlias is "").
+================
+*/
+func selfByDressedAlias(sender *enterworld.Character, typed string) bool {
+	alias := senderDressedAlias(sender)
+	return alias != "" && strings.EqualFold(typed, alias)
+}
+
+/*
+================
+findCharacterByDressedAlias
+
+Port-only (SRO_WHISPER_JOB_ALIAS): resolve a typed whisper target that
+matched no character name to the division character whose job alias it
+is AND who is wearing the suit right now. The dress verdict reads a
+snapshot, never the live record. An alias whose owner is undressed (or
+has none) resolves to nobody: the sender cannot tell "suit off" from
+"logged off" from "never existed", and all three answer
+ChatErrCantFindTarget.
+================
+*/
+func findCharacterByDressedAlias(deps Dependencies, divisionID, name string) *enterworld.Character {
+	for _, candidate := range deps.CharactersForDivision(divisionID) {
+		if candidate == nil || candidate.Job.Alias == "" || !strings.EqualFold(candidate.Job.Alias, name) {
+			continue
+		}
+		if snapshot := characterSnapshot(deps, divisionID, candidate); snapshot != nil &&
+			enterworld.DressedJob(snapshot) != 0 {
+			return candidate
+		}
+	}
+	return nil
+}
+
+// characterSnapshot copies mutable character state while the authority read
+// door is held. Chat decisions must never inspect the live record after the
+// door closes.
+/*
+================
+characterSnapshot
+================
+*/
+func characterSnapshot(
+	deps Dependencies,
+	divisionID string,
+	character *enterworld.Character,
+) *enterworld.Character {
+	if deps == nil || character == nil {
+		return nil
+	}
+	var snapshot *enterworld.Character
+	deps.Read(divisionID, func() {
+		snapshot = character.Snapshot()
+	})
+	return snapshot
+}

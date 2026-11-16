@@ -1,0 +1,826 @@
+/*
+===========================================================================
+
+qinshi_tomb_test.go - verification of Qin-Shi Emperor Tomb teleport links and walk-in zones
+
+Tests both SRO_QINSHI_TOMB off (native default) and on: 13 Floor 5-6
+teleport destinations, 77 teleport links (including Floor 4 snake gate 125
+and Floor 6 exit buildings 131..134), and 72 walk-in TELEPORT event zones
+(normalized to uppercase to match WaterValidator.WalkInZoneAt). The
+flag-off catalog is proven byte-identical to the shipped one, the tomb's
+link graph is proven closed, and the Jangan door is walked at levels 69
+and 70 (GH #1013).
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"bytes"
+	"fmt"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/world/monster"
+	"opensro.online/server/internal/game/world/simulation"
+	"opensro.online/server/internal/testsupport/clientdata"
+	"opensro.online/server/internal/testsupport/gamedatatest"
+)
+
+/*
+================
+TestQinShiTombEmbeddedTeleportLinks
+================
+*/
+func TestQinShiTombEmbeddedTeleportLinks(t *testing.T) {
+	dataRows := monster.SplitTabbedText(qinshiTombTeleportDataTSV)
+	if got, want := len(dataRows), 13; got != want {
+		t.Fatalf("embedded tomb teleportdata rows = %d, want %d", got, want)
+	}
+	for i, row := range dataRows {
+		if len(row) != 13 {
+			t.Fatalf("teleportdata row %d column count = %d, want 13", i+1, len(row))
+		}
+	}
+
+	rows := monster.SplitTabbedText(qinshiTombTeleportLinkTSV)
+	if got, want := len(rows), 77; got != want {
+		t.Fatalf("embedded tomb teleportlink rows = %d, want %d", got, want)
+	}
+	for i, row := range rows {
+		if len(row) != 21 {
+			t.Fatalf("row %d column count = %d, want 21", i+1, len(row))
+		}
+	}
+}
+
+/*
+================
+TestQinShiTombPortalsAndWalkIns
+================
+*/
+func TestQinShiTombPortalsAndWalkIns(t *testing.T) {
+	clientdata.RequireGameData(t)
+	dir := clientdata.RetailTextdataDir(t)
+
+	t.Setenv(monster.EnvQinShiTomb, "off")
+	baseCatalog, err := loadPortalCatalog(dir)
+	if err != nil {
+		t.Fatalf("loadPortalCatalog(off): %v", err)
+	}
+	if _, exists := baseCatalog.walkIns["GATE_JINSI_IN"]; exists {
+		t.Fatal("GATE_JINSI_IN must not be active when SRO_QINSHI_TOMB is off")
+	}
+
+	t.Setenv(monster.EnvQinShiTomb, "on")
+	tombCatalog, err := loadPortalCatalog(dir)
+	if err != nil {
+		t.Fatalf("loadPortalCatalog(on): %v", err)
+	}
+	if got, want := len(tombCatalog.destinations)-len(baseCatalog.destinations), 13; got != want {
+		t.Fatalf("added tomb teleport destinations = %d, want %d", got, want)
+	}
+	if got, want := len(tombCatalog.links)-len(baseCatalog.links), 77; got != want {
+		t.Fatalf("added tomb teleport links = %d, want %d", got, want)
+	}
+	if got, want := len(tombCatalog.walkIns)-len(baseCatalog.walkIns), 72; got != want {
+		t.Fatalf("added tomb walk-in zones = %d, want %d", got, want)
+	}
+
+	// Verify outer entrance walk-in GATE_JINSI_OUT (49 -> 50, requires level 70..999),
+	// inner exit walk-in GATE_JINSI_IN (50 -> 49), and uppercase normalization of
+	// mixed-case zones (GATE_JINSI_01X01_12, GATE_JINSI_05X01-1..3, GATE_JINSI_06X01_06..06X05_03).
+	outLink, ok := tombCatalog.walkIns["GATE_JINSI_OUT"]
+	if !ok || outLink.source != 49 || outLink.target != 50 {
+		t.Fatalf("GATE_JINSI_OUT link = %+v, ok=%v; want 49->50", outLink, ok)
+	}
+	inLink, ok := tombCatalog.walkIns["GATE_JINSI_IN"]
+	if !ok || inLink.source != 50 || inLink.target != 49 {
+		t.Fatalf("GATE_JINSI_IN link = %+v, ok=%v; want 50->49", inLink, ok)
+	}
+	for zone, want := range map[string][2]uint32{
+		"GATE_JINSI_01X01_12": {51, 53},
+		"GATE_JINSI_05X01-1":  {136, 139},
+		"GATE_JINSI_05X01-2":  {137, 140},
+		"GATE_JINSI_05X01-3":  {138, 141},
+		"GATE_JINSI_06X01_06": {144, 143},
+		"GATE_JINSI_06X02_06": {145, 142},
+		"GATE_JINSI_06X03_09": {146, 142},
+		"GATE_JINSI_06X04_12": {147, 142},
+		"GATE_JINSI_06X05_03": {148, 142},
+	} {
+		link, ok := tombCatalog.walkIns[zone]
+		if !ok || link.source != want[0] || link.target != want[1] {
+			t.Fatalf("walk-in %s = %+v, ok=%v; want %d->%d", zone, link, ok, want[0], want[1])
+		}
+	}
+
+	// Verify Floor 4 snake gate (125 -> 130) and Floor 6 exit building links (131..134 -> {53, 129, 120, 50}).
+	for _, pair := range [][2]uint32{{125, 130}, {131, 53}, {132, 129}, {133, 120}, {134, 50}} {
+		if _, ok := tombCatalog.links[pair]; !ok {
+			t.Fatalf("missing Tomb building link %v", pair)
+		}
+		src := tombCatalog.destinations[pair[0]]
+		if !src.building {
+			t.Fatalf("Tomb building gate %d (%s) must be marked as a building gate", pair[0], src.code)
+		}
+	}
+
+	// Verify Floor 6 center -> North wing trigger portal radius fallback (the native portal operation).
+	rt := &Runtime{}
+	atPortal := simulation.Spawn{RegionID: 0x8002, X: -131, Y: 1890, Z: 2535}
+	if got := rt.walkInZoneAt(atPortal); got != "GATE_JINSI_06X01_06" {
+		t.Fatalf("walkInZoneAt(Floor 6 North portal) = %q, want GATE_JINSI_06X01_06", got)
+	}
+	atCenterArrival := simulation.Spawn{RegionID: 0x8002, X: 0, Y: 1785, Z: 59}
+	if got := rt.walkInZoneAt(atCenterArrival); got != "" {
+		t.Fatalf("walkInZoneAt(Floor 6 center arrival) = %q, want empty", got)
+	}
+	t.Setenv(monster.EnvQinShiTomb, "off")
+	if got := rt.walkInZoneAt(atPortal); got != "" {
+		t.Fatalf("walkInZoneAt(off) = %q, want empty", got)
+	}
+}
+
+/*
+================
+canonicalPortalCatalog
+
+One deterministic line per catalog row (destinations, sources, links,
+buildings, walk-ins), so two catalogs compare byte for byte.
+================
+*/
+func canonicalPortalCatalog(c *portalCatalog) string {
+	linkLine := func(link portalLink) string {
+		line := fmt.Sprintf("%d>%d|%d", link.source, link.target, link.fee)
+		for _, cond := range link.conditions {
+			line += fmt.Sprintf("|{%d,%d,%d}", cond.kind, cond.minimum, cond.maximum)
+		}
+		return line
+	}
+	var b strings.Builder
+	ids := make([]uint32, 0, len(c.destinations))
+	for id := range c.destinations {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		d := c.destinations[id]
+		fmt.Fprintf(&b, "D %d|%d|%s|%t|%t|%d|%t|%d|%d|%v|%v|%v\n",
+			d.id, d.ref, d.code, d.building, d.fortressGate, d.gateKind, d.recall,
+			d.world, d.spawn.RegionID, d.spawn.X, d.spawn.Y, d.spawn.Z)
+	}
+	refs := make([]uint32, 0, len(c.sources))
+	for ref := range c.sources {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i] < refs[j] })
+	for _, ref := range refs {
+		fmt.Fprintf(&b, "S %d>%d\n", ref, c.sources[ref])
+	}
+	keys := make([][2]uint32, 0, len(c.links))
+	for key := range c.links {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i][0] != keys[j][0] {
+			return keys[i][0] < keys[j][0]
+		}
+		return keys[i][1] < keys[j][1]
+	})
+	for _, key := range keys {
+		fmt.Fprintf(&b, "L %s\n", linkLine(c.links[key]))
+	}
+	codes := make([]string, 0, len(c.buildings))
+	for code := range c.buildings {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	for _, code := range codes {
+		fmt.Fprintf(&b, "B %s>%d\n", code, c.buildings[code])
+	}
+	zones := make([]string, 0, len(c.walkIns))
+	for zone := range c.walkIns {
+		zones = append(zones, zone)
+	}
+	sort.Strings(zones)
+	for _, zone := range zones {
+		fmt.Fprintf(&b, "W %s|%s\n", zone, linkLine(c.walkIns[zone]))
+	}
+	return b.String()
+}
+
+/*
+================
+TestQinShiOffCatalogIsByteIdentical
+
+The off state is the shipped catalog, proven byte for byte: the off
+catalog serializes deterministically, and the on catalog is exactly the
+off catalog plus the tomb's rows, so flag-off cannot drift (GH #1013).
+================
+*/
+func TestQinShiOffCatalogIsByteIdentical(t *testing.T) {
+	clientdata.RequireGameData(t)
+	dir := gamedatatest.TextdataDir(t)
+
+	t.Setenv(monster.EnvQinShiTomb, "off")
+	off, err := loadPortalCatalog(dir)
+	if err != nil {
+		t.Fatalf("loadPortalCatalog(off): %v", err)
+	}
+	offAgain, err := loadPortalCatalog(dir)
+	if err != nil {
+		t.Fatalf("loadPortalCatalog(off) again: %v", err)
+	}
+	if canonicalPortalCatalog(off) != canonicalPortalCatalog(offAgain) {
+		t.Fatal("off catalog load is not deterministic")
+	}
+	for zone := range off.walkIns {
+		if strings.HasPrefix(zone, "GATE_JINSI") {
+			t.Fatalf("tomb walk-in %s is active with the flag off", zone)
+		}
+	}
+
+	t.Setenv(monster.EnvQinShiTomb, "on")
+	on, err := loadPortalCatalog(dir)
+	if err != nil {
+		t.Fatalf("loadPortalCatalog(on): %v", err)
+	}
+	stripped := &portalCatalog{
+		destinations: map[uint32]portalDestination{},
+		sources:      map[uint32]uint32{},
+		links:        map[[2]uint32]portalLink{},
+		buildings:    map[string]uint32{},
+		walkIns:      map[string]portalLink{},
+	}
+	for id, d := range on.destinations {
+		if _, shipped := off.destinations[id]; shipped {
+			stripped.destinations[id] = d
+		}
+	}
+	for ref, id := range on.sources {
+		if _, shipped := off.sources[ref]; shipped {
+			stripped.sources[ref] = id
+		}
+	}
+	for key, link := range on.links {
+		if _, shipped := off.links[key]; shipped {
+			stripped.links[key] = link
+		}
+	}
+	stripped.buildings = on.buildings
+	for zone, link := range on.walkIns {
+		if _, shipped := off.walkIns[zone]; shipped {
+			stripped.walkIns[zone] = link
+		}
+	}
+	if canonicalPortalCatalog(stripped) != canonicalPortalCatalog(off) {
+		t.Fatal("the on catalog is not the off catalog plus tomb rows")
+	}
+}
+
+/*
+================
+TestQinShiTombClosedLinkGraph
+
+With the flag on, every tomb link lands on a real destination with a
+real landing point, every tomb walk-in is free, and the Jangan door
+keeps its level-70..999 gate (GH #1013).
+================
+*/
+func TestQinShiTombClosedLinkGraph(t *testing.T) {
+	clientdata.RequireGameData(t)
+	t.Setenv(monster.EnvQinShiTomb, "on")
+	catalog, err := loadPortalCatalog(gamedatatest.TextdataDir(t))
+	if err != nil {
+		t.Fatalf("loadPortalCatalog(on): %v", err)
+	}
+	tombLinks := 0
+	for _, link := range catalog.links {
+		src, srcOK := catalog.destinations[link.source]
+		dst, dstOK := catalog.destinations[link.target]
+		if !srcOK || !dstOK {
+			t.Fatalf("link %d>%d misses a destination", link.source, link.target)
+		}
+		if !strings.HasPrefix(src.code, "GATE_JINSI") && !strings.HasPrefix(dst.code, "GATE_JINSI") {
+			continue
+		}
+		tombLinks++
+		if dst.spawn.RegionID == 0 {
+			t.Fatalf("tomb link %s>%s lands in region 0", src.code, dst.code)
+		}
+	}
+	if tombLinks == 0 {
+		t.Fatal("no tomb links in the on catalog")
+	}
+	for zone, link := range catalog.walkIns {
+		if !strings.HasPrefix(zone, "GATE_JINSI") {
+			continue
+		}
+		if link.fee != 0 {
+			t.Fatalf("tomb walk-in %s charges %d", zone, link.fee)
+		}
+		if catalog.destinations[link.target].spawn.RegionID == 0 {
+			t.Fatalf("tomb walk-in %s lands in region 0", zone)
+		}
+	}
+	door, ok := catalog.walkIns["GATE_JINSI_OUT"]
+	if !ok {
+		t.Fatal("GATE_JINSI_OUT is not a walk-in with the flag on")
+	}
+	if got := catalog.destinations[door.target]; got.code != "GATE_JINSI_IN" || got.spawn.RegionID != 0x8007 {
+		t.Fatalf("the tomb door lands on %+v, want GATE_JINSI_IN in 0x8007", got)
+	}
+	wantConditions := []portalCondition{{1, 70, 999}, {portalConditionTransport, 0, 0}}
+	if len(door.conditions) != len(wantConditions) {
+		t.Fatalf("door conditions %+v, want %+v", door.conditions, wantConditions)
+	}
+	for i, want := range wantConditions {
+		if door.conditions[i] != want {
+			t.Fatalf("door conditions %+v, want %+v", door.conditions, wantConditions)
+		}
+	}
+}
+
+/*
+================
+TestQinShiTombEveryFloorReachable
+
+The closed-graph test proves every tomb link lands somewhere real; this
+proves the chain is walkable end to end (#1800 step 2): from the Jangan
+door's landing on Floor 1 (0x8007), following tomb link edges region to
+region, every one of the six floors (0x8002..0x8007) is reachable. The
+qinshi family's nests stand on those floors; a floor no edge reaches
+would be population no player can ever meet. Intra-floor walking is the
+dungeon navmesh's proof (movement.TestPublishedDungeonPortalTraversal),
+not this one's.
+================
+*/
+func TestQinShiTombEveryFloorReachable(t *testing.T) {
+	clientdata.RequireGameData(t)
+	t.Setenv(monster.EnvQinShiTomb, "on")
+	catalog, err := loadPortalCatalog(gamedatatest.TextdataDir(t))
+	if err != nil {
+		t.Fatalf("loadPortalCatalog(on): %v", err)
+	}
+	edges := map[uint16][]uint16{}
+	for _, link := range catalog.links {
+		src, srcOK := catalog.destinations[link.source]
+		dst, dstOK := catalog.destinations[link.target]
+		if !srcOK || !dstOK {
+			t.Fatalf("link %d>%d misses a destination", link.source, link.target)
+		}
+		if !strings.HasPrefix(src.code, "GATE_JINSI") && !strings.HasPrefix(dst.code, "GATE_JINSI") {
+			continue
+		}
+		from, to := src.spawn.RegionID, dst.spawn.RegionID
+		if from != 0 && to != 0 && from != to {
+			edges[from] = append(edges[from], to)
+		}
+	}
+	reached := map[uint16]bool{0x8007: true}
+	queue := []uint16{0x8007}
+	for len(queue) > 0 {
+		region := queue[0]
+		queue = queue[1:]
+		for _, next := range edges[region] {
+			if !reached[next] {
+				reached[next] = true
+				queue = append(queue, next)
+			}
+		}
+	}
+	for floor := uint16(0x8002); floor <= 0x8007; floor++ {
+		if !reached[floor] {
+			t.Fatalf("floor %#x is not reachable from the tomb door's landing on 0x8007", floor)
+		}
+	}
+}
+
+/*
+================
+placeTombDoorWalker
+
+Stands the player at the tomb door's zone (region 0x66AC).
+================
+*/
+func placeTombDoorWalker(rt *Runtime, c *enterworld.Character) {
+	rt.Worlds.Update(simulation.WorldKey(testDivision, c.Name), func() simulation.WorldState { return simulation.SeedWorldState(c) },
+		func(w *simulation.WorldState) {
+			w.Spawn = simulation.Spawn{RegionID: 0x66ac, X: 961, Y: 150.4, Z: 1828}
+			w.SpawnSet = true
+			w.MoveSegment = nil
+		})
+}
+
+/*
+================
+placeOutsideTombDoor
+
+Stands the player west of the tomb door's zone, still in region 0x66AC.
+================
+*/
+func placeOutsideTombDoor(rt *Runtime, c *enterworld.Character) {
+	rt.Worlds.Update(simulation.WorldKey(testDivision, c.Name), func() simulation.WorldState { return simulation.SeedWorldState(c) },
+		func(w *simulation.WorldState) {
+			w.Spawn = simulation.Spawn{RegionID: 0x66ac, X: 900, Y: 150.4, Z: 1800}
+			w.SpawnSet = true
+			w.MoveSegment = nil
+		})
+}
+
+/*
+================
+TestWalkingIntoTheTombDoorLevels
+
+The reference server's NPC teleport command at the tomb's own door: a level-69 player is refused by the
+door link's level condition (the teleport answer's 0x15) and stays; a
+level-70 player arrives on Floor 1 (region 0x8007) with nothing charged.
+================
+*/
+func TestWalkingIntoTheTombDoorLevels(t *testing.T) {
+	clientdata.RequireGameData(t)
+	t.Setenv(monster.EnvQinShiTomb, "on")
+	rt, c, _, _ := returnFixture(t, 30000)
+	if err := rt.ConfigurePortals(gamedatatest.TextdataDir(t)); err != nil {
+		t.Fatal(err)
+	}
+	rt.Monsters = simulation.NewMonsterState(monster.TemplateFromParts(nil, nil))
+	// The door's event zone sits at the east of the region, like the cave
+	// mouth's lookup in walkin_test.go.
+	rt.WalkInZoneAt = func(at simulation.Spawn) string {
+		if at.RegionID == 0x66ac && at.X > 940 {
+			return "GATE_JINSI_OUT"
+		}
+		return ""
+	}
+	pushed := &[][]wire.Frame{}
+	rt.PushCharacterFrames = func(_, _ string, frames []wire.Frame) { *pushed = append(*pushed, frames) }
+	placeOutsideTombDoor(rt, c)
+	if err := rt.AdmitCharacterSession(testDivision, c.Name, 1); err != nil {
+		t.Fatal(err)
+	}
+	rt.advanceWalkIns(1000)
+	if len(*pushed) != 0 {
+		t.Fatalf("outside the door pushed %+v", *pushed)
+	}
+
+	level := int64(69)
+	c.Level = &level
+	placeTombDoorWalker(rt, c)
+	rt.advanceWalkIns(1100)
+	if len(*pushed) != 1 || !bytes.Equal((*pushed)[0][0].Payload, []byte{2, 0x15}) {
+		t.Fatalf("level-69 door entry answered %+v, want the level refusal", *pushed)
+	}
+	rt.advanceWalkIns(1200)
+	if len(*pushed) != 1 {
+		t.Fatal("standing on at the door asked again")
+	}
+
+	level = 70
+	gold := *c.Gold
+	placeOutsideTombDoor(rt, c)
+	rt.advanceWalkIns(1300)
+	placeTombDoorWalker(rt, c)
+	rt.advanceWalkIns(1400)
+	if len(*pushed) != 2 || (*pushed)[1][0].Opcode != enterworld.OpcodeResetClient {
+		t.Fatalf("level-70 door entry answered %+v, want the teleport reset", *pushed)
+	}
+	if uint16(*c.World.Spawn.RegionID) != 0x8007 {
+		t.Fatalf("arrived in region %v, want Floor 1 (0x8007)", *c.World.Spawn.RegionID)
+	}
+	if *c.Gold != gold {
+		t.Fatal("the tomb door charged a fee")
+	}
+}
+
+/*
+================
+placeTombFloor5Walker
+
+Stands the player at x on Qin-Shi Floor 5 (region 0x8003).
+================
+*/
+func placeTombFloor5Walker(rt *Runtime, c *enterworld.Character, x float64) {
+	rt.Worlds.Update(simulation.WorldKey(testDivision, c.Name), func() simulation.WorldState { return simulation.SeedWorldState(c) },
+		func(w *simulation.WorldState) {
+			w.Spawn = simulation.Spawn{RegionID: 0x8003, X: x, Y: -50, Z: 100}
+			w.SpawnSet = true
+			w.MoveSegment = nil
+		})
+}
+
+/*
+================
+tombGateChainState
+
+A Floor 5 tomb chain state on a pinned clock (the chain itself is
+covered in world/simulation; here it is only driven to its open gate).
+================
+*/
+func tombGateChainState(t *testing.T) (*simulation.MonsterState, time.Time) {
+	t.Helper()
+	base := time.UnixMilli(1_784_100_000_000)
+	ref := func(id uint32, codename string) monster.MonsterRef {
+		return monster.MonsterRef{RefObjID: id, Codename: codename, TidWord: 0x00C6, MaxHP: 100, MonsterType: 3}
+	}
+	nest := func(id uint32, x float64) monster.NestRow {
+		return monster.NestRow{
+			SpawnPoint:     monster.SpawnPoint{RefObjID: id, RegionID: 0x8003, X: x, Y: -50, Z: 100},
+			MaxCount:       0,
+			PolicyPinned:   true,
+			RetailEvidence: true,
+		}
+	}
+	floor6 := []string{"MOB_TQ_BLACKSNAKE", "MOB_TQ_WHITESNAKE",
+		"MOB_TQ_SNAKEGENERAL", "MOB_TQ_SNAKEGENERAL_CLON", "MOB_TQ_SNAKEGENERAL_CLON2", "MOB_TQ_SNAKEGENERAL_CLON3",
+		"MOB_TQ_TOMBBUGGHOST_CLON2", "MOB_TQ_SNAKESLAVE_CLON2", "MOB_TQ_TOMBBUGGHOST_CLON", "MOB_TQ_SNAKEWOMAN_CLON2",
+		"MOB_TQ_TOMBBUGGHOST", "MOB_TQ_SNAKESLAVE_CLON", "MOB_TQ_SNAKEWOMAN_CLON", "MOB_TQ_SNAKEDEMON_CLON2",
+		"MOB_TQ_SNAKESLAVE", "MOB_TQ_SNAKEDEMON_CLON", "MOB_TQ_SNAKEMAN_CLON2", "MOB_TQ_SNAKEWOMAN",
+		"MOB_TQ_SNAKEMAN_CLON", "MOB_TQ_SNAKEDEMON", "MOB_TQ_SNAKEMAN"}
+	refs := map[uint32]monster.MonsterRef{
+		11: ref(11, "MOB_TQ_EASTGUARDIAN"),
+		12: ref(12, "MOB_TQ_SOUTHGUARDIAN"),
+		13: ref(13, "MOB_TQ_WESTGUARDIAN"),
+		14: ref(14, "MOB_TQ_NORTHGUARDIAN"),
+		15: ref(15, "MOB_TQ_FLAMEMASTER"),
+	}
+	for i, codename := range floor6 {
+		id := uint32(21 + i)
+		refs[id] = ref(id, codename)
+	}
+	chain := simulation.NewMonsterState(monster.TemplateFromParts(
+		refs,
+		[]monster.NestRow{nest(11, 100), nest(12, 200), nest(13, 300), nest(14, 400), nest(15, 500)},
+	))
+	chain.SetTimeSource(func() time.Time { return base })
+	chain.SetRandomSource(func() float64 { return 0.5 })
+	if err := chain.InstallTombChain(); err != nil {
+		t.Fatalf("InstallTombChain: %v", err)
+	}
+	chain.StartDivision(testDivision)
+	return chain, base
+}
+
+/*
+================
+tombGateAdvance
+
+Steps the chain one second at a time up to the offset and returns the
+live Floor 5 instances.
+================
+*/
+func tombGateAdvance(chain *simulation.MonsterState, base time.Time, fromMs, toMs int64) []monster.Instance {
+	for step := fromMs + 1000; step <= toMs; step += 1000 {
+		chain.AdvancePopulation(base.UnixMilli() + step)
+	}
+	return chain.InstancesInRegions(testDivision, []uint16{0x8003})
+}
+
+/*
+================
+tombGateLiveGid
+
+The live gid of a chain codename on Floor 5.
+================
+*/
+func tombGateLiveGid(t *testing.T, live []monster.Instance, codename string) uint32 {
+	t.Helper()
+	for _, in := range live {
+		if in.Ref.Codename == codename {
+			return in.Gid
+		}
+	}
+	t.Fatalf("no live %s on Floor 5", codename)
+	return 0
+}
+
+/*
+================
+TestFloor6WalkInWaitsForTheFlameMaster
+
+The Floor 6 entry exists only once the tomb chain opens it (#2372):
+walking into a Floor 5 exit zone while the Flame Master still lives
+does nothing; after the four guardians and the Flame Master die, the
+same walk teleports to Floor 6.
+================
+*/
+func TestFloor6WalkInWaitsForTheFlameMaster(t *testing.T) {
+	clientdata.RequireGameData(t)
+	t.Setenv(monster.EnvQinShiTomb, "on")
+	rt, c, _, _ := returnFixture(t, 30000)
+	if err := rt.ConfigurePortals(gamedatatest.TextdataDir(t)); err != nil {
+		t.Fatal(err)
+	}
+	chain, base := tombGateChainState(t)
+	rt.Monsters = chain
+	rt.WalkInZoneAt = func(at simulation.Spawn) string {
+		if at.RegionID == 0x8003 && at.X > 500 {
+			return "GATE_JINSI_05X01-1"
+		}
+		return ""
+	}
+	pushed := &[][]wire.Frame{}
+	rt.PushCharacterFrames = func(_, _ string, frames []wire.Frame) { *pushed = append(*pushed, frames) }
+	level := int64(100)
+	c.Level = &level
+	placeTombFloor5Walker(rt, c, 100)
+	if err := rt.AdmitCharacterSession(testDivision, c.Name, 1); err != nil {
+		t.Fatal(err)
+	}
+	rt.advanceWalkIns(1000)
+	if len(*pushed) != 0 {
+		t.Fatalf("outside the zone pushed %+v", *pushed)
+	}
+
+	placeTombFloor5Walker(rt, c, 600)
+	rt.advanceWalkIns(1100)
+	if len(*pushed) != 0 {
+		t.Fatalf("walking into the shut portal answered %+v", *pushed)
+	}
+	// The persisted spawn only changes when a teleport commits; the
+	// live pose is what proves the player never left Floor 5.
+	pose := rt.Worlds.Snapshot(simulation.WorldKey(testDivision, c.Name),
+		func() simulation.WorldState { return simulation.SeedWorldState(c) }).LiveSpawnAt(1100)
+	if pose.RegionID != 0x8003 {
+		t.Fatalf("walking into the shut portal left Floor 5: pose region %#x", pose.RegionID)
+	}
+
+	// Run the chain: four guardians, then the Flame Master.
+	live := tombGateAdvance(chain, base, 0, 5000)
+	for _, codename := range []string{"MOB_TQ_EASTGUARDIAN", "MOB_TQ_SOUTHGUARDIAN", "MOB_TQ_WESTGUARDIAN", "MOB_TQ_NORTHGUARDIAN"} {
+		if !chain.Defeat(testDivision, tombGateLiveGid(t, live, codename), base.Add(6*time.Second)) {
+			t.Fatalf("defeat %s rejected", codename)
+		}
+	}
+	live = tombGateAdvance(chain, base, 5000, 10000)
+	if !chain.Defeat(testDivision, tombGateLiveGid(t, live, "MOB_TQ_FLAMEMASTER"), base.Add(11*time.Second)) {
+		t.Fatal("defeat Flame Master rejected")
+	}
+	if !chain.TombGateOpen(testDivision, simulation.TombGateFloor6Entry) {
+		t.Fatal("chain gate still shut after the Flame Master died")
+	}
+
+	// Walk out and back in: now the portal exists.
+	placeTombFloor5Walker(rt, c, 100)
+	rt.advanceWalkIns(1200)
+	placeTombFloor5Walker(rt, c, 600)
+	rt.advanceWalkIns(1300)
+	if len(*pushed) != 1 || (*pushed)[0][0].Opcode != enterworld.OpcodeResetClient {
+		t.Fatalf("walking into the open portal answered %+v, want the teleport reset", *pushed)
+	}
+	if got := *c.World.Spawn.RegionID; got != 0x8002 {
+		t.Fatalf("arrived in region %#x, want Floor 6 (0x8002)", got)
+	}
+}
+
+/*
+================
+placeTombFloor6Walker
+
+Stands the player at a point on Qin-Shi Floor 6 (region 0x8002).
+================
+*/
+func placeTombFloor6Walker(rt *Runtime, c *enterworld.Character, x, y, z float64) {
+	rt.Worlds.Update(simulation.WorldKey(testDivision, c.Name), func() simulation.WorldState { return simulation.SeedWorldState(c) },
+		func(w *simulation.WorldState) {
+			w.Spawn = simulation.Spawn{RegionID: 0x8002, X: x, Y: y, Z: z}
+			w.SpawnSet = true
+			w.MoveSegment = nil
+		})
+}
+
+/*
+================
+tombFloor6Pose
+
+The player's live pose on Floor 6.
+================
+*/
+func tombFloor6Pose(rt *Runtime, c *enterworld.Character, nowMs int64) simulation.Spawn {
+	return rt.Worlds.Snapshot(simulation.WorldKey(testDivision, c.Name),
+		func() simulation.WorldState { return simulation.SeedWorldState(c) }).LiveSpawnAt(nowMs)
+}
+
+/*
+================
+TestFloor6ArenaPortalsWaitForTheirStages
+
+Floor 6's arena portals belong to the tomb chain (#2373): the west
+entry and the arena exit do nothing while their stages live; once the
+west wave is fully dead the entry teleports onto the arena platform,
+and the exit - open through the entry - teleports back to the north
+ledge.
+================
+*/
+func TestFloor6ArenaPortalsWaitForTheirStages(t *testing.T) {
+	clientdata.RequireGameData(t)
+	t.Setenv(monster.EnvQinShiTomb, "on")
+	rt, c, _, _ := returnFixture(t, 30000)
+	if err := rt.ConfigurePortals(gamedatatest.TextdataDir(t)); err != nil {
+		t.Fatal(err)
+	}
+	chain, base := tombGateChainState(t)
+	rt.Monsters = chain
+	rt.WalkInZoneAt = func(at simulation.Spawn) string {
+		if at.RegionID != 0x8002 {
+			return ""
+		}
+		if at.X == -131 && at.Z == 2535 {
+			return "GATE_JINSI_06X01_06"
+		}
+		if at.X < -4000 {
+			return "GATE_JINSI_06X05_03"
+		}
+		return ""
+	}
+	pushed := &[][]wire.Frame{}
+	rt.PushCharacterFrames = func(_, _ string, frames []wire.Frame) { *pushed = append(*pushed, frames) }
+	level := int64(100)
+	c.Level = &level
+	placeTombFloor6Walker(rt, c, 0, 1785, 59)
+	if err := rt.AdmitCharacterSession(testDivision, c.Name, 1); err != nil {
+		t.Fatal(err)
+	}
+	rt.advanceWalkIns(1000)
+	if len(*pushed) != 0 {
+		t.Fatalf("outside the zones pushed %+v", *pushed)
+	}
+
+	// The arena exit first, with no entry portal open: nothing.
+	placeTombFloor6Walker(rt, c, -131, 1890, 2535)
+	rt.advanceWalkIns(1100)
+	if len(*pushed) != 0 {
+		t.Fatalf("walking into the shut arena exit answered %+v", *pushed)
+	}
+	if pose := tombFloor6Pose(rt, c, 1100); pose.X != -131 || pose.Z != 2535 {
+		t.Fatalf("the shut arena exit moved the player: pose %+v", pose)
+	}
+
+	// The west entry, with the west wave alive: nothing.
+	placeTombFloor6Walker(rt, c, 100, -49, 0)
+	rt.advanceWalkIns(1200)
+	placeTombFloor6Walker(rt, c, -4500, -49, 0)
+	rt.advanceWalkIns(1300)
+	if len(*pushed) != 0 {
+		t.Fatalf("walking into the shut west portal answered %+v", *pushed)
+	}
+	if pose := tombFloor6Pose(rt, c, 1300); pose.X != -4500 {
+		t.Fatalf("the shut west portal moved the player: pose %+v", pose)
+	}
+
+	// Clear the west wave through the chain; its portal opens.
+	tombGateAdvance(chain, base, 0, 5000)
+	west := map[string]bool{}
+	for _, codename := range []string{
+		"MOB_TQ_TOMBBUGGHOST_CLON2", "MOB_TQ_SNAKESLAVE_CLON2", "MOB_TQ_TOMBBUGGHOST_CLON", "MOB_TQ_SNAKEWOMAN_CLON2",
+		"MOB_TQ_TOMBBUGGHOST", "MOB_TQ_SNAKESLAVE_CLON", "MOB_TQ_SNAKEWOMAN_CLON", "MOB_TQ_SNAKEDEMON_CLON2",
+		"MOB_TQ_SNAKESLAVE", "MOB_TQ_SNAKEDEMON_CLON", "MOB_TQ_SNAKEMAN_CLON2", "MOB_TQ_SNAKEWOMAN",
+		"MOB_TQ_SNAKEMAN_CLON", "MOB_TQ_SNAKEDEMON", "MOB_TQ_SNAKEMAN",
+	} {
+		west[codename] = true
+	}
+	killed := 0
+	for _, in := range chain.InstancesInRegions(testDivision, []uint16{0x8002}) {
+		if !west[in.Ref.Codename] {
+			continue
+		}
+		if !chain.Defeat(testDivision, in.Gid, base.Add(6*time.Second)) {
+			t.Fatalf("defeat west %s rejected", in.Ref.Codename)
+		}
+		killed++
+	}
+	if killed != 75 {
+		t.Fatalf("west wave killed = %d, want 75", killed)
+	}
+	if !chain.TombGateOpen(testDivision, "Chins_Floor6_Portal3") {
+		t.Fatal("west portal (Portal3) shut after the west wave died")
+	}
+
+	// Walk out and back into the entry: onto the arena platform.
+	placeTombFloor6Walker(rt, c, 100, -49, 0)
+	rt.advanceWalkIns(1400)
+	placeTombFloor6Walker(rt, c, -4500, -49, 0)
+	rt.advanceWalkIns(1500)
+	if len(*pushed) != 1 || (*pushed)[0][0].Opcode != enterworld.OpcodeResetClient {
+		t.Fatalf("walking into the open west portal answered %+v, want the teleport reset", *pushed)
+	}
+	if pose := tombFloor6Pose(rt, c, 1500); pose.RegionID != 0x8002 || pose.X != 0 || pose.Z != 59 {
+		t.Fatalf("arrived at pose %+v, want the arena platform (0,1785,59)", pose)
+	}
+
+	// And out again through the exit the entry opened.
+	placeTombFloor6Walker(rt, c, -131, 1890, 2535)
+	rt.advanceWalkIns(1600)
+	if len(*pushed) != 2 || (*pushed)[1][0].Opcode != enterworld.OpcodeResetClient {
+		t.Fatalf("walking into the open arena exit answered %+v, want the teleport reset", *pushed)
+	}
+	if pose := tombFloor6Pose(rt, c, 1600); pose.RegionID != 0x8002 || pose.X != -73 || pose.Z != 7089 {
+		t.Fatalf("arrived at pose %+v, want the north ledge (-73,140,7089)", pose)
+	}
+}

@@ -1,0 +1,4 @@
+# Files in apps/client-next/src with open-coded `* 1920` / `1920 *` sector math
+# or raw `0x8000` region-bit tests predating world-space.ts (#1279).
+# Format: `<path> <count>`. This ledger may only shrink; run
+# `node scripts/checks/check_world_space.mjs --update` after migrating a file.

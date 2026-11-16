@@ -1,0 +1,336 @@
+/*
+===========================================================================
+
+portal_world.go - teleports that cross into another game world
+
+A teleport destination names its RefGameWorld (teleportdata GenWorldID).
+The native teleport request sends a teleport into
+a siege world through the fortress entry rules, asks the destination world
+whether it takes the PC (the world's transfer check), then moves the
+PC into layer 1 through the PC's
+world teleport (vtable +0x378). Refusals are the 0x1Cxx teleport errors;
+the wire carries their low byte (portalNotice, category 13).
+
+===========================================================================
+*/
+package action
+
+import (
+	"fmt"
+	"path/filepath"
+	"strconv"
+
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/world/fortress"
+	"opensro.online/server/internal/game/world/instance"
+	"opensro.online/server/internal/game/world/muhan"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+const (
+	// 0x1C1A UIIT_MSG_FORT_ENTRANCE_FORTRESS_FAIL_01: a fortress gate refuses
+	// a PC whose job state is not 4 (none) - one wearing a job suit.
+	portalFortressJobSuit byte = 0x1a
+	// 0x1C1D UIIT_MSG_FORT_NOT_POSSESS_FORTRESS_MEMBER: a fortress's other
+	// portals (its portal stones and town portal) serve the owning guild.
+	portalFortressOwnersOnly byte = 0x1d
+	// 0x1C1B UIIT_MSG_FORT_PORTALSTONE_FAIL_04: one side of the war has
+	// brought its MaxEntrance into the fortress.
+	portalFortressFull byte = 0x1b
+	// 0x1C1C UIIT_MSG_FORT_ENTRANCE_FORTRESS_FAIL_02: during a war only the
+	// occupying guild and the applicants enter.
+	portalFortressNotInWar byte = 0x1c
+	// 0x1C1E UIIT_MSG_FORT_ETC_ERR_CANT_ENTER_5MINBEFORE: attackers wait five
+	// minutes after a temporary capture.
+	portalFortressCaptureWait byte = 0x1e
+	// Natively every world is entered on layer 1.
+	portalWorldLayer = 1
+)
+
+/*
+================
+loadFortressCatalog
+
+siegefortress.txt's enabled rows: Service, FortressID, CodeName, the Korean
+name, NameStrID, the town gate, then the u16 pair at +0x78/+0x7A whose
+second member is MaxEntrance.
+================
+*/
+func loadFortressCatalog(dir string) ([]fortress.Catalog, error) {
+	rows := enterworld.ReadTextdataFile(filepath.Join(dir, "siegefortress.txt"))
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("siegefortress is absent or empty")
+	}
+	var out []fortress.Catalog
+	for i, r := range rows {
+		if r[0] != "1" {
+			continue
+		}
+		if len(r) < 14 {
+			return nil, fmt.Errorf("siegefortress row %d is truncated", i+1)
+		}
+		id, err := strconv.ParseUint(r[1], 10, 32)
+		if err != nil || id == 0 {
+			return nil, fmt.Errorf("siegefortress row %d identity", i+1)
+		}
+		maximum, err := strconv.ParseUint(r[7], 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("siegefortress row %d entrance limit", i+1)
+		}
+		fee, err := strconv.ParseUint(r[11], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("siegefortress row %d request fee", i+1)
+		}
+		out = append(out, fortress.Catalog{ID: uint32(id), CodeName: r[2], MaxEntrance: uint32(maximum),
+			RequestFee: fee, OfficialNpc: r[13], TownGate: r[5]})
+	}
+	return out, nil
+}
+
+/*
+================
+travelPoint
+
+A relocation's destination: a position and the world and layer it lies in.
+================
+*/
+type travelPoint struct {
+	spawn simulation.Spawn
+	world instance.ID
+}
+
+/*
+================
+portalTransferError
+
+The native transfer-status-to-teleport-error map for the statuses the
+transfer check can answer.
+================
+*/
+func portalTransferError(status instance.Status) byte {
+	switch status {
+	case instance.MissingLayer, instance.MissingWorld:
+		return 3
+	case instance.AllocationFull:
+		return 0x29
+	case instance.PlayerLimitReached:
+		return 0x25
+	}
+	return 2
+}
+
+/*
+================
+portalWorld
+
+The world and layer a destination lies in.
+================
+*/
+func portalWorld(destination portalDestination) instance.ID {
+	return instance.Pack(destination.world, portalWorldLayer)
+}
+
+/*
+================
+portalWorldAdmission
+
+The world half of the native teleport request: the destination's world and layer, after the
+fortress entry rules for a siege world and the destination world's
+transfer check. Runs under the division lock, outside the character
+update, because the fortress head count reads other characters.
+================
+*/
+func (rt *Runtime) portalWorldAdmission(division string, c *enterworld.Character, arrival portalDestination) (instance.ID, byte) {
+	world, known := instance.Lookup(arrival.world)
+	if !known {
+		return 0, 2
+	}
+	if world.Siege() {
+		if refusal := rt.fortressEntry(division, c, arrival, world); refusal != 0 {
+			return 0, refusal
+		}
+	}
+	if arena, ok := muhan.Lookup(int(arrival.world)); ok {
+		// Port-only, not native (#3314): the solo/party rule the world
+		// codename carried alone until now. A solo arena refuses a
+		// player in a live party; a party arena refuses one without.
+		party := rt.rewardPartyOf(division, enterworld.ObjectIDForCharacter(c))
+		if arena.Solo && party != nil || !arena.Solo && party == nil {
+			return 0, 2
+		}
+	}
+	destination := portalWorld(arrival)
+	if rt.Monsters == nil {
+		if uint32(destination) != domain.DefaultWorldInstance {
+			return 0, portalTransferError(instance.MissingWorld)
+		}
+		return destination, 0
+	}
+	if status := rt.Monsters.CheckPopulationTransfer(division, destination, c.GMPrivilege); status != instance.Success {
+		return 0, portalTransferError(status)
+	}
+	return destination, 0
+}
+
+/*
+================
+fortressEntry
+
+The native teleport's siege branch. The destination gate's own building decides the
+rule: a fortress gate takes anyone not in a
+job suit while no war runs (the native war-entry check returns
+before its war checks when the server's war mode is clear); every other
+portal of the fortress takes only the owning guild
+(the native owner test) or an allied one (the allied test,
+fortress_allies.go).
+================
+*/
+func (rt *Runtime) fortressEntry(division string, c *enterworld.Character, destination portalDestination, world instance.Definition) byte {
+	fortressID, ok := rt.Fortresses.ForWorld(world)
+	if !ok {
+		return 2
+	}
+	if destination.fortressGate {
+		// Job state +0xF is 4 (none) unless a job suit is worn: job mode.
+		if rt.jobDressed(c) {
+			return portalFortressJobSuit
+		}
+		if rt.Fortresses.WarActive(division) {
+			return rt.fortressWarEntry(division, c, fortressID)
+		}
+		return 0
+	}
+	var guildID int64
+	if c.GuildID != nil {
+		guildID = *c.GuildID
+	}
+	if !rt.Fortresses.GuildOwns(division, fortressID, guildID) {
+		record, _ := rt.Fortresses.Get(division, fortressID)
+		if guildID == 0 || record.GuildID == 0 || !rt.Unions.Allied(division, record.GuildID, guildID) {
+			return portalFortressOwnersOnly
+		}
+	}
+	return 0
+}
+
+/*
+================
+fortressWarEntry
+
+The native war-entry check past its war-mode test. The
+occupying guild needs no application; everyone else must have applied.
+Defenders (the holder: a temporary
+holder while one exists) may bring half of MaxEntrance; attackers the
+whole of it, or half once the fortress is occupied, and only after the
+post-capture wait. Each side counts the PCs already in the world's layer
+(siege slots 39 and 40).
+================
+*/
+func (rt *Runtime) fortressWarEntry(division string, c *enterworld.Character, fortressID uint32) byte {
+	if c.GuildID == nil || *c.GuildID == 0 {
+		return portalFortressNotInWar
+	}
+	guild := *c.GuildID
+	record, ok := rt.Fortresses.Get(division, fortressID)
+	if !ok {
+		return 2
+	}
+	occupied := record.GuildID != 0
+	if _, applied := record.Applicants[guild]; !(occupied && record.GuildID == guild) && !applied {
+		return portalFortressNotInWar
+	}
+	defender := rt.fortressDefender(division, record, guild)
+	defenders, attackers := rt.fortressSides(division, record)
+	if defender {
+		if record.MaxEntrance>>1 <= defenders {
+			return portalFortressFull
+		}
+		return 0
+	}
+	if !record.EntryOpen {
+		return portalFortressCaptureWait
+	}
+	limit := record.MaxEntrance
+	if occupied {
+		limit >>= 1
+	}
+	if limit <= attackers {
+		return portalFortressFull
+	}
+	return 0
+}
+
+/*
+================
+fortressSides
+
+The PCs admitted to the fortress's world, split into its defenders (the
+holder and its allies) and everyone else.
+================
+*/
+func (rt *Runtime) fortressSides(division string, record fortress.Record) (defenders, attackers uint32) {
+	fortressID := record.ID
+	var world instance.ID
+	for _, definition := range instance.Shipped() {
+		if id, ok := rt.Fortresses.ForWorld(definition); ok && id == fortressID {
+			world = instance.Pack(definition.ID, portalWorldLayer)
+		}
+	}
+	rt.characterAdmissions.Range(func(key, value any) bool {
+		admission := value.(populationAdmission)
+		if admission.lease.ID != world || admission.division != division {
+			return true
+		}
+		c := rt.findCharacter(admission.division, admission.name)
+		if c == nil {
+			return true
+		}
+		if c.GuildID != nil && rt.fortressDefender(division, record, *c.GuildID) {
+			defenders++
+		} else {
+			attackers++
+		}
+		return true
+	})
+	return defenders, attackers
+}
+
+/*
+================
+moveWorldMembership
+
+The population half of any relocation: when the destination lies in
+another world, the session's membership moves there (capacity bypassed:
+the PC is returning to a permanent world, never queueing into a war).
+Returns the previous membership for restorePopulationSession. The caller
+holds the division lock.
+================
+*/
+func (rt *Runtime) moveWorldMembership(division string, c *enterworld.Character, from, to instance.ID) (populationAdmission, bool) {
+	if from == to {
+		return populationAdmission{}, true
+	}
+	previous, status := rt.transferPopulationSession(division, c.Name, to, true)
+	return previous, status == instance.Success
+}
+
+/*
+================
+setCharacterWorld
+
+Writes the semantic world a PC now resides in. The default world is the
+absent value, so field characters keep their records unchanged.
+================
+*/
+func setCharacterWorld(c *enterworld.Character, world instance.ID) {
+	if c.World == nil {
+		c.World = &domain.CharacterWorld{}
+	}
+	if uint32(world) == domain.DefaultWorldInstance {
+		c.World.PackedInstance = nil
+		return
+	}
+	packed := uint32(world)
+	c.World.PackedInstance = &packed
+}

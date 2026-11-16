@@ -1,0 +1,498 @@
+package statuseffect
+
+import (
+	"strconv"
+	"strings"
+)
+
+// Link is the shared lnks relationship (native execution context+68). Source and target
+// effects have distinct wire tokens; the source token identifies this link.
+// The registry commits both halves or neither. All returned values are copies.
+type Link struct {
+	DivisionID, SourceName, TargetName                                  string
+	SourceGID, TargetGID                                                uint32
+	SourceToken, TargetToken                                            uint32
+	SkillID, SkillGroup, Group, MaxDistance, MaxOutgoing, ThreatPercent uint32
+	// ManaPercent and ManaCap are lkdh's MP share of the recipient's dealt
+	// damage and its per-hit ceiling (Mana Switch); zero means no share.
+	ManaHPPercent, ManaPercent, ManaCap uint32
+	// Hunt is hntp: the source keeps receiving the target's position while
+	// the link lives (Tag Point, Hunting Point; action/huntingpoint.go).
+	Hunt bool
+	// FenceMask, FencePercent and FenceMaxHits are lkdr's lane share
+	// (Physical / Magical Fence, in the server's damage-effect processing);
+	// a zero percent means no fence.
+	// FenceHits counts the hits the link has absorbed (native link +0x3C).
+	FenceMask, FencePercent, FenceMaxHits, FenceHits uint32
+	// QuotaPercent is lkdd's shared percent (Pain Quota); zero
+	// means no quota.
+	QuotaPercent uint32
+	// ScreamRange is abnb's range (Scream Mask): an attacker hitting
+	// the recipient within it rolls the row's statuses; zero means none.
+	ScreamRange              uint32
+	ExpiresAtMs, StartedAtMs int64
+	ClientCancelable         bool
+	// TargetModifiers are the recipient half's parameter writes (the
+	// server's buff-modifier application in mode 2: stri/inti). The source
+	// half skips them, so a link never carries source modifiers.
+	TargetModifiers              Modifiers
+	sourceRetired, targetRetired bool
+}
+
+func linkKey(division string, token uint32) string {
+	return strings.ToLower(division) + "\x00" + strconv.FormatUint(uint64(token), 10)
+}
+
+// ApplyLink admits the ordinary lnks/lkag shape, without the native +374,
+// +49c or +4a0 variants. The server's linked-effect validation: same target
+// or mixed skill IDs in a nonzero link group => 300c; reaching lnks[2] =>
+// 3029. Zero means no count limit.
+func (r *Registry) ApplyLink(link Link) uint16 {
+	if r == nil {
+		return 0x3011
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if code := r.linkRefusalLocked(link); code != 0 {
+		return code
+	}
+	source, target := ownerKey(link.DivisionID, link.SourceName), ownerKey(link.DivisionID, link.TargetName)
+	link.sourceRetired, link.targetRetired = false, false
+	e := Effect{DivisionID: link.DivisionID, SkillID: link.SkillID, SkillGroup: link.SkillGroup,
+		LinkToken: link.SourceToken, State: StateActive, ExpiresAtMs: link.ExpiresAtMs, StartedAtMs: link.StartedAtMs,
+		DurationPresent: link.ExpiresAtMs != 0, ClientCancelable: link.ClientCancelable}
+	recipient := e
+	recipient.CharacterName, recipient.OwnerGID, recipient.InstanceToken, recipient.Phase = link.TargetName, link.TargetGID, link.TargetToken, 2
+	recipient.Modifiers = link.TargetModifiers
+	if !r.bindModifiersLocked(&recipient) {
+		return 0x3011
+	}
+	e.CharacterName, e.OwnerGID, e.InstanceToken, e.Phase = link.SourceName, link.SourceGID, link.SourceToken, 1
+	// A fresh cast on the recipient replaces the half an earlier
+	// departure orphaned there, whoever cast it: the entry belongs to
+	// the recipient, so the recipient holds one entry for the buff,
+	// never a stacked copy beside the orphan. A live pair is refused
+	// above and never reaches here, and a live caster's halves are not
+	// replaced - only a source-retired link leaves an orphan behind.
+	for i, old := range r.byOwner[target] {
+		if old.Phase != 2 || old.LinkToken == 0 || old.StopRequested ||
+			(old.SkillID != link.SkillID && (link.SkillGroup == 0 || old.SkillGroup != link.SkillGroup)) {
+			continue
+		}
+		if orphan, ok := r.links[linkKey(link.DivisionID, old.LinkToken)]; ok && orphan.sourceRetired {
+			r.requestReplacementStopLocked(target, i)
+		}
+	}
+	r.byOwner[source] = append(r.byOwner[source], e)
+	r.byOwner[target] = append(r.byOwner[target], recipient)
+	r.touchLocked(source)
+	r.touchLocked(target)
+	link.TargetModifiers = Modifiers{}
+	r.links[linkKey(link.DivisionID, link.SourceToken)] = link
+	// The server installs the latest target effect in ParamKeeper+210.
+	// It is a single pointer, not a sum of all incoming links.
+	r.threatOwners[target] = link.SourceToken
+	// An lkdd effect installs in ParamKeeper+20C, again a single
+	// pointer: the latest quota wins.
+	if link.QuotaPercent != 0 {
+		r.quotaOwners[target] = link.SourceToken
+	}
+	// An abnb effect installs in ParamKeeper+200, the same single pointer.
+	if link.ScreamRange != 0 {
+		r.screamOwners[target] = link.SourceToken
+	}
+	return 0
+}
+
+// LinkRefusal is ApplyLink's admission alone, so a caster is charged only
+// for a link the registry will accept.
+func (r *Registry) LinkRefusal(link Link) uint16 {
+	if r == nil {
+		return 0x3011
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.linkRefusalLocked(link)
+}
+
+func (r *Registry) linkRefusalLocked(link Link) uint16 {
+	if link.DivisionID == "" || link.SourceName == "" || link.TargetName == "" ||
+		strings.EqualFold(link.SourceName, link.TargetName) || link.SourceGID == 0 || link.TargetGID == 0 ||
+		link.SourceGID == link.TargetGID || link.SourceToken == 0 || link.TargetToken == 0 ||
+		link.SourceToken == link.TargetToken || link.SkillID == 0 || link.SkillGroup == 0 || link.ExpiresAtMs <= 0 {
+		return 0x3011
+	}
+	source, target := ownerKey(link.DivisionID, link.SourceName), ownerKey(link.DivisionID, link.TargetName)
+	if len(r.byOwner[source]) >= MaxAttachedEffectsPerCharacter || len(r.byOwner[target]) >= MaxAttachedEffectsPerCharacter {
+		return 0x3029
+	}
+	count := uint32(0)
+	for _, old := range r.links {
+		if !strings.EqualFold(old.DivisionID, link.DivisionID) || old.sourceRetired || !strings.EqualFold(old.SourceName, link.SourceName) || old.Group != link.Group {
+			continue
+		}
+		if old.SkillID == link.SkillID {
+			if old.TargetGID == link.TargetGID {
+				return 0x300c
+			}
+			count++
+		} else if link.Group != 0 {
+			return 0x300c
+		}
+	}
+	if link.MaxOutgoing != 0 && count >= link.MaxOutgoing {
+		return 0x3029
+	}
+	for _, rows := range r.byOwner {
+		for _, old := range rows {
+			if strings.EqualFold(old.DivisionID, link.DivisionID) && (old.InstanceToken == link.SourceToken || old.InstanceToken == link.TargetToken) {
+				return 0x300c
+			}
+		}
+	}
+	return 0
+}
+
+// Range/source-loss updates request the source's retirement. The source's
+// retirement callback, rather than the request, forces its recipient to
+// retire.
+func (r *Registry) stopLinkLocked(division string, token uint32) {
+	l, ok := r.links[linkKey(division, token)]
+	if !ok {
+		return
+	}
+	if !l.sourceRetired {
+		r.stopLinkHalfLocked(l, true)
+	} else if !l.targetRetired {
+		r.stopLinkHalfLocked(l, false)
+	}
+}
+
+func (r *Registry) stopLinkHalfLocked(l Link, source bool) {
+	name, token := l.TargetName, l.TargetToken
+	if source {
+		name, token = l.SourceName, l.SourceToken
+	}
+	key := ownerKey(l.DivisionID, name)
+	for i, e := range r.byOwner[key] {
+		// Native FindActiveBuffBySkillID accepts pending/active instances and does
+		// not skip an already requested stop. A paired recipient uses its exact ID.
+		if e.SkillID != l.SkillID || e.InstanceToken != token ||
+			(e.State != StatePending && e.State != StateActive) {
+			continue
+		}
+		r.requestReplacementStopLocked(key, i)
+		return
+	}
+}
+
+func (r *Registry) StopLink(division string, token uint32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stopLinkLocked(division, token)
+}
+
+func (r *Registry) retireLinkHalfLocked(e Effect) {
+	key := linkKey(e.DivisionID, e.LinkToken)
+	l, ok := r.links[key]
+	if !ok {
+		return
+	}
+	if e.Phase != 1 {
+		r.detachLinkHalfLocked(e)
+		return
+	}
+	l.sourceRetired = true
+	if !l.targetRetired {
+		r.stopLinkHalfLocked(l, false)
+	}
+	if l.sourceRetired && l.targetRetired {
+		delete(r.links, key)
+	} else {
+		r.links[key] = l
+	}
+}
+
+/*
+================
+detachLinkHalfLocked
+
+Forget's half of a pair: the owner is leaving, so its half is marked
+retired without asking the other half to stop. The native logout cleanup
+cancels only the departing character's own buff list; nothing walks
+another character's entries, whose buffs serialize out of each owner's
+own manager and run their own timers. The retired mark still ends the
+pair's live exchanges at once: the threat, fence, quota, mana and hunt
+readers all refuse a link with a retired half. The surviving half
+retires by its own expiry through the ordinary teardown.
+================
+*/
+func (r *Registry) detachLinkHalfLocked(e Effect) {
+	key := linkKey(e.DivisionID, e.LinkToken)
+	l, ok := r.links[key]
+	if !ok {
+		return
+	}
+	if e.Phase == 1 {
+		l.sourceRetired = true
+	} else {
+		l.targetRetired = true
+		// The retirement path clears link+10; the source observes the
+		// missing recipient in its subsequent persistent-cast update, not
+		// in the cancellation request.
+		l.TargetGID = 0
+		// The same path clears +210 unconditionally; an older effect
+		// retiring does
+		// not restore a previous contributor or preserve a newer pointer.
+		delete(r.threatOwners, ownerKey(e.DivisionID, e.CharacterName))
+		for _, owners := range []map[string]uint32{r.quotaOwners, r.screamOwners} {
+			if owners[ownerKey(e.DivisionID, e.CharacterName)] == e.LinkToken {
+				delete(owners, ownerKey(e.DivisionID, e.CharacterName))
+			}
+		}
+	}
+	if l.sourceRetired && l.targetRetired {
+		delete(r.links, key)
+	} else {
+		r.links[key] = l
+	}
+}
+
+/*
+================
+SourceHalfPresent
+
+Whether the link's source owner still holds the phase-1 half, installed
+and not on its way out. Once it has left with its caster the pair is
+detached (detachLinkHalfLocked): there is no live pair to police, and
+the recipient half is owned by its own timer alone.
+================
+*/
+func (r *Registry) SourceHalfPresent(link Link) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.byOwner[ownerKey(link.DivisionID, link.SourceName)] {
+		if e.Phase == 1 && e.LinkToken == link.SourceToken && !e.StopRequested {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Registry) Links() []Link {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Link, 0, len(r.links))
+	for _, l := range r.links {
+		out = append(out, l)
+	}
+	return out
+}
+
+/*
+==================
+HuntLinks
+
+The logically active hunt links (hntp). A stop or the expiry ends the
+reports at once, as it ends a threat share (ThreatLink): the source half
+leaves the native task list before B6A0 retires the recipient.
+==================
+*/
+func (r *Registry) HuntLinks(nowMs int64) []Link {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []Link
+	for _, l := range r.links {
+		if !l.Hunt || l.sourceRetired || l.targetRetired || (Effect{ExpiresAtMs: l.ExpiresAtMs}).Expired(nowMs) {
+			continue
+		}
+		for _, e := range r.byOwner[ownerKey(l.DivisionID, l.SourceName)] {
+			if e.LinkToken == l.SourceToken && e.Phase == 1 && !e.StopRequested {
+				out = append(out, l)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// ThreatLink is the installed, logically active target effect. A stop disables
+// contribution immediately, before the effect update emits B6A0 retirement.
+func (r *Registry) ThreatLink(division, target string, nowMs int64) (Link, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := ownerKey(division, target)
+	token := r.threatOwners[key]
+	l, ok := r.links[linkKey(division, token)]
+	if !ok || l.sourceRetired || l.targetRetired || (Effect{ExpiresAtMs: l.ExpiresAtMs}).Expired(nowMs) {
+		return Link{}, false
+	}
+	for _, e := range r.byOwner[key] {
+		if e.LinkToken == token && e.Phase == 2 && !e.StopRequested {
+			return l, true
+		}
+	}
+	return Link{}, false
+}
+
+/*
+==================
+ManaLinks
+
+The logically active links whose recipient is target and that hand the
+source a share of target's dealt damage (lkdh), and held, the number of
+links target receives of any kind. The native shared-damage split
+divides the damage by the size of that list (+0x2E8) before it pays
+each lkdh link its share. Unlike the single +210 threat pointer,
+every lkdh link counts: each source owns its own share. A stop disables
+the share at once, as for ThreatLink. Inferred: a stopped half has left
+the native list, so it is not counted.
+==================
+*/
+func (r *Registry) ManaLinks(division, target string, nowMs int64) (links []Link, held int) {
+	if r == nil {
+		return nil, 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := ownerKey(division, target)
+	var out []Link
+	for _, e := range r.byOwner[key] {
+		if e.LinkToken == 0 || e.Phase != 2 || e.StopRequested {
+			continue
+		}
+		held++
+		l, ok := r.links[linkKey(division, e.LinkToken)]
+		if !ok || l.ManaPercent == 0 && l.ManaHPPercent == 0 || l.sourceRetired || l.targetRetired || (Effect{ExpiresAtMs: l.ExpiresAtMs}).Expired(nowMs) {
+			continue
+		}
+		l.TargetModifiers = Modifiers{}
+		out = append(out, l)
+	}
+	return out, held
+}
+
+/*
+==================
+FenceLinks
+
+The logically active links whose recipient is target and that move a share
+of its damage to their source (lkdr), in the order they were installed:
+the server appends each to the recipient's +2C8 list, and its damage
+walk traverses it. A stop disables the share at once, as for ManaLinks.
+==================
+*/
+func (r *Registry) FenceLinks(division, target string, nowMs int64) []Link {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []Link
+	for _, e := range r.byOwner[ownerKey(division, target)] {
+		if e.LinkToken == 0 || e.Phase != 2 || e.StopRequested {
+			continue
+		}
+		l, ok := r.links[linkKey(division, e.LinkToken)]
+		if !ok || l.FencePercent == 0 || l.sourceRetired || l.targetRetired || (Effect{ExpiresAtMs: l.ExpiresAtMs}).Expired(nowMs) {
+			continue
+		}
+		l.TargetModifiers = Modifiers{}
+		out = append(out, l)
+	}
+	return out
+}
+
+/*
+==================
+QuotaLink
+
+The installed, logically active Pain Quota target effect (ParamKeeper+20C),
+as ThreatLink is for +210.
+==================
+*/
+func (r *Registry) QuotaLink(division, target string, nowMs int64) (Link, bool) {
+	if r == nil {
+		return Link{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ownedLinkLocked(r.quotaOwners, division, target, nowMs, func(l Link) bool { return l.QuotaPercent != 0 })
+}
+
+/*
+==================
+ScreamLink
+
+The installed, logically active Scream Mask target effect (ParamKeeper+200).
+==================
+*/
+func (r *Registry) ScreamLink(division, target string, nowMs int64) (Link, bool) {
+	if r == nil {
+		return Link{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ownedLinkLocked(r.screamOwners, division, target, nowMs, func(l Link) bool { return l.ScreamRange != 0 })
+}
+
+/*
+==================
+ownedLinkLocked
+
+The live link a single-pointer slot names for target: both halves
+installed, unexpired, the recipient half in phase 2 and not stopping.
+==================
+*/
+func (r *Registry) ownedLinkLocked(owners map[string]uint32, division, target string, nowMs int64, kind func(Link) bool) (Link, bool) {
+	key := ownerKey(division, target)
+	token, ok := owners[key]
+	if !ok {
+		return Link{}, false
+	}
+	l, ok := r.links[linkKey(division, token)]
+	if !ok || !kind(l) || l.sourceRetired || l.targetRetired || (Effect{ExpiresAtMs: l.ExpiresAtMs}).Expired(nowMs) {
+		return Link{}, false
+	}
+	for _, e := range r.byOwner[key] {
+		if e.LinkToken == token && e.Phase == 2 && !e.StopRequested {
+			l.TargetModifiers = Modifiers{}
+			return l, true
+		}
+	}
+	return Link{}, false
+}
+
+/*
+==================
+CountFenceHit
+
+In the reference server's damage-effects processing, a fence that moved a
+share counts the hit on its link (+0x3C) and,
+when lkdr's max hits is nonzero and reached, stops contributing (+0x10 = 0).
+Every shipped fence authors 0, so its link only ends with its duration,
+range or source. Reports whether the link still shares.
+==================
+*/
+func (r *Registry) CountFenceHit(division string, token uint32) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := linkKey(division, token)
+	l, ok := r.links[key]
+	if !ok {
+		return false
+	}
+	l.FenceHits++
+	r.links[key] = l
+	if l.FenceMaxHits != 0 && l.FenceHits >= l.FenceMaxHits {
+		r.stopLinkLocked(division, token)
+		return false
+	}
+	return true
+}

@@ -1,0 +1,289 @@
+/*
+===========================================================================
+
+monsterstate_damage.go - damage plans against monsters
+
+===========================================================================
+*/
+
+package simulation
+
+import (
+	"math"
+	"opensro.online/server/internal/game/abnormal"
+	worldgeom "opensro.online/server/internal/game/world"
+	"opensro.online/server/internal/game/world/instance"
+	"opensro.online/server/internal/game/world/monster"
+	"sort"
+)
+
+/*
+================
+CombatCandidatesInWorld
+
+The candidates around center in the caller's world. It reads only
+already-materialized populations and samples all movers at one instant
+under one lock: a linear scan, then a sort of the nearby result, avoiding
+a full-world copy/sort and N lock crossings. The world is always the
+caller's; no variant assumes the default world (#1552).
+================
+*/
+func (s *MonsterState) CombatCandidatesInWorld(divisionID string, world instance.ID, center Spawn, reach float64, nowMs int64, nearest bool) []monster.Instance {
+	return s.combatCandidates(divisionID, world, center, reach, nowMs, nearest)
+}
+
+/*
+================
+combatCandidates
+================
+*/
+func (s *MonsterState) combatCandidates(divisionID string, world instance.ID, center Spawn, reach float64, nowMs int64, nearest bool) []monster.Instance {
+	lease, exists := s.PopulationLease(divisionID, world)
+	if !exists {
+		return nil
+	}
+	return s.CombatCandidatesInPopulation(divisionID, lease, center, reach, nowMs, nearest)
+}
+
+/*
+================
+CombatCandidatesInPopulation
+================
+*/
+func (s *MonsterState) CombatCandidatesInPopulation(divisionID string, lease instance.Lease, center Spawn, reach float64, nowMs int64, nearest bool) []monster.Instance {
+	if reach < 0 || math.IsNaN(reach) || math.IsInf(reach, 0) {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.populationForLease(divisionID, lease)
+	if state == nil {
+		return nil
+	}
+	var out []monster.Instance
+	var distances map[uint32]float64
+	maxLimit := reach
+	if !nearest {
+		maxLimit += state.instances.maxRadiusBound() * float64(monster.GradeScale(4))
+	}
+	// Query only the outdoor sector window that can intersect maxLimit;
+	// dungeons walk the dungeon buckets, unbounded queries the full table.
+	for gid, pose := range state.movers.livePosesWithinOutdoorReach(center, maxLimit, nowMs, nil) {
+		// Region arithmetic masks the dungeon bit. Do not let matching low
+		// bits alias indoor and outdoor coordinates into a valid area target.
+		if !worldgeom.SamePlane(center.RegionID, pose.RegionID) {
+			continue
+		}
+		dy := pose.Y - center.Y
+		if math.Abs(dy) > maxLimit {
+			continue
+		}
+		distance := WorldDistance2D(center, Spawn{RegionID: pose.RegionID, X: pose.X, Y: pose.Y, Z: pose.Z})
+		if distance > maxLimit {
+			continue
+		}
+		distance = math.Hypot(distance, dy)
+		if distance > maxLimit {
+			continue
+		}
+		limit := reach
+		if !nearest {
+			// The reference radius bounds the graded one (at most x3,
+			// gradescale.go) before the full instance is read.
+			_, radius := state.instances.metadata(gid)
+			limit += radius * float64(monster.GradeScale(4))
+		}
+		if distance <= limit {
+			instance, exists := state.instances.lookup(gid)
+			// A fortress structure takes only a weapon's basic attack aimed
+			// at it (the retail server's can-attack check), so it is never an
+			// area, chain or secondary victim.
+			if !exists || instance.CurrentHP == 0 || instance.Ref.Structure {
+				continue
+			}
+			if !nearest && distance > reach+instance.BodyRadius() {
+				continue
+			}
+			out = append(out, instance)
+			if nearest {
+				if distances == nil {
+					distances = make(map[uint32]float64)
+				}
+				distances[gid] = distance
+			}
+		}
+	}
+	if len(out) > 1 {
+		sort.Slice(out, func(i, j int) bool {
+			if nearest && distances[out[i].Gid] != distances[out[j].Gid] {
+				return distances[out[i].Gid] < distances[out[j].Gid]
+			}
+			return out[i].Gid < out[j].Gid
+		})
+	}
+	return out
+}
+
+/*
+================
+MonsterDamagePlan
+================
+*/
+type MonsterDamagePlan struct {
+	StatusHit abnormal.HitContext
+	// Abnormal holds the statuses the retail server's abnormal roll made for
+	// this impact, applied only if the monster survives it.
+	Abnormal []abnormal.Record
+	// Prepared outside character and population mutation doors; never resolved during commit.
+	AbnormalSources         map[uint32]MonsterAbnormalSource
+	GID, ExpectedHP, Damage uint32
+	// CreditGID is the source after authority-owned attribution (for example,
+	// a COS owner's GID). Zero represents an unattributed hit.
+	CreditGID uint32
+	Knockdown *MonsterKnockdownPlan
+	Knockback *MonsterKnockdownPlan
+}
+
+/*
+==================
+ApplyDamageBatch
+
+ApplyDamageBatch validates the complete live HP snapshot before any write.
+The division's character transaction owns cost/rewards around this single
+population door. A stale victim refuses the whole plan, never half an AoE.
+==================
+*/
+func (s *MonsterState) ApplyDamageBatch(divisionID string, plans []MonsterDamagePlan) ([]MonsterDamageResult, bool) {
+	if len(plans) == 0 || len(plans) > 255 {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.populationForObject(divisionID, plans[0].GID)
+	seen := make(map[uint32]bool, len(plans))
+	for _, plan := range plans {
+		instance, ok := state.instances.lookup(plan.GID)
+		if !ok || seen[plan.GID] {
+			return nil, false
+		}
+		asPlanned := instance.CurrentHP != 0 && instance.CurrentHP == plan.ExpectedHP
+		if !asPlanned || !validImpactDisplacement(plan.Knockdown, plan.Knockback) || !validAbnormalSources(plan) {
+			return nil, false
+		}
+		seen[plan.GID] = true
+	}
+	results := make([]MonsterDamageResult, 0, len(plans))
+	for _, plan := range plans {
+		results = append(results, s.applyDamageLocked(divisionID, state, plan))
+	}
+	return results, true
+}
+
+/*
+==================
+ApplyDamageSequences
+
+ApplyDamageSequences is ApplyDamageBatch for multi-impact areas: every
+victim's first plan must match its live HP before any write, then each
+victim takes its impacts in order until the first fatal one.
+==================
+*/
+func (s *MonsterState) ApplyDamageSequences(divisionID string, sequences [][]MonsterDamagePlan) ([][]MonsterDamageResult, bool) {
+	if len(sequences) == 0 || len(sequences) > 255 || len(sequences[0]) == 0 {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.populationForObject(divisionID, sequences[0][0].GID)
+	seen := make(map[uint32]bool, len(sequences))
+	for _, plans := range sequences {
+		if len(plans) == 0 || len(plans) > 255 {
+			return nil, false
+		}
+		gid := plans[0].GID
+		instance, ok := state.instances.lookup(gid)
+		if !ok || seen[gid] || instance.CurrentHP == 0 || instance.CurrentHP != plans[0].ExpectedHP {
+			return nil, false
+		}
+		for _, plan := range plans {
+			if plan.GID != gid || !validImpactDisplacement(plan.Knockdown, plan.Knockback) || !validAbnormalSources(plan) {
+				return nil, false
+			}
+		}
+		seen[gid] = true
+	}
+	results := make([][]MonsterDamageResult, 0, len(sequences))
+	for _, plans := range sequences {
+		out := make([]MonsterDamageResult, 0, len(plans))
+		for _, plan := range plans {
+			result := s.applyDamageLocked(divisionID, state, plan)
+			out = append(out, result)
+			if result.Fatal {
+				break
+			}
+		}
+		results = append(results, out)
+	}
+	return results, true
+}
+
+/*
+==================
+MonsterDamageResult
+
+MonsterDamageResult is the committed outcome of one hit against a
+simulation-owned monster. It is a value snapshot: callers cannot mutate the
+population by retaining it.
+==================
+*/
+type MonsterDamageResult struct {
+	// Population is captured with HP and contributions, before the source
+	// can be retired. Reward origin must not infer a default wire world.
+	Population instance.Lease
+	// Contributions is a detached snapshot delivered only at the fatal transition.
+	Contributions []MonsterContribution
+	Instance      monster.Instance
+	BeforeHP      uint32
+	CurrentHP     uint32
+	// Damage retains the committed hit for feedback; Applied is only the HP debit.
+	Damage  uint32
+	Applied uint32
+	// Fatal is true only for the hit that transitions a live monster from
+	// positive HP to zero. Population removal remains an explicit Defeat
+	// lifecycle step so the combat lane can publish the death result first.
+	Fatal bool
+	// Abnormal reports the break/application consequences of this impact.
+	Abnormal  MonsterAbnormalEffects
+	Knockdown *MonsterKnockdownPlan
+	Knockback *MonsterKnockdownPlan
+}
+
+/*
+==================
+ApplyDamage
+
+ApplyDamage subtracts damage from the one authoritative CurrentHP field
+while holding the population lock. Concurrent hits therefore observe one
+ordered HP history, Applied records only the HP actually removed, and
+exactly one hit can own the fatal transition.
+
+The method deliberately does not call Defeat. Combat must first send the
+fatal action-result row (whose death bit drives the client animation), then
+advance population lifecycle through Defeat at its evidenced removal point.
+==================
+*/
+func (s *MonsterState) ApplyDamage(
+	divisionID string,
+	gid uint32,
+	damage uint32,
+) (MonsterDamageResult, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state := s.populationForObject(divisionID, gid)
+	_, ok := state.instances.lookup(gid)
+	if !ok {
+		return MonsterDamageResult{}, false
+	}
+	return s.applyDamageLocked(divisionID, state, MonsterDamagePlan{GID: gid, Damage: damage}), true
+}

@@ -1,0 +1,193 @@
+/*
+===========================================================================
+
+monster_dormancy.go - sleeping populations in empty regions
+
+===========================================================================
+*/
+
+package simulation
+
+import (
+	"opensro.online/server/internal/game/world/monster"
+	"time"
+)
+
+const regionSleepGraceMs int64 = 30000
+
+// EnableRegionDormancy must be installed before tickers start. Nest/unique
+// timers remain global; only safe settled PENDING actors leave the due queue.
+/*
+================
+EnableRegionDormancy
+================
+*/
+func (s *MonsterState) EnableRegionDormancy() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.regionDormancy = true
+}
+
+// prepareDormancy runs before visibility publication. A full sector ring wakes
+// before the much smaller message-block visibility/aggro boundary is reached.
+// It returns the gids it woke, keyed by population (nil when it woke
+// nobody); the leg counts them and tracks their first dispatch (#1820
+// part C).
+/*
+================
+prepareDormancy
+================
+*/
+func (s *MonsterState) prepareDormancy(now int64, division string, sessions []SessionSnapshot) map[populationKey]map[uint32]struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.regionDormancy {
+		return nil
+	}
+	var woken map[populationKey]map[uint32]struct{}
+	for _, key := range s.populationKeys() {
+		if division != "" && key.division != division {
+			continue
+		}
+		state := s.populationForLease(key.division, key.lease)
+		if state == nil {
+			continue
+		}
+		if state.keepAwakeUntil == nil {
+			state.keepAwakeUntil = make(map[uint16]int64)
+		}
+		for _, session := range sessions {
+			if session.DivisionID != key.division || session.Population != key.lease {
+				continue
+			}
+			for _, region := range RegionScopeRing(session.World.LiveSpawnAt(now).RegionID) {
+				state.keepAwakeUntil[region] = now + regionSleepGraceMs
+				for gid := range state.dormantRegions[region] {
+					state.forgetDormant(gid)
+					state.instances.wake(gid)
+					if state.instances.contains(gid) {
+						// Phase-continuous wake (#1820 B part A): the
+						// cadence is caught up to the phase it would
+						// hold had it never slept, then the scheduler
+						// lands the next due time on that phase - the
+						// ring no longer resumes on one tick. (tryDormant
+						// cannot re-sleep it here: keepAwakeUntil was
+						// just set above.)
+						state.movers.catchUpActivity(gid, uint32(now))
+						s.scheduleBehavior(state, gid, now)
+						if woken == nil {
+							woken = make(map[populationKey]map[uint32]struct{})
+						}
+						set := woken[key]
+						if set == nil {
+							set = make(map[uint32]struct{})
+							woken[key] = set
+						}
+						set[gid] = struct{}{}
+					}
+				}
+			}
+		}
+		// Bound serialization/disk work under the authority lock. Actor state
+		// remains hot until its complete record has been written successfully.
+		deadline := time.Now().Add(2 * time.Millisecond)
+		for n := 0; n < 128 && len(state.archiveQueue) > 0 && time.Now().Before(deadline); n++ {
+			gid := state.archiveQueue[0]
+			state.archiveQueue = state.archiveQueue[1:]
+			delete(state.archiveQueued, gid)
+			if _, sleeping := state.dormant[gid]; sleeping {
+				state.instances.freeze(gid)
+			}
+		}
+		if len(state.archiveQueue) == 0 {
+			state.archiveQueue = nil
+		}
+		state.compactDormantIndexes(deadline)
+	}
+	return woken
+}
+
+/*
+================
+tryDormant
+================
+*/
+func (s *MonsterState) tryDormant(state *divisionMonsterState, gid uint32, m moverSchedule, now int64) bool {
+	if !s.regionDormancy || state.keepAwakeUntil == nil {
+		return false
+	}
+	if m.mode != monster.MoverPending || !FeaturesAt(m.regionID).Dormancy {
+		return false
+	}
+	if now < state.keepAwakeUntil[m.regionID] {
+		return false
+	}
+	if !state.movers.compact(gid) {
+		return false
+	}
+	actor, ok := state.instances.lookup(gid)
+	if !ok || actor.Rarity()&15 == 3 || actor.SummonerGID != 0 || actor.NestDetached || !actor.Nest.Respawn || actor.Nest.NativeTacticsFlags&0x84 != 0 {
+		return false
+	}
+	unhurt := actor.CurrentHP == actor.EffectiveMaxHP() && !actor.Help.HasPending() && actor.Abnormal == nil
+	still := actor.Motion == (monster.MotionHold{}) && actor.Opponents == ([2]monster.Opponent{}) && actor.SummonActionUntilMs == 0
+	if !unhurt || !still {
+		return false
+	}
+	if len(state.contributions[gid]) != 0 {
+		return false
+	}
+	if _, ok := state.pendingSummons[gid]; ok {
+		return false
+	}
+	if state.dormant == nil {
+		state.dormant = make(map[uint32]uint16)
+		state.dormantRegions = make(map[uint16]map[uint32]struct{})
+	}
+	region := m.regionID
+	if state.dormantRegions[region] == nil {
+		state.dormantRegions[region] = make(map[uint32]struct{})
+	}
+	state.dormant[gid] = region
+	state.dormantRegions[region][gid] = struct{}{}
+	if state.instances.archive != nil {
+		if state.archiveQueued == nil {
+			state.archiveQueued = make(map[uint32]struct{})
+		}
+		if _, queued := state.archiveQueued[gid]; !queued {
+			state.archiveQueue = append(state.archiveQueue, gid)
+			state.archiveQueued[gid] = struct{}{}
+		}
+	}
+	state.behavior.remove(gid)
+	state.storeAITimer(gid)
+	return true
+}
+
+/*
+================
+forgetDormant
+
+The bank restore has work to do only for an actor that actually
+slept: tryDormant registers the gid in dormant before it stores the
+bank away (storeAITimer), and this function is the only place that
+unregisters one, so a stored bank exists exactly while its gid is
+registered here. The schedulers call this for every due actor, and
+the awake majority used to pay the bank's two gid-map probes for a
+restore that could not fire (#2029: aiTimer was most of this
+function's cost in the seeded leg profile). Probe dormant first;
+the asleep path below is unchanged, restore before unregister.
+================
+*/
+func (state *divisionMonsterState) forgetDormant(gid uint32) {
+	region, ok := state.dormant[gid]
+	if !ok {
+		return
+	}
+	state.aiTimer(gid)
+	delete(state.dormant, gid)
+	delete(state.dormantRegions[region], gid)
+	if len(state.dormantRegions[region]) == 0 {
+		delete(state.dormantRegions, region)
+	}
+}

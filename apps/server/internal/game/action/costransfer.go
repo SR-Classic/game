@@ -1,0 +1,105 @@
+/*
+===========================================================================
+
+costransfer.go - owns costransfer behavior and its checked data boundaries
+
+===========================================================================
+*/
+package action
+
+import (
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+)
+
+// Both inventories belong to the same character authority transaction. Caller
+// holds the division action lock; failed validation changes neither inventory.
+/*
+================
+applyCosTransfer
+================
+*/
+func (rt *Runtime) applyCosTransfer(c *enterworld.Character, q wire.ItemMoveRequest) OpResult {
+	var questFrames []wire.Frame
+	refusalCode := wire.ErrCodeInvalidRequest
+	committed := rt.deps.Update(c, "player-cos-transfer", func() bool {
+		bag, cos, ok := rt.ownedCOSContainer(c, q.CosGID)
+		if !ok {
+			return false
+		}
+		player := bagOf(c)
+		source, dest := player, cos
+		if q.MovementType == wire.MoveTypeCosToPlayer {
+			source, dest = cos, player
+		}
+		item, present := source.At(q.SourceSlot)
+		if !present {
+			return false
+		}
+		// Port-only, not native (halloween.go): a sealed event helmet
+		// never leaves for a companion's bag; bringing one back is fine.
+		if q.MovementType == wire.MoveTypePlayerToCos && rt.HalloweenHelmetSeal.Sealed(item.Codename) {
+			refusalCode = wire.ErrCodeCannotEnterCosBag
+			return false
+		}
+		// A quest item never enters a companion's bag: the native
+		// transfer refuses it on its TypeID class alone (3/3/9), with
+		// no codename exemption, and answers with the client's
+		// cannot-move-to-summon-item banner. The pickup share policy
+		// keeps its own alchemy exemption (isPersonalQuestPickupItem);
+		// this guard does not borrow it.
+		if q.MovementType == wire.MoveTypePlayerToCos && isQuestItemTypeID(item.TypeFlags) {
+			refusalCode = wire.ErrCodeCannotEnterCosBag
+			return false
+		}
+		// Trade goods never enter the personal bag (#3144): they live
+		// in a companion's cargo, sell from it at the specialty shop,
+		// and their authored CanDrop bit bars the ground, so a stack
+		// dragged out of the cargo would be stuck in the bag for
+		// good. The set is the pickup lane's (isPickupTradeGoods:
+		// 3/3/8 with TID4 1 or 2); the event food under the same
+		// TID3 (3.3.8.0) is an ordinary bag item and still crosses.
+		if q.MovementType == wire.MoveTypeCosToPlayer && isPickupTradeGoods(item.TypeFlags) {
+			return false
+		}
+		// Nor does a good leave the bag for a companion: goods load only
+		// at the specialty shop (buysIntoTransport). A row already in a
+		// bag is taken out and refunded by the load-time repair
+		// (traderepair.go) instead.
+		if q.MovementType == wire.MoveTypePlayerToCos && isPickupTradeGoods(item.TypeFlags) {
+			return false
+		}
+		if fault := source.TransferWholeTo(dest, q.SourceSlot, q.DestSlot, rt.maxStackFor(item.TypeFlags, item.Codename)); fault != nil {
+			return false
+		}
+		// Check publication representability before committing the stronger COS
+		// record contract. This excludes bodies the durable row cannot preserve.
+		candidate := *c.CompanionByGID(q.CosGID)
+		candidate.Container = &domain.COSContainer{Capacity: bag.Capacity, Rows: rowsFromInvItems(cos.Items())}
+		refs := rt.deps.ItemReferences().(enterworld.CharacterRefSource)
+		ref, found := refs.CharacterRefByCodename(candidate.Codename)
+		if !found {
+			return false
+		}
+		if _, err := enterworld.BuildCOSRecord(&candidate, ref, rt.deps.ItemReferences()); err != nil {
+			return false
+		}
+		// Rebuilding the player inventory detaches its summoner records. Commit
+		// the bag through that new canonical pet, not the old row's pointer.
+		next := *c
+		next.MissionInventory = rowsFromInvItems(player.Items())
+		retained := next.CompanionByGID(q.CosGID)
+		if retained == nil {
+			return false
+		}
+		retained.Container = candidate.Container
+		c.MissionInventory = next.MissionInventory
+		questFrames = rt.updateQuestInventory(c)
+		return true
+	})
+	if !committed {
+		return failureResult(refusalCode)
+	}
+	return OpResult{Frames: append([]wire.Frame{{Opcode: wire.OpItemMoveResponse, Payload: wire.NewWriter(8).U8(1).U8(q.MovementType).U32(q.CosGID).U8(q.SourceSlot).U8(q.DestSlot).Payload()}}, questFrames...)}
+}

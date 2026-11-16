@@ -1,0 +1,364 @@
+/*
+===========================================================================
+
+window-position-lifecycle.test.mjs - placement through the production UI owner
+
+Deferred assets isolate session lifetime from rendering readiness. Shutdown,
+retained travel and fresh viewport admission use the actual UI entry points.
+Native OnCreate loads saved origins, then its layout overwrites eagerly
+created main/map windows; lazy guide and extended quickslot keep theirs.
+
+===========================================================================
+*/
+import "../helpers/native-source-loader.mjs";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { uiFixture } from "../helpers/ui-fixture.mjs";
+const { createUi } = await import( "../../src/engine/runtime/ui/ui.ts" );
+const { createGameplay } = await import(
+	"../../src/engine/runtime/simulation/worker/session/world/gameplay/gameplay.ts"
+);
+const { defaultExtendedQuickslot } = await import( "../../src/engine/foundation/ui/extended-quickslot.ts" );
+
+/*
+================
+fixture
+================
+*/
+function fixture() {
+	const saved = [];
+	const ui = createUi( {
+		assets: { available: () => 0, request: () => 0, take: () => null, cancel: () => {} },
+		commands: () => {},
+		publish: () => {},
+		texture: () => {},
+		base: "https://fixture.invalid/",
+		apiBase: "https://fixture.invalid/",
+		extensions: { saveWindowPositions: value => saved.push( value ) }
+	} );
+	/** @type {import("../../src/engine/contracts/ui.ts").UiView} */
+	const view = {
+		session: { phase: "world", revision: 1 },
+		gameplay: null,
+		entities: [],
+		width: 1280,
+		height: 720,
+		worldReady: false
+	};
+	return { ui, view, saved };
+}
+
+/** @type {import("../../src/engine/foundation/ui/window-positions.ts").WindowPositions} */
+const RECORD = {
+	width: 1280,
+	height: 720,
+	windows: {
+		mainPopup: [ 220, 90 ],
+		worldMap: [ 240, 80 ],
+		gameGuide: [ 100, 110 ],
+		extendedQuickslot: [ 30, 60 ]
+	}
+};
+const LAID_OUT = {
+	...RECORD,
+	windows: {
+		mainPopup: [ 892, 242 ],
+		store: [ 892, 242 ],
+		storageRoom: [ 892, 242 ],
+		exchange: [ 892, 242 ],
+		// The M window is the v1.188 650 x 422 (map-chrome.ts), centred
+		// in 1280 x 720 at (315, 149); the COS window shares its default.
+		worldMap: [ 315, 149 ],
+		cosWindow: [ 315, 149 ],
+		gameGuide: [ 100, 110 ],
+		alchemyBox: [ 100, 110 ],
+		autoPotion: [ 100, 110 ],
+		extendedQuickslot: [ 30, 60 ]
+	}
+};
+
+test("UI disposal saves an entered session once, without needing a logout frame", () => {
+	const { ui, view, saved } = fixture();
+	ui.event( { kind: "window-positions", value: RECORD } );
+	ui.step( view, 0 );
+	assert.equal( saved.length, 0 );
+	ui.dispose();
+	assert.deepEqual( saved, [ LAID_OUT ] );
+	ui.dispose();
+	assert.equal( saved.length, 1 );
+});
+
+test("logout writes before reset and later disposal does not overwrite it", () => {
+	const { ui, view, saved } = fixture();
+	ui.event( { kind: "window-positions", value: RECORD } );
+	ui.step( view, 0 );
+	ui.step( { ...view, session: { phase: "character-select", revision: 2 } }, 1 );
+	assert.deepEqual( saved, [ LAID_OUT ] );
+	ui.dispose();
+	assert.equal( saved.length, 1 );
+});
+
+test("retained disconnect and reconnect keep the placement session until shutdown", () => {
+	const { ui, view, saved } = fixture();
+	ui.event( { kind: "window-positions", value: RECORD } );
+	ui.step( view, 0 );
+	const game = createGameplay( () => {} );
+	game.seed( { gid: 7, refObjId: 0, kind: "player", name: "Fixture", regionId: 1, x: 0, y: 0, z: 0, heading: 0 } );
+	const gameplay = game.take();
+	assert.ok( gameplay );
+	ui.step( { ...view, gameplay, session: { phase: "disconnected", revision: 2 } }, 1 );
+	ui.step( { ...view, gameplay, session: { phase: "reconnecting", revision: 3 } }, 2 );
+	ui.step( { ...view, gameplay, session: { phase: "world", revision: 4 } }, 3 );
+	assert.equal( saved.length, 0 );
+	ui.dispose();
+	assert.deepEqual( saved, [ LAID_OUT ] );
+});
+
+test("a fresh viewport mismatch clears UI-owned origins and ignores legacy quickslot coordinates", () => {
+	const { ui, view, saved } = fixture();
+	ui.event( { kind: "window-positions", value: RECORD } );
+	ui.event( { kind: "quickslot-preferences", value: { ...defaultExtendedQuickslot(), position: [ 900, 500 ] } } );
+	ui.step( view, 0 );
+	ui.step( { ...view, session: { phase: "character-select", revision: 2 } }, 1 );
+	assert.deepEqual( saved[0], LAID_OUT );
+	ui.step( { ...view, width: 1024, height: 768, session: { phase: "world", revision: 3 } }, 2 );
+	ui.dispose();
+	assert.equal( saved.length, 2 );
+	assert.equal( saved[1].width, 1024 );
+	assert.equal( saved[1].height, 768 );
+	assert.deepEqual( saved[1].windows.mainPopup, [ 636, 290 ] );
+	assert.deepEqual( saved[1].windows.worldMap, [ 187, 173 ] );
+	// The 650 x 422 map centred in 1024 x 768; the legacy [900, 500] is ignored.
+	assert.deepEqual( saved[1].windows.extendedQuickslot, [ 187, 173 ], "old quickslot origin was not restored" );
+});
+
+test("UI disposal before world entry leaves the stored record untouched", () => {
+	const { ui, view, saved } = fixture();
+	ui.event( { kind: "window-positions", value: RECORD } );
+	ui.step( { ...view, session: { phase: "signed-out", revision: 1 } }, 0 );
+	ui.dispose();
+	assert.deepEqual( saved, [] );
+});
+
+test("mismatched placement saves authored eager origins before layout and leaves the live session open", () => {
+	const saved = [];
+	const f = uiFixture( undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+		saveWindowPositions: value => saved.push( value )
+	} );
+	try {
+		f.ui.event( { kind: "window-positions", value: RECORD } );
+		f.ui.step( f.state, 0 );
+		assert.equal( saved.length, 1, "existing mismatched file is replaced as HUD creation completes" );
+		assert.deepEqual( saved[0].windows.mainPopup, [ 595, 262 ] );
+		assert.deepEqual( saved[0].windows.worldMap, [ 100, 100 ] );
+		assert.deepEqual(
+			saved[0].windows.extendedQuickslot,
+			[ 100, 100 ],
+			"quickslot does not exist in prelayout save"
+		);
+		f.ui.step( { ...f.state }, 100 );
+		assert.equal( saved.length, 1, "initial snapshot is written once" );
+		f.dispose();
+		assert.equal( saved.length, 2, "the initial snapshot did not retire this session" );
+		assert.deepEqual( saved[1].windows.mainPopup, [ 1212, 422 ] );
+		// The 650 x 422 map centred in 1600 x 900.
+		assert.deepEqual( saved[1].windows.worldMap, [ 475, 239 ] );
+	} finally {
+		f.dispose();
+	}
+});
+
+test("the map opens without its chrome art when the build lacks it", () => {
+	// #3407: a build made before the later client's map art was imported
+	// has none of these files. They draw nothing, as a native static with
+	// no texture does; they never load, so they must not hold the window.
+	const WMAP = "/assets/images/Media_extracted/interface/worldmap/";
+	const absent = Object.fromEntries( [
+		...[ 1, 2, 3, 4 ].map( n => "wmap_window_edge_" + n + ".png" ),
+		"wmap_wnd_bottom_frame.png",
+		"wmap_wnd_corner_02.png",
+		"wmap_button_automatic.png",
+		"wmap_button_passivity.png"
+	].map( name => [ WMAP + name, { absent: true } ] ) );
+	const f = uiFixture( undefined, undefined, undefined, undefined, undefined, undefined, undefined, {}, absent );
+	try {
+		f.ui.step( f.state, 0 );
+		f.ui.event( { kind: "key", code: "KeyM" } );
+		// A frame that changes nothing publishes no semantics, so look at
+		// every frame's product.
+		let admitted = false;
+		for ( let frame = 1; frame <= 3; frame++ ) {
+			const semantics = f.ui.step( f.state, frame );
+			admitted ||= !!semantics?.controls.some( control => control.id === "map-drag" );
+		}
+		assert.ok( admitted, "the map is admitted without its chrome art" );
+	} finally {
+		f.dispose();
+	}
+});
+
+test("resizing the map saves its displayed clamped origin rather than its old drag coordinates", () => {
+	const saved = [];
+	const f = uiFixture( undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+		saveWindowPositions: value => saved.push( value )
+	} );
+	try {
+		f.ui.step( f.state, 0 );
+		f.ui.event( { kind: "key", code: "KeyM" } );
+		f.ui.step( f.state, 1 );
+		f.ui.event( { kind: "drag", id: "map-drag", dx: 700, dy: 500 } );
+		f.ui.step( f.state, 2 );
+		const resized = { ...f.state, width: 800, height: 600 };
+		const semantics = f.ui.step( resized, 3 );
+		const drag = semantics?.controls.find( control => control.id === "map-drag" );
+		assert.ok( drag, "the resized map is visibly admitted" );
+		const origin = [ drag.rect[0] - 20, drag.rect[1] - 4 ];
+		// Clamped into 800 x 600 by the 650-wide window and its 456-deep
+		// extent (the foot frame reaches 34 below the 422 window).
+		assert.deepEqual( origin, [ 150, 144 ] );
+		f.dispose();
+		assert.deepEqual( saved.at( -1 ).windows.worldMap, origin );
+	} finally {
+		f.dispose();
+	}
+});
+
+for ( const restored of [ false, true ] ) {
+	test(`tiny viewport ${restored ? "remembered" : "default"} guide and quickslot origins stay stable after first display`, () => {
+		const saved = [];
+		const f = uiFixture( undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+			saveWindowPositions: value => saved.push( value )
+		} );
+		try {
+			const view = { ...f.state, width: 300, height: 200 };
+			if ( restored ) {
+				f.ui.event( {
+					kind: "window-positions",
+					value: {
+						width: 300,
+						height: 200,
+						windows: { gameGuide: [ 0, 0 ], extendedQuickslot: [ 0, 0 ] }
+					}
+				} );
+			}
+			f.ui.step( view, 0 );
+			f.ui.event( { kind: "activate", id: "open-window:Game Guide" } );
+			const semantics = f.ui.step( view, 1 );
+			assert.ok( semantics );
+			const drag = semantics?.controls.find( control => control.id === "guide-drag" );
+			assert.ok( drag, "guide has been instantiated" );
+			const nativeOrigin = restored ? [ -120, -252 ] : [ -60, -126 ];
+			assert.equal(
+				drag.draggable,
+				false,
+				"compact fitting preserves native positions by disabling window drags"
+			);
+			const [x, y, width, height] = drag.rect;
+			assert.ok( drag.rect.every( Number.isFinite ) );
+			assert.ok( x >= 0 && y >= 0 && width > 0 && height > 0 );
+			assert.ok( x + width <= view.width && y + height <= view.height );
+			// Since #2408 the compact strip is the touch layout alone: a
+			// fine pointer keeps the native extended bar beside its strip
+			// at any size, fitted into the viewport like the windows.
+			const extDrag = semantics.controls.find( control => control.id === "ext-drag" );
+			assert.ok( extDrag, "a fine pointer keeps the native extended bar at a tiny viewport" );
+			const next = f.ui.step( { ...view }, 200 ) ?? semantics;
+			const nextDrag = next?.controls.find( control => control.id === "guide-drag" );
+			assert.ok( nextDrag );
+			assert.deepEqual( nextDrag.rect, drag.rect, "the fitted title does not drift between frames" );
+			assert.equal( nextDrag.draggable, false );
+			f.dispose();
+			assert.deepEqual( saved.at( -1 ).windows.gameGuide, nativeOrigin );
+			// The bar is created at first display now (#2408), so it saves
+			// the origin it was drawn at - never the fitted coordinates.
+			assert.deepEqual(
+				saved.at( -1 ).windows.extendedQuickslot,
+				restored ? [ 0, 0 ] : [ extDrag.rect[0], extDrag.rect[1] ]
+			);
+		} finally {
+			f.dispose();
+		}
+	});
+}
+
+for ( const guideState of [ "open", "closed", "reopened" ] ) {
+	test(`viewport resize relays layout to live quickslots and ${guideState} guide lifecycle`, () => {
+		const saved = [];
+		const f = uiFixture( undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+			saveWindowPositions: value => saved.push( value )
+		} );
+		try {
+			f.ui.event( {
+				kind: "window-positions",
+				value: {
+					width: 1600,
+					height: 900,
+					windows: { gameGuide: [ 1000, 400 ], extendedQuickslot: [ 1450, 650 ] }
+				}
+			} );
+			f.ui.step( f.state, 0 );
+			f.ui.event( { kind: "activate", id: "open-window:Game Guide" } );
+			f.ui.step( f.state, 1 );
+			if ( guideState !== "open" ) {
+				f.ui.event( { kind: "activate", id: "open-window:Inventory" } );
+				f.ui.step( f.state, 2 );
+			}
+			const resized = { ...f.state, width: 800, height: 600 };
+			let semantics = f.ui.step( resized, 3 );
+			if ( guideState === "reopened" ) {
+				f.ui.event( { kind: "activate", id: "open-window:Game Guide" } );
+				semantics = f.ui.step( resized, 4 );
+			}
+			const expected = guideState === "open" ?
+				[ 190, 74 ] :
+				guideState === "closed" ?
+				[ 1000, 400 ] :
+				[ 380, 148 ];
+			const guide = semantics?.controls.find( control => control.id === "guide-drag" );
+			if ( guideState === "closed" ) assert.equal( guide, undefined );
+			else {
+				assert.ok( guide );
+				assert.deepEqual( [ guide.rect[0] - 10, guide.rect[1] - 5 ], expected );
+			}
+			f.ui.step( { ...resized }, 200 );
+			f.dispose();
+			assert.deepEqual( saved.at( -1 ).windows.gameGuide, expected );
+			assert.deepEqual( saved.at( -1 ).windows.extendedQuickslot, [ 720, 568 ] );
+		} finally {
+			f.dispose();
+		}
+	});
+}
+
+test("Alchemy restores against its native root extent while retaining its visible pane", () => {
+	const saved = [];
+	const f = uiFixture( undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+		saveWindowPositions: value => saved.push( value )
+	} );
+	try {
+		const view = { ...f.state, width: 800, height: 600 };
+		f.ui.event( {
+			kind: "window-positions",
+			value: {
+				width: view.width,
+				height: view.height,
+				windows: { alchemyBox: [ 1000, 1000 ] }
+			}
+		} );
+		f.ui.step( view, 0 );
+		f.ui.event( { kind: "activate", id: "open-window:Alchemy" } );
+		const semantics = f.ui.step( view, 1 );
+		assert.ok(
+			semantics?.controls.some( control => control.id === "window-drag:Alchemy" ),
+			"Alchemy was instantiated"
+		);
+		f.dispose();
+		assert.deepEqual(
+			saved.at( -1 ).windows.alchemyBox,
+			[ 424, 448 ],
+			"native root is 376 by 152, not the tall pane"
+		);
+	} finally {
+		f.dispose();
+	}
+});

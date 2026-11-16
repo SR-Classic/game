@@ -1,0 +1,417 @@
+/*
+===========================================================================
+
+world-admission.test.mjs - worker-prepared world scenes reach the renderer
+
+Preparation keeps every render guard, moves group streams into one
+transferable arena, and the renderer adopts the received storage as is,
+through a one-use lease, across GPU recovery and residency limits.
+
+===========================================================================
+*/
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { build } from "esbuild";
+import { root } from "../../tools/project.mjs";
+// How long a worker answer may take on a loaded machine before the test
+// calls it stranded. Generous: a correct loader answers in milliseconds.
+const ANSWER_TIMEOUT_MS = 10000;
+const result = await build( {
+	stdin: {
+		resolveDir: root,
+		contents: `
+export * from './src/engine/foundation/rendering/world-scene.ts';
+export * from './src/engine/runtime/assets/world-lease.ts';
+export * from './src/engine/runtime/renderer/world/world.ts';
+export * from './src/engine/runtime/random/random.ts';
+`
+	},
+	bundle: true,
+	format: "esm",
+	platform: "node",
+	write: false
+} );
+const {
+	prepareWorldScene,
+	worldSceneTransfers,
+	copyWorldScene,
+	worldSceneBytes,
+	createWorldLease,
+	createWorldRenderer,
+	createPresentationRandom
+} = await import( "data:text/javascript;base64," + Buffer.from( result.outputFiles[0].contents ).toString( "base64" ) );
+const identity = () => new Float32Array( [ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 ] );
+/*
+================
+scene
+================
+*/
+function scene() {
+	return {
+		id: "scene",
+		originRegion: 1,
+		warnings: [],
+		groups: [ {
+			id: "mesh",
+			center: [ 0, 0, 0 ],
+			radius: 10000,
+			material: { color: [ 1, 1, 1, 1 ], alphaCutoff: 0, blend: false, doubleSided: true },
+			geometry: {
+				positions: new Float32Array( [ 0, 0, 0, 1, 0, 0, 0, 1, 0 ] ),
+				normals: new Float32Array( 9 ),
+				uvs: new Float32Array( 6 ),
+				indices: new Uint32Array( [ 0, 1, 2 ] ),
+				transform: identity(),
+				instances: identity()
+			}
+		} ]
+	};
+}
+/*
+================
+transfer
+================
+*/
+function transfer( value ) {
+	const prepared = prepareWorldScene( value );
+	return structuredClone( prepared, { transfer: worldSceneTransfers( prepared.scene ) } );
+}
+
+test("terrain seam plans are rebuilt at admission and transferred with exclusive ownership", () => {
+	const source = scene(), group = source.groups[0];
+	group.geometry.positions = new Float32Array( [ 320, 0, 20, 20, 0, 20, 40, 9, 40 ] );
+	group.ranges = [ {
+		cell: [ 0, 0 ],
+		lod: 0,
+		indexStart: 0,
+		indexCount: 3,
+		vertexStart: 0,
+		vertexCount: 3,
+		center: [ 160, 0, 160 ],
+		radius: 300,
+		heights: Array( 289 ).fill( 0 ),
+		seamVertices: new Uint32Array( [ 999, 999 ] )
+	} ];
+	const prepared = prepareWorldScene( source ), copied = copyWorldScene( source );
+	const plan = prepared.scene.groups[0].ranges[0].seamVertices;
+	assert.deepEqual(
+		[ ...plan ],
+		[ 0, 33, 2, 36 ],
+		"edge plus interior needing authored-height restoration; matching interior omitted"
+	);
+	assert.deepEqual( copied.groups[0].ranges[0].seamVertices, plan );
+	assert.notEqual( copied.groups[0].ranges[0].seamVertices, plan );
+	const received = structuredClone( prepared, { transfer: worldSceneTransfers( prepared.scene ) } );
+	assert.equal( plan.byteLength, 0 );
+	assert.deepEqual( [ ...received.scene.groups[0].ranges[0].seamVertices ], [ 0, 33, 2, 36 ] );
+	const world = createWorldRenderer(),
+		geometry = {
+			/*
+			================
+			upload
+			================
+			*/
+			upload( data ) {
+				return { data };
+			},
+			release() {},
+			updateIndices() {},
+			updatePositions() {}
+		},
+		images = { upload() {}, release() {} };
+	world.adopt( createWorldLease( received ) );
+	world.camera( { eye: [ -960, 500, 10 ], target: [ 160, 0, 160 ], fov: Math.PI / 3, near: 1, far: 5000 } );
+	const frame = world.prepare( geometry, images, 1 );
+	assert.equal( frame.draws[0].data.positions[7], 0, "first selection restores the mismatched interior height" );
+	world.dispose( geometry, images );
+});
+
+/*
+================
+terrainScene
+
+One terrain cell with every vertex attribute, residency as given.
+================
+*/
+function terrainScene( residency ) {
+	const source = scene(), g = source.groups[0].geometry;
+	if ( residency ) source.residency = residency;
+	g.positions = new Float32Array( [ 0, 1, 0, 20, 2, 0, 0, 3, 20 ] );
+	g.normals = new Float32Array( [ 0, 1, 0, .6, .8, 0, 0, .8, .6 ] );
+	g.uvs = new Float32Array( [ 0, 0, 1, 0, 0, 1 ] );
+	g.colors = new Float32Array( [ 1, .5, .25, 1, .5, .25, 1, .75, .25, 1, .5, .5 ] );
+	g.maskUVs = new Float32Array( [ .1, .2, .3, .4, .5, .6 ] );
+	source.groups[0].ranges = [ {
+		cell: [ 0, 0 ],
+		lod: 0,
+		indexStart: 0,
+		indexCount: 3,
+		vertexStart: 0,
+		vertexCount: 3,
+		center: [ 160, 0, 160 ],
+		radius: 300,
+		heights: Array( 289 ).fill( 0 ),
+		seamVertices: new Uint32Array( 0 )
+	} ];
+	return source;
+}
+
+test("terrain transfers only the packed stream it draws and its positions, world and frontend alike", () => {
+	for ( const residency of [ undefined, "frontend" ] ) {
+		const source = terrainScene( residency ), split = source.groups[0].geometry;
+		const prepared = prepareWorldScene( terrainScene( residency ) ),
+			full = worldSceneBytes( terrainScene( residency ) ),
+			received = structuredClone( prepared, { transfer: worldSceneTransfers( prepared.scene ) } ).scene.groups[0]
+				.geometry;
+		for ( const name of [ "normals", "uvs", "colors", "maskUVs" ] ) {
+			assert.equal( received[name], undefined, `${residency ?? "world"} terrain drops split ${name}` );
+		}
+		// The interleave carries every dropped stream: picking reads uv and
+		// colour alpha there (picking.ts).
+		for ( let v = 0; v < split.positions.length / 3; v++ ) {
+			assert.deepEqual( [ ...received.vertices.subarray( v * 14 + 6, v * 14 + 8 ) ], [
+				...split.uvs.subarray( v * 2, v * 2 + 2 )
+			] );
+			assert.equal( received.vertices[v * 14 + 11], split.colors[v * 4 + 3] );
+		}
+		assert.deepEqual( [ ...received.positions ], [ ...split.positions ], "seam stitching keeps its positions" );
+		assert.equal( prepared.bytes, full - (9 + 6 + 12 + 6) * 4, "residency is charged for what is held" );
+	}
+});
+
+// Preparation moves every group stream into one arena: the receiving clone pays per buffer.
+test("worker admission keeps every guard and transfers all skin buffers in one arena", () => {
+	const source = scene(), g = source.groups[0].geometry;
+	g.joints = new Uint32Array( 12 );
+	g.weights = new Float32Array( [ 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 ] );
+	g.bones = identity();
+	const reference = copyWorldScene( source ), prepared = prepareWorldScene( source );
+	assert.equal( prepared.bytes, worldSceneBytes( source ) );
+	const arenas = new Set(
+		Object.values( prepared.scene.groups[0].geometry ).filter( v => ArrayBuffer.isView( v ) ).map( v => v.buffer )
+	);
+	assert.equal( arenas.size, 1, "group streams share one transferable arena" );
+	const buffers = worldSceneTransfers( prepared.scene );
+	assert.equal( new Set( buffers ).size, buffers.length );
+	const received = structuredClone( prepared, { transfer: buffers } );
+	for ( const buffer of buffers ) assert.equal( buffer.byteLength, 0, "sender no longer owns transferred bytes" );
+	for ( const [key, value] of Object.entries( reference.groups[0].geometry ) ) {
+		assert.deepEqual( received.scene.groups[0].geometry[key], value, key );
+	}
+	for ( const field of [ "positions", "normals", "uvs", "instances", "transform" ] ) {
+		const bad = scene();
+		bad.groups[0].geometry[field][0] = NaN;
+		assert.throws( () => prepareWorldScene( bad ) );
+	}
+	for (
+		const mutate of [
+			s => s.groups[0].geometry.indices[2] = 999,
+			s => s.groups[0].material.frames = [ "wrong" ],
+			s => s.groups[0].material.color[3] = Infinity,
+			s => s.groups[0].geometry.weights = new Float32Array( 12 )
+		]
+	) {
+		const bad = scene();
+		mutate( bad );
+		assert.throws( () => prepareWorldScene( bad ) );
+	}
+});
+
+test("adoption consumes one private lease and reuses those exact arrays across GPU recovery", () => {
+	const received = transfer( scene() ), positions = received.scene.groups[0].geometry.positions;
+	const lease = createWorldLease( received ), world = createWorldRenderer(), uploads = [];
+	const geometry = {
+			/*
+			================
+			upload
+			================
+			*/
+			upload( data ) {
+				uploads.push( data );
+				return { data };
+			},
+			release() {}
+		},
+		textures = { upload: () => ({}), release() {} };
+	assert.deepEqual( Object.keys( lease ).sort(), [ "sceneId", "takeWorld" ] );
+	assert.ok( Object.isFrozen( lease ) );
+	world.adopt( lease, "full" );
+	world.prepare( geometry, textures, 1 );
+	assert.equal( uploads[0].positions, positions, "renderer adopted, rather than copied, transferred storage" );
+	assert.throws( () => world.adopt( lease ), /already consumed/ );
+	assert.equal( world.stats().sceneId, "scene" );
+	world.invalidate();
+	world.prepare( geometry, textures, 1 );
+	assert.equal( uploads[1].positions, positions );
+	world.dispose( geometry, textures );
+});
+
+test("shared mutable geometry retains per-group isolation while immutable streams transfer once", () => {
+	const source = scene(), first = source.groups[0];
+	source.groups.push( { ...first, id: "second", geometry: { ...first.geometry } } );
+	const prepared = prepareWorldScene( source ), [a, b] = prepared.scene.groups;
+	assert.notEqual( a.geometry.positions, b.geometry.positions, "terrain seam writes must not mutate another group" );
+	assert.equal( a.geometry.indices, b.geometry.indices, "read-only index source can remain shared" );
+	a.geometry.positions[0] = 123;
+	assert.equal( b.geometry.positions[0], 0 );
+	assert.equal( first.geometry.positions[0], 0 );
+	const moved = structuredClone( prepared, { transfer: worldSceneTransfers( prepared.scene ) } );
+	moved.scene.groups[0].geometry.positions[0] = 456;
+	assert.equal( moved.scene.groups[1].geometry.positions[0], 0 );
+});
+
+test("admission past the residency budget consumes the lease and stages the replacement", () => {
+	const value = scene(), bytes = worldSceneBytes( value ), world = createWorldRenderer( bytes + 16 );
+	const geometry = { upload: () => ({}), release() {} }, textures = { upload: () => ({}), release() {} };
+	world.adopt( createWorldLease( transfer( value ) ) );
+	world.prepare( geometry, textures, 1 );
+	const next = scene();
+	next.id = "replacement";
+	const lease = createWorldLease( transfer( next ) );
+	// The budget is a target, not a limit: the lease is consumed, the
+	// committed world stands until the staged replacement completes.
+	world.adopt( lease );
+	assert.throws( () => lease.takeWorld(), /already consumed/ );
+	assert.equal( world.stats().sceneId, "scene" );
+	world.prepare( geometry, textures, 1 );
+	assert.equal( world.stats().sceneId, "replacement" );
+	assert.equal( world.stats().pendingGroups, 0 );
+	world.dispose( geometry, textures );
+});
+
+test("copied and transferred worlds retain the same application-owned star RNG through replacement", () => {
+	const copied = createWorldRenderer( undefined, undefined, createPresentationRandom( 42 ) ),
+		adopted = createWorldRenderer( undefined, undefined, createPresentationRandom( 42 ) );
+	const geometry = { upload: data => ({ data }), release() {} }, textures = { upload: () => ({}), release() {} };
+	const source = scene();
+	source.groups[0].material.sky = 2;
+	source.environment = { startTimeOfDay: 0, ratePerSecond: 0, tracks: { starAlpha: [ { t: 0, value: 1 } ] } };
+	try {
+		for ( let cycle = 0; cycle < 3; cycle++ ) {
+			copied.scene( structuredClone( source ) );
+			adopted.adopt( createWorldLease( transfer( structuredClone( source ) ) ) );
+			for ( const dt of [ 0, .125, .25 ] ) {
+				const a = copied.prepare( geometry, textures, 1, cycle + dt ),
+					b = adopted.prepare( geometry, textures, 1, cycle + dt );
+				assert.deepEqual( a.environment, b.environment );
+				assert.deepEqual( a.draws.map( d => d.data ), b.draws.map( d => d.data ) );
+			}
+			copied.invalidate();
+			adopted.invalidate();
+		}
+	} finally {
+		copied.dispose( geometry, textures );
+		adopted.dispose( geometry, textures );
+	}
+});
+
+test("failed worker world transfer publishes an error instead of stranding the request", async t => {
+	const bundle = {
+		source: { sectorX: 1, sectorY: 1 },
+		terrain: { blocks: [] },
+		terrainTextures: { tileCatalog: { referencedTiles: [] } },
+		objects: { placements: [], resources: { meshes: [], bsr: [], materialSets: [] } }
+	};
+	t.mock.method( globalThis, "fetch", async () => new Response( JSON.stringify( bundle ) ) );
+	const compiled = await build( {
+		entryPoints: [ `${root}/src/engine/runtime/assets/worker/loader.ts` ],
+		bundle: true,
+		platform: "node",
+		format: "esm",
+		write: false,
+		plugins: [ {
+			name: "pack-io",
+			/*
+			================
+			setup
+			================
+			*/
+			setup( b ) {
+				b.onResolve( { filter: /\.\/packs\/packs$/ }, () => ({ path: "packs", namespace: "fixture" }) );
+				// The stub answers everything the loader asks of the packs owner.
+				// stats() feeds the progress beat, which publishes at once when
+				// 150 ms pass between createLoader and the load: under load that
+				// threw here and became the request's error answer.
+				b.onLoad(
+					{ filter: /.*/, namespace: "fixture" },
+					() => ({
+						contents: `export class AssetAbsentError extends Error {}
+export const createPacks=()=>({worldAnimationManifests:async()=>[],textureVariant(){},stats:()=>({hits:0}),dispose(){}});`
+					})
+				);
+			}
+		} ]
+	} );
+	const { createLoader } = await import(
+		"data:text/javascript;base64," + Buffer.from( compiled.outputFiles[0].contents ).toString( "base64" )
+	);
+	const results = [];
+	// The load chain (fetch, decode, the failing transfer) is asynchronous;
+	// a fixed count of event-loop turns ran out under machine load. Wait
+	// for the answer itself, bounded so a stranded request still fails.
+	let answered;
+	const answer = new Promise( resolve => answered = resolve );
+	const loader = createLoader( result => {
+		if ( result.kind === "world" ) throw Error( "fixture transfer failed" );
+		// Liveness notes (progress, job bytes, the decoding mark) are not answers.
+		if (
+			[ "progress", "job-progress", "job-decoding", "job-fetching", "hd-availability" ].includes( result.kind )
+		) return;
+		results.push( result );
+		answered();
+	} );
+	let timer;
+	try {
+		loader.receive( {
+			kind: "load",
+			id: 1,
+			url: "http://localhost/world.json",
+			limit: 1024 * 1024,
+			decode: "world"
+		} );
+		await Promise.race( [
+			answer,
+			new Promise( resolve => timer = setTimeout( resolve, ANSWER_TIMEOUT_MS ) )
+		] );
+		assert.equal( results.length, 1 );
+		assert.equal( results[0].kind, "error" );
+		assert.match( results[0].error, /fixture transfer failed/ );
+	} finally {
+		clearTimeout( timer );
+		loader.dispose();
+	}
+});
+
+test("terrain boxes are owned and must conservatively enclose the cell and its heights", () => {
+	const value = scene(),
+		range = {
+			cell: [ 0, 0 ],
+			lod: 0,
+			indexStart: 0,
+			indexCount: 3,
+			vertexStart: 0,
+			vertexCount: 3,
+			center: [ 160, 0, 160 ],
+			radius: 230,
+			heights: Array( 289 ).fill( 0 ),
+			bounds: [ 0, 0, 0, 320, 1, 320 ]
+		};
+	value.groups[0].ranges = [ range ];
+	const copied = copyWorldScene( value );
+	assert.notEqual( copied.groups[0].ranges[0].bounds, range.bounds );
+	range.bounds[1] = -10;
+	assert.equal( copied.groups[0].ranges[0].bounds[1], 0 );
+	for (
+		const bounds of [ [ 0, 1, 0, 320, 2, 320 ], [ 1, 0, 0, 320, 1, 320 ], [ 0, 0, 0, 319, 1, 320 ], [
+			0,
+			0,
+			0,
+			320,
+			1,
+			NaN
+		], [ 0, 0, 0, 320, 1 ] ]
+	) {
+		range.bounds = bounds;
+		assert.throws( () => worldSceneBytes( value ), /terrain/i );
+	}
+});

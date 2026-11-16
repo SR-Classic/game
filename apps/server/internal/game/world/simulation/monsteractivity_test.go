@@ -1,0 +1,466 @@
+package simulation
+
+import (
+	"testing"
+
+	worldgeom "opensro.online/server/internal/game/world"
+	"opensro.online/server/internal/game/world/monster"
+)
+
+func activityFixture(t *testing.T) (*MonsterMoverOps, monster.Instance, int64) {
+	t.Helper()
+	ops, actor := monsterLegFixture(t, passiveTactics())
+	const now int64 = 10000
+	m, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	ops.startWanderLeg(monsterTestDivision, &actor, passiveTactics(), m, now)
+	m, _ = ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	m.Activity = monster.ActivityCadence{Interval: 1000, LastCheck: uint32(now)}
+	m.BehaviorDeadlineMs = now + 500 // activity gate must take precedence when both expire
+	ops.Monsters.CommitMover(monsterTestDivision, actor.Gid, m)
+	return ops, actor, now
+}
+
+func TestActivitySuspendsUnobservedActorAndPreservesMovement(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	original, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	ops.RunMonsterLeg(now+1001, nil, &fakePusher{})
+	m, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if m.Mode() != monster.MoverPending || m.From != original.From || m.To != original.To || m.ArriveMs != original.ArriveMs {
+		t.Fatalf("activity did not suspend AI independently of movement: %+v", m)
+	}
+	ops.RunMonsterLeg(original.ArriveMs, nil, &fakePusher{})
+	m, _ = ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if m.Mode() != monster.MoverPending || m.ArriveMs != 0 || m.Pose != original.To {
+		t.Fatalf("PENDING arrival incorrectly resumed AI: %+v", m)
+	}
+}
+
+func TestActivityDeadPlayerResumesAtCadenceNotVisibilityAdmission(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	ops.RunMonsterLeg(now+1001, nil, &fakePusher{})
+	asleep, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if asleep.Mode() != monster.MoverPending {
+		t.Fatal("not pending")
+	}
+	p := playerSessionAt(1, 1000, 1000)
+	p.CombatEligible = false
+	ops.RunMonsterLeg(now+2001, []SessionSnapshot{p}, &fakePusher{})
+	m, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if m.Mode() != monster.MoverPending {
+		t.Fatal("resumed at equality")
+	}
+	ops.RunMonsterLeg(now+2002, []SessionSnapshot{p}, &fakePusher{})
+	m, _ = ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if m.Mode() != monster.MoverWandering || m.DepartMs != now+2002 || m.BehaviorDeadlineMs <= now+2002 {
+		t.Fatalf("resume must re-enter WANDER with new movement/deadline: %+v", m)
+	}
+}
+
+func TestActivityForeignPartitionCannotKeepMonsterAwake(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	p := playerSessionAt(1, 1000, 1000)
+	p.WorldInstance = 0x20001
+	ops.RunMonsterLeg(now+1001, []SessionSnapshot{p}, &fakePusher{})
+	m, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if m.Mode() != monster.MoverPending {
+		t.Fatalf("foreign world kept actor active: %v", m.Mode())
+	}
+}
+
+func TestActivityRetaliationInvalidatesSuspensionAndWakesScheduledActor(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	before, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	after := before
+	after.Activity.Due(uint32(now + 1001))
+	mustMoverTransition(&after, monster.MoverEventActivityLost, 0)
+	if !ops.Monsters.ArmRetaliation(monsterTestDivision, actor.Gid, PlayerObjectID(1)) {
+		t.Fatal("hit refused")
+	}
+	if ops.Monsters.commitActivity(monsterTestDivision, actor.Gid, before, after, now+1001) {
+		t.Fatal("stale suspension replaced retaliation")
+	}
+	batches := ops.Monsters.behaviorBatches(now + 1)
+	found := false
+	for _, b := range batches {
+		for _, a := range b.actors {
+			found = found || a.gid == actor.Gid
+		}
+	}
+	if !found {
+		t.Fatal("retaliation did not wake queue entry")
+	}
+}
+
+/*
+================
+TestCommitActivityCadenceOnlyStampsCadence
+
+An idle re-check commit that moves only the activity clock stores
+exactly the committed value (stamped in place, not rebuilt: the
+interest bounds and the pending row's shared handle never carried
+the cadence), and a commit that moves anything else still lands in
+full (#2136). Read back through Mover, the read the gate trusts.
+================
+*/
+func TestCommitActivityCadenceOnlyStampsCadence(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	before, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	after := before
+	if !after.Activity.Due(uint32(now + 1001)) {
+		t.Fatal("fixture cadence did not fire")
+	}
+	if !ops.Monsters.commitActivity(monsterTestDivision, actor.Gid, before, after, now+1001) {
+		t.Fatal("cadence-only commit rejected")
+	}
+	got, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if got != after {
+		t.Fatalf("stored mover differs from cadence-only commit:\n got %+v\nwant %+v", got, after)
+	}
+	moved := after
+	moved.Pose.X += 25
+	if !ops.Monsters.commitActivity(monsterTestDivision, actor.Gid, after, moved, now+1001) {
+		t.Fatal("pose-carrying commit rejected")
+	}
+	got, _ = ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if got != moved {
+		t.Fatal("pose change did not land in full")
+	}
+}
+
+/*
+================
+TestActivityGateReportsGenerationAdvance
+
+The step chains its generation-guarded commits off the gate's
+last answer (#2136): a due re-check that suspends rewrites the
+row - the stored generation moves and the answer must say so,
+or the step would chain off the generation it read at dispatch.
+The settled re-check beside a viewer is pinned cadence-only by
+the golden leg test; this pins the rewriting half.
+================
+*/
+func TestActivityGateReportsGenerationAdvance(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	_, genBefore, _ := ops.Monsters.MoverGeneration(monsterTestDivision, actor.Gid)
+	ops.activity = ops.captureActivity(nil, now+1001)
+	current, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	_, gated, handled, generationAdvanced := ops.runActivityGate(monsterTestDivision, &actor, current, now+1001)
+	if !handled || gated.Mode() != monster.MoverPending {
+		t.Fatalf("unobserved actor was not suspended: %v", gated.Mode())
+	}
+	if !generationAdvanced {
+		t.Fatal("suspension rewrote the row but the gate denied advancing the generation")
+	}
+	if _, genAfter, _ := ops.Monsters.MoverGeneration(monsterTestDivision, actor.Gid); genAfter == genBefore {
+		t.Fatal("suspension did not advance the stored generation")
+	}
+}
+
+/*
+================
+TestCommitActivityCadenceOnlySkipsValidate
+
+A cadence-only commit moves nothing Validate guards: the stored
+row passed validation when its own commit wrote it, and the pair
+differs only in the cadence stamp. Re-validating the whole state
+on every due re-check is the deferred remainder of the gate's
+write set (#2029), so the cadence arm must not run it. The proof
+installs a row no full commit would accept (a wandering mover
+retaining an attack-plan field): the cadence commit still lands
+and stamps, while a pose-carrying commit of the same row keeps
+panicking - the full path's validation is untouched.
+================
+*/
+func TestCommitActivityCadenceOnlySkipsValidate(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	s := ops.Monsters
+	corrupt, _ := s.Mover(monsterTestDivision, actor.Gid)
+	corrupt.AttackCooldownMs = 5
+	s.mu.Lock()
+	s.populationForObject(monsterTestDivision, actor.Gid).movers.set(actor.Gid, corrupt)
+	s.mu.Unlock()
+
+	after := corrupt
+	if !after.Activity.Due(uint32(now + 1001)) {
+		t.Fatal("fixture cadence did not fire")
+	}
+	if !s.commitActivity(monsterTestDivision, actor.Gid, corrupt, after, now+1001) {
+		t.Fatal("cadence-only commit rejected")
+	}
+	// Read the raw row, not Mover: the gate's read validates, and
+	// this row is installed precisely because it cannot pass.
+	s.mu.Lock()
+	got, ok := s.populationForObject(monsterTestDivision, actor.Gid).movers.lookup(actor.Gid)
+	s.mu.Unlock()
+	if !ok {
+		t.Fatal("cadence-only commit lost the row")
+	}
+	if got.Activity != after.Activity || got.AttackCooldownMs != corrupt.AttackCooldownMs {
+		t.Fatalf("cadence-only commit rebuilt the row: %+v", got)
+	}
+
+	moved := after
+	moved.Pose.X += 25
+	panicked := false
+	func() {
+		defer func() { panicked = recover() != nil }()
+		s.commitActivity(monsterTestDivision, actor.Gid, after, moved, now+1001)
+	}()
+	if !panicked {
+		t.Fatal("pose-carrying commit of an invalid row did not panic")
+	}
+}
+
+/*
+================
+TestCommitActivityCadenceOnlySkipsApproachSync
+
+Approach membership derives from the mover's mode and target and
+the instance's squad eligibility (monsterapproach.go). A
+cadence-only commit moves none of them - the activity gate, its
+only production source, never holds a chasing or attacking row
+(MaySuspendWander admits wandering, the other gate arm is pending) -
+so it must not re-derive membership: an eligibility flip waits for
+the next full commit, which still syncs (#2136).
+================
+*/
+func TestCommitActivityCadenceOnlySkipsApproachSync(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	s := ops.Monsters
+	approachTarget := func() (uint32, bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		target, ok := s.populationForObject(monsterTestDivision, actor.Gid).approachActors[actor.Gid]
+		return target, ok
+	}
+	setSummoner := func(gid uint32) {
+		s.mu.Lock()
+		state := s.populationForObject(monsterTestDivision, actor.Gid)
+		member := state.instances.get(actor.Gid)
+		member.SummonerGID = gid
+		state.instances.set(actor.Gid, member)
+		s.mu.Unlock()
+	}
+
+	// A squad-eligible chaser, engaged by a full commit, is a member.
+	setSummoner(999)
+	mover, _ := s.Mover(monsterTestDivision, actor.Gid)
+	if mover.Mode() == monster.MoverSpawning {
+		mustMoverTransition(&mover, monster.MoverEventSpawnHoldElapsed, 0)
+	}
+	mustMoverTransition(&mover, monster.MoverEventAggroAcquired, squadTestTarget)
+	if !s.CommitMover(monsterTestDivision, actor.Gid, mover) {
+		t.Fatal("engage commit refused")
+	}
+	if target, ok := approachTarget(); !ok || target != squadTestTarget {
+		t.Fatalf("full commit did not record approach membership: %v %v", target, ok)
+	}
+
+	// Eligibility flips off; the cadence-only commit must not notice.
+	setSummoner(0)
+	before, _ := s.Mover(monsterTestDivision, actor.Gid)
+	after := before
+	after.Activity.LastCheck++
+	if !cadenceOnlyWrite(before, after) {
+		t.Fatal("fixture commit is not cadence-only")
+	}
+	if !s.commitActivity(monsterTestDivision, actor.Gid, before, after, now+1001) {
+		t.Fatal("cadence-only commit rejected")
+	}
+	if target, ok := approachTarget(); !ok || target != squadTestTarget {
+		t.Fatalf("cadence-only commit re-derived approach membership: %v %v", target, ok)
+	}
+
+	// The next full commit syncs again and the membership goes.
+	moved := after
+	moved.Pose.X += 25
+	if !s.commitActivity(monsterTestDivision, actor.Gid, after, moved, now+1001) {
+		t.Fatal("full commit rejected")
+	}
+	if _, ok := approachTarget(); ok {
+		t.Fatal("full commit did not re-derive approach membership")
+	}
+}
+
+func TestActivityProductionTickerRetainsUnobservedDivision(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	source := &fakeSource{}
+	ticker := newTestTicker(source, &fakePusher{})
+	ticker.Monsters = ops
+	ticker.RunTick(now + 1001)
+	m, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if m.Mode() != monster.MoverPending {
+		t.Fatal("last viewer removal dropped AI work before PENDING")
+	}
+	source.sessions = []SessionSnapshot{playerSessionAt(1, 1000, 1000)}
+	ticker.RunTick(now + 2002)
+	m, _ = ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if m.Mode() != monster.MoverWandering {
+		t.Fatal("returning PC did not resume retained population")
+	}
+}
+
+func TestActivityOldGenerationCannotResumePopulation(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	p := playerSessionAt(1, 1000, 1000)
+	p.Population.Generation++
+	ops.RunMonsterLeg(now+1001, []SessionSnapshot{p}, &fakePusher{})
+	m, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if m.Mode() != monster.MoverPending {
+		t.Fatal("another lifetime of the same world kept actor awake")
+	}
+}
+
+func TestSummonFactoryBindsControllerAndExemptsActivity(t *testing.T) {
+	ops, parent, child, now := followFixture(t)
+	m, _ := ops.Monsters.Mover("summon", child.Gid)
+	if m.ControllerGID() != parent.Gid || m.ControlMode() != monster.ControlSummoned {
+		t.Fatal("summon omitted CSNM 11 mode 2")
+	}
+	mustMoverTransition(&m, monster.MoverEventStartWander, 0)
+	m.Activity = monster.ActivityCadence{Interval: 1000, LastCheck: uint32(now)}
+	m.BehaviorDeadlineMs = now + 10000
+	ops.Monsters.CommitMover("summon", child.Gid, m)
+	ops.activity = ops.captureActivity(nil, now+1001)
+	frames, _, handled, _ := ops.runActivityGate("summon", &child, m, now+1001)
+	after, _ := ops.Monsters.Mover("summon", child.Gid)
+	if handled || len(frames) != 0 || after != m {
+		t.Fatal("controlled actor ran unobserved suspension/cadence")
+	}
+}
+
+func TestPendingResumeRefusedWanderFallsBackThroughEntryOwner(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	ops.RunMonsterLeg(now+1001, nil, &fakePusher{})
+	ops.Monsters.mu.Lock()
+	state := ops.Monsters.populationForObject(monsterTestDivision, actor.Gid)
+	row := state.instances.get(actor.Gid)
+	row.Ref.RunSpeed = 0
+	state.instances.set(actor.Gid, row)
+	ops.Monsters.mu.Unlock()
+	ops.RunMonsterLeg(now+2002, []SessionSnapshot{playerSessionAt(1, 1000, 1000)}, &fakePusher{})
+	m, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if m.Mode() != monster.MoverIdle || m.LastEvent() != monster.MoverEventEntryRefused {
+		t.Fatal("failed WANDER entry did not enter IDLE")
+	}
+}
+
+func TestPendingInboxPrecedesResumeAndWakesSleepingActor(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	ops.RunMonsterLeg(now+1001, nil, &fakePusher{})
+	before, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if err := ops.Monsters.DeliverMonsterHelp(monsterTestDivision, actor.Gid, helpPayload(1, 999999, 0, 0, 999998)); err != nil {
+		t.Fatal(err)
+	}
+	// A rejected command still consumes this tick, before the due PENDING
+	// callback could see the returning PC and resume WANDER.
+	p := playerSessionAt(1, 1000, 1000)
+	ops.RunMonsterLeg(now+2002, []SessionSnapshot{p}, &fakePusher{})
+	after, _ := ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	row, _ := ops.Monsters.Get(monsterTestDivision, actor.Gid)
+	if _, pending := row.Help.Pending(); pending {
+		t.Fatal("PENDING stranded its inbox")
+	}
+	if after.Mode() != monster.MoverPending || after.Activity != before.Activity {
+		t.Fatal("state callback ran before queued command")
+	}
+	ops.RunMonsterLeg(now+2003, []SessionSnapshot{p}, &fakePusher{})
+	after, _ = ops.Monsters.Mover(monsterTestDivision, actor.Gid)
+	if after.Mode() != monster.MoverWandering {
+		t.Fatal("consumed command prevented subsequent resume")
+	}
+}
+
+func TestPendingResumePreservesIndependentOpponentLedger(t *testing.T) {
+	ops, actor, now := activityFixture(t)
+	ops.RunMonsterLeg(now+1001, nil, &fakePusher{})
+	ledger := [2]monster.Opponent{{GID: PlayerObjectID(1), LastHitMs: 500}, {GID: PlayerObjectID(2), LastHitMs: 501}}
+	ops.Monsters.mu.Lock()
+	state := ops.Monsters.populationForObject(monsterTestDivision, actor.Gid)
+	row := state.instances.get(actor.Gid)
+	row.Opponents = ledger
+	state.instances.set(actor.Gid, row)
+	ops.Monsters.mu.Unlock()
+	ops.RunMonsterLeg(now+2002, []SessionSnapshot{playerSessionAt(3, 1000, 1000)}, &fakePusher{})
+	row, _ = ops.Monsters.Get(monsterTestDivision, actor.Gid)
+	if row.Opponents != ledger {
+		t.Fatal("WANDER resume cleared opponent memory without a release event")
+	}
+}
+
+/*
+================
+TestActivityBlockForMemoizesByPose
+
+The gate's block memo answers a standing pose from the memo, a
+moved actor resolves fresh and refreshes its one memo in place,
+and returning to the first pose re-resolves it - the pointer
+behind the map changes none of the pose guard's answers (#3027).
+================
+*/
+func TestActivityBlockForMemoizesByPose(t *testing.T) {
+	ops := &MonsterMoverOps{}
+	at := Spawn{RegionID: 1, X: 1000, Z: 1000}
+	block, ok := ops.activityBlockFor(7, at)
+	if !ok {
+		t.Fatal("outdoor pose did not resolve a block")
+	}
+	if again, _ := ops.activityBlockFor(7, at); again != block {
+		t.Fatal("standing pose resolved a different block")
+	}
+	moved := at
+	moved.X += 5000
+	fresh, _ := ops.activityBlockFor(7, moved)
+	if fresh == block {
+		t.Fatal("moved actor kept its old block")
+	}
+	if back, _ := ops.activityBlockFor(7, at); back != block {
+		t.Fatal("returned actor did not re-resolve its first block")
+	}
+	if len(ops.activityBlocks) != 1 {
+		t.Fatalf("memo holds %d actors, want the one refreshed memo", len(ops.activityBlocks))
+	}
+	if _, ok := ops.activityBlockFor(8, at); !ok || len(ops.activityBlocks) != 2 {
+		t.Fatal("a second actor did not get its own memo")
+	}
+}
+
+/*
+================
+TestActivitySnapshotCountedHereFollowsTheAskedWorld
+
+The gate's census verdict answers off the asked world's counts:
+a block counted under another world is inactive here, an
+uncounted block is inactive everywhere, and rotating the asked
+world (the snapshot's per-batch world) moves the answers with
+it (#3027).
+================
+*/
+func TestActivitySnapshotCountedHereFollowsTheAskedWorld(t *testing.T) {
+	here := activityWorld{division: "a", world: 1, generation: 1}
+	there := activityWorld{division: "a", world: 2, generation: 1}
+	counted := worldgeom.MessageBlock{X: 3, Z: 4}
+	foreign := worldgeom.MessageBlock{X: 9, Z: 9}
+	snap := &monsterActivitySnapshot{counts: map[activityWorld]map[worldgeom.MessageBlock]uint16{
+		here:  {counted: 2},
+		there: {foreign: 1},
+	}}
+	snap.askWorld(here)
+	if !snap.countedHere(counted) {
+		t.Fatal("counted block inactive in its own world")
+	}
+	if snap.countedHere(foreign) {
+		t.Fatal("another world's block active here")
+	}
+	if snap.countedHere(worldgeom.MessageBlock{X: 1}) {
+		t.Fatal("uncounted block active")
+	}
+	snap.askWorld(there)
+	if !snap.countedHere(foreign) || snap.countedHere(counted) {
+		t.Fatal("answers did not follow the asked world")
+	}
+	snap.askWorld(activityWorld{division: "a", world: 3, generation: 1})
+	if snap.countedHere(counted) || snap.countedHere(foreign) {
+		t.Fatal("uncounted world active")
+	}
+}

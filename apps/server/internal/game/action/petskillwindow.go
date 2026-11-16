@@ -1,0 +1,269 @@
+/*
+===========================================================================
+
+petskillwindow.go - kind-3 timed pet-skill windows on the magic-state board
+
+Tracks per-character timed pet-skill item windows and retires expired rows
+on each action tick under the division operation lock.
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"math"
+	"sort"
+	"sync"
+
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/enterworld"
+	wire "opensro.online/server/internal/game/item/wire"
+)
+
+/*
+================
+petSkillItemType
+
+The magic-state board's kind-3 slot (client 67A470 -> 6E6E00) is driven by
+an item whose RefItemData+0x29C Param1 is authored in SECONDS. The
+classification and the remaining-seconds rule live in enterworld so the
+item-use path, the tick sweep and the world-entry re-raise share one owner.
+================
+*/
+func petSkillItemType(typeIDs [4]int64) bool { return enterworld.PetSkillItemType(typeIDs) }
+
+/*
+================
+itemParam1Seconds
+
+itemParam1Seconds reads RefItemData+0x29C for a family whose Param1 unit is
+seconds. The projection publishes the column unscaled because the unit
+belongs to the consumer: the same column is minutes for a COS summoner and
+milliseconds for a recall scroll.
+================
+*/
+func itemParam1Seconds(ref *enterworld.ItemRef) int64 {
+	if ref == nil || ref.NativeFields == "" {
+		return 0
+	}
+	seconds, ok := ref.NativeFields.Lookup("itemParam1_29c")
+	if !ok || math.IsNaN(seconds) || math.IsInf(seconds, 0) || math.Trunc(seconds) != seconds || seconds <= 0 || seconds*1000 > float64(^uint32(0)) {
+		return 0
+	}
+	return int64(seconds)
+}
+
+// petSkillWindowCapacity bounds one character's live rows. Client 6E6150 keys a
+// row by kind and id, so distinct items stack rather than replace; the same
+// item restarts its own row.
+const petSkillWindowCapacity = 8
+
+/*
+================
+upsertPetSkillWindow
+================
+*/
+func upsertPetSkillWindow(windows []domain.PetSkillWindow, itemRefObjID uint32, codename string, endUnixMs int64) []domain.PetSkillWindow {
+	for i := range windows {
+		if windows[i].ItemRefObjID == itemRefObjID {
+			windows[i].Codename = codename
+			windows[i].EndUnixMs = endUnixMs
+			return windows
+		}
+	}
+	if len(windows) >= petSkillWindowCapacity {
+		return windows
+	}
+	return append(windows, domain.PetSkillWindow{ItemRefObjID: itemRefObjID, Codename: codename, EndUnixMs: endUnixMs})
+}
+
+/*
+================
+petSkillWindowRemaining
+================
+*/
+func petSkillWindowRemaining(window domain.PetSkillWindow, nowMs int64) uint32 {
+	return enterworld.PetSkillWindowRemaining(window.EndUnixMs, nowMs)
+}
+
+/*
+================
+petSkillWindowIndex
+
+The owners one timed-row sweep (pet-skill windows, param jobs, PK
+records) walks. sorted caches the owners in keys() order between
+membership turns: the sweeps run every tick, the membership turns
+only when track hands an owner in or a sweep forgets an empty one,
+so the per-tick rebuild and re-sort bought the same list (#2033).
+================
+*/
+type petSkillWindowIndex struct {
+	mu     sync.Mutex
+	owners map[petOwnerKey]struct{}
+	sorted []petOwnerKey
+}
+
+/*
+================
+track
+================
+*/
+func (index *petSkillWindowIndex) track(divisionID, characterName string) {
+	index.mu.Lock()
+	defer index.mu.Unlock()
+	if index.owners == nil {
+		index.owners = map[petOwnerKey]struct{}{}
+	}
+	key := petOwnerKey{division: divisionID, name: characterName}
+	if _, ok := index.owners[key]; !ok {
+		// A new owner turns the membership; re-tracking a live
+		// one leaves the cached order standing.
+		index.sorted = nil
+	}
+	index.owners[key] = struct{}{}
+}
+
+/*
+================
+keys
+
+The owners in (division, name) order - unique in an index, so the
+order is total and the cached list is the list a fresh sort builds.
+A rebuild always allocates a fresh slice and the cache swaps to it
+whole: a sweep ranging the list while it forgets an owner mid-range
+(forget drops the cache, not the backing) never sees it move.
+Callers only range the result.
+================
+*/
+func (index *petSkillWindowIndex) keys() []petOwnerKey {
+	index.mu.Lock()
+	defer index.mu.Unlock()
+	if index.sorted != nil {
+		return index.sorted
+	}
+	keys := make([]petOwnerKey, 0, len(index.owners))
+	for key := range index.owners {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].division != keys[j].division {
+			return keys[i].division < keys[j].division
+		}
+		return keys[i].name < keys[j].name
+	})
+	index.sorted = keys
+	return keys
+}
+
+/*
+================
+forget
+================
+*/
+func (index *petSkillWindowIndex) forget(key petOwnerKey) {
+	index.mu.Lock()
+	defer index.mu.Unlock()
+	if _, ok := index.owners[key]; ok {
+		delete(index.owners, key)
+		index.sorted = nil
+	}
+}
+
+/*
+================
+TrackPetSkillWindows
+
+TrackPetSkillWindows hands a character to the tick sweep. World entry calls
+it through enterworld.Deps.TrackTimedWindows, because the sweep's index is
+otherwise filled only by item use and a relogged window would never retire.
+================
+*/
+func (rt *Runtime) TrackPetSkillWindows(divisionID, characterName string) {
+	rt.petSkillWindows.track(divisionID, characterName)
+}
+
+/*
+================
+TrackTimedWindows
+
+World entry hands a character with any timed row to every sweep that owns
+one: pet-skill windows and param jobs (paramjob.go).
+================
+*/
+func (rt *Runtime) TrackTimedWindows(divisionID, characterName string) {
+	rt.petSkillWindows.track(divisionID, characterName)
+	rt.paramJobOwners.track(divisionID, characterName)
+}
+
+/*
+================
+advancePetSkillWindows
+
+advancePetSkillWindows retires each spent row with the native zero pair,
+which client 775F20 turns into 6E6150's remove selector. An exhausted
+window is not self-retiring on the client: CIFMagicStateBoard_OnUpdate holds the row at zero
+because only server teardown may remove it.
+================
+*/
+func (rt *Runtime) advancePetSkillWindows(nowMs int64) {
+	type retirement struct {
+		key    petOwnerKey
+		frames []wire.Frame
+	}
+	var due []retirement
+	for _, key := range rt.petSkillWindows.keys() {
+		frames, empty := rt.advancePetSkillWindowsInDivision(key, nowMs)
+		if empty {
+			rt.petSkillWindows.forget(key)
+		}
+		if len(frames) > 0 {
+			due = append(due, retirement{key: key, frames: frames})
+		}
+	}
+	for _, row := range due {
+		if rt.PushCharacterFrames != nil {
+			rt.PushCharacterFrames(row.key.division, row.key.name, row.frames)
+		}
+	}
+}
+
+/*
+================
+advancePetSkillWindowsInDivision
+
+Retires the owner's expired pet skill windows. PetSkillWindows is persisted,
+so the compaction runs inside the tick-batched character door (#1836): the
+division lock alone neither excludes a concurrent Snapshot under the read
+door nor marks the record dirty. The door commits only when a window
+actually expired.
+================
+*/
+func (rt *Runtime) advancePetSkillWindowsInDivision(key petOwnerKey, nowMs int64) ([]wire.Frame, bool) {
+	unlock := rt.lockDivision(key.division)
+	defer unlock()
+	character := rt.findCharacter(key.division, key.name)
+	if character == nil {
+		return nil, false
+	}
+	var frames []wire.Frame
+	empty := false
+	rt.deps.UpdateDeferred(character, "pet-skill-windows", func() bool {
+		kept := character.PetSkillWindows[:0]
+		for _, window := range character.PetSkillWindows {
+			if window.EndUnixMs > nowMs {
+				kept = append(kept, window)
+				continue
+			}
+			frames = append(frames, wire.Frame{
+				Opcode:  wire.OpCosStateRefresh,
+				Payload: wire.EncodeCosSummonTimerRetire3691(window.ItemRefObjID),
+			})
+		}
+		retired := len(kept) != len(character.PetSkillWindows)
+		character.PetSkillWindows = kept
+		empty = len(kept) == 0
+		return retired
+	})
+	return frames, empty
+}

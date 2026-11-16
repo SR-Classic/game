@@ -1,0 +1,324 @@
+/*
+===========================================================================
+
+beta_settings_test.go - beta settings survive validated job materialization
+
+Exercises deployment resolution and Nomad's JSON variable boundary without
+live jobs or licensed assets. Invalid beta values must fail before catalog
+or asset discovery, even when their gameplay feature is switched off.
+
+===========================================================================
+*/
+
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"opensro.online/server/internal/config/shardsettings"
+	"opensro.online/server/internal/game/action"
+)
+
+/*
+================
+clearShardSettingsEnv
+
+Deployment tests choose every setting explicitly rather than inheriting
+the operator's shell or a durable mastery policy from the shared cluster.
+================
+*/
+func clearShardSettingsEnv(t *testing.T) {
+	t.Helper()
+	for _, setting := range shardsettings.Settings {
+		t.Setenv(setting.Env, "")
+	}
+}
+
+/*
+================
+betaSettingsOptions
+================
+*/
+func betaSettingsOptions(t *testing.T) commandOptions {
+	t.Helper()
+	return commandOptions{
+		ModuleRoot: filepath.Clean("../../.."),
+		StateDir:   t.TempDir(),
+		Namespace:  "sro",
+		Network:    "game-private",
+		AgentPort:  8787,
+		PrivateNet: true,
+	}
+}
+
+/*
+================
+betaSettingsVariables
+
+Checks the same resolved values serialized for the Nomad job request.
+================
+*/
+func betaSettingsVariables(t *testing.T) map[string]any {
+	t.Helper()
+	resolved, err := resolveDeployment(betaSettingsOptions(t), false)
+	if err != nil {
+		t.Fatalf("resolveDeployment: %v", err)
+	}
+	payload, err := jobVariablesJSON(resolved.gameVariables(shardDeployment{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var variables map[string]any
+	if err := json.Unmarshal([]byte(payload), &variables); err != nil {
+		t.Fatalf("decode job variables: %v", err)
+	}
+	return variables
+}
+
+/*
+================
+TestBetaSettingsDeploymentDefaults
+
+The public defaults are native (#606): a deployment that names no beta
+value runs the original rules, the durable mastery policy included
+(betamastery.go).
+================
+*/
+func TestBetaSettingsDeploymentDefaults(t *testing.T) {
+	clearShardSettingsEnv(t)
+	variables := betaSettingsVariables(t)
+	want := map[string]string{
+		"beta_starter_kit":       "off",
+		"beta_player_map":        "off",
+		"beta_mastery":           "off",
+		"beta_silk":              "off",
+		"beta_silk_active_only":  "off",
+		"beta_growth":            "off",
+		"beta_growth_bands":      "",
+		"beta_skill_exp_rate":    "1",
+		"beta_drop_rate":         "1",
+		"beta_drop_mix":          "off",
+		"beta_drop_cap":          "0",
+		"beta_gold_rate":         "1",
+		"beta_rare_rate":         "1",
+		"beta_shop_only_degree9": "off",
+		"beta_seal_rates":        "off",
+		"beta_unique_respawn":    "off",
+	}
+	for name, expected := range want {
+		if got := variables[name]; got != expected {
+			t.Errorf("%s = %#v, want %q", name, got, expected)
+		}
+	}
+}
+
+/*
+================
+TestBetaSettingsProductionProfile
+
+Our deployment's beta values (config/shard-settings.json, which the
+release passes as sro-nomad's environment) name only table-filled
+settings, pass the deployer's validation and reach the job unchanged.
+================
+*/
+func TestBetaSettingsProductionProfile(t *testing.T) {
+	clearShardSettingsEnv(t)
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "config", "shard-settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile map[string]string
+	if err := json.Unmarshal(data, &profile); err != nil {
+		t.Fatalf("shard-settings.json: %v", err)
+	}
+	if len(profile) == 0 {
+		t.Fatal("shard-settings.json names no setting")
+	}
+	tableVar := map[string]string{}
+	for _, setting := range shardsettings.Settings {
+		if setting.Source == shardsettings.FromTable {
+			tableVar[setting.Env] = setting.NomadVar
+		}
+	}
+	for name, value := range profile {
+		if _, ok := tableVar[name]; !ok {
+			t.Fatalf("shard-settings.json names %s, which is not a table-filled shard setting", name)
+		}
+		t.Setenv(name, value)
+	}
+	variables := betaSettingsVariables(t)
+	for name, value := range profile {
+		if got := variables[tableVar[name]]; got != value {
+			t.Errorf("%s reached the job as %#v, want %q", name, got, value)
+		}
+	}
+}
+
+/*
+================
+TestBetaSettingsDeploymentOff
+================
+*/
+func TestBetaSettingsDeploymentOff(t *testing.T) {
+	clearShardSettingsEnv(t)
+	for _, setting := range shardsettings.Settings {
+		if strings.HasPrefix(setting.Env, "SRO_BETA_") &&
+			setting.Source == shardsettings.FromTable &&
+			setting.Validation == shardsettings.ValueSwitch {
+			t.Setenv(setting.Env, "off")
+		}
+	}
+	t.Setenv("SRO_BETA_DROP_MIX", "off")
+	t.Setenv("SRO_BETA_SILK", "off")
+	variables := betaSettingsVariables(t)
+	for _, name := range []string{
+		"beta_starter_kit", "beta_player_map", "beta_growth", "beta_drop_mix",
+		"beta_silk", "beta_shop_only_degree9", "beta_seal_rates", "beta_unique_respawn",
+	} {
+		if got := variables[name]; got != "off" {
+			t.Errorf("%s = %#v, want explicit off", name, got)
+		}
+	}
+	if got := variables["beta_mastery"]; got != "off" {
+		t.Fatalf("durable mastery default = %#v, want native off", got)
+	}
+}
+
+/*
+================
+TestBetaSettingsDeploymentNumericBoundaries
+================
+*/
+func TestBetaSettingsDeploymentNumericBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		env, variable string
+		accepted      []string
+		refused       []string
+	}{
+		{"SRO_BETA_SKILL_EXP_RATE", "beta_skill_exp_rate", []string{"1", "9223372036854775807"},
+			[]string{"0", "-1", "9223372036854775808", "typo"}},
+		{"SRO_BETA_DROP_RATE", "beta_drop_rate", []string{"1", "100"},
+			[]string{"0", "101", "999999999999999999999", "typo"}},
+		{"SRO_BETA_DROP_CAP", "beta_drop_cap", []string{"0", "1000"},
+			[]string{"-1", "1001", "999999999999999999999", "typo"}},
+		{"SRO_BETA_GOLD_RATE", "beta_gold_rate", []string{"1", "10000"},
+			[]string{"0", "10001", "999999999999999999999", "typo"}},
+		{"SRO_BETA_RARE_RATE", "beta_rare_rate", []string{"1", "1000"},
+			[]string{"0", "1001", "999999999999999999999", "typo"}},
+		{"SRO_BETA_SILK", "beta_silk", []string{"1", "100000"},
+			[]string{"-1", "100001", "4294967296", "typo"}},
+	} {
+		t.Run(test.env, func(t *testing.T) {
+			for _, value := range test.accepted {
+				t.Run("accept "+value, func(t *testing.T) {
+					clearShardSettingsEnv(t)
+					t.Setenv(test.env, " \t"+value+"\n")
+					variables := betaSettingsVariables(t)
+					if got := variables[test.variable]; got != value {
+						t.Fatalf("%s = %#v, want trimmed %q", test.variable, got, value)
+					}
+					if test.env == "SRO_BETA_SILK" && value == "1" {
+						rate, err := action.ParseBetaSilk(variables[test.variable].(string))
+						if err != nil || rate != 1 {
+							t.Fatalf("silk 1 = %d, %v; want one silk per hour", rate, err)
+						}
+					}
+				})
+			}
+			for _, value := range test.refused {
+				t.Run("refuse "+value, func(t *testing.T) {
+					clearShardSettingsEnv(t)
+					t.Setenv("SRO_BETA_GROWTH", "off")
+					t.Setenv(test.env, value)
+					_, err := resolveDeployment(betaSettingsOptions(t), false)
+					if err == nil || !strings.Contains(err.Error(), test.env) {
+						t.Fatalf("%s=%q with growth off: got %v", test.env, value, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+/*
+================
+TestBetaSettingsDeploymentDropMix
+================
+*/
+func TestBetaSettingsDeploymentDropMix(t *testing.T) {
+	for _, value := range []string{
+		"equipment=100,potion=1", "assigned=1,ammo=100", "off", "on",
+	} {
+		t.Run(value, func(t *testing.T) {
+			clearShardSettingsEnv(t)
+			t.Setenv("SRO_BETA_DROP_MIX", " \t"+value+"\n")
+			if got := betaSettingsVariables(t)["beta_drop_mix"]; got != value {
+				t.Fatalf("beta_drop_mix = %#v, want %q", got, value)
+			}
+		})
+	}
+	for _, value := range []string{
+		"unknown=1", "potion=0", "potion=101", "potion=1,POTION=2", "potion", "typo",
+	} {
+		t.Run("refuse "+value, func(t *testing.T) {
+			clearShardSettingsEnv(t)
+			t.Setenv("SRO_BETA_GROWTH", "off")
+			t.Setenv("SRO_BETA_DROP_MIX", value)
+			_, err := resolveDeployment(betaSettingsOptions(t), false)
+			if err == nil || !strings.Contains(err.Error(), "SRO_BETA_DROP_MIX") {
+				t.Fatalf("invalid mix %q with growth off: got %v", value, err)
+			}
+		})
+	}
+}
+
+/*
+================
+TestBetaSettingsValidationPrecedesCatalogDiscovery
+================
+*/
+func TestBetaSettingsValidationPrecedesCatalogDiscovery(t *testing.T) {
+	for _, setting := range shardsettings.Settings {
+		if !strings.HasPrefix(setting.Env, "SRO_BETA_") || setting.Source != shardsettings.FromTable {
+			continue
+		}
+		t.Run(setting.Env, func(t *testing.T) {
+			clearShardSettingsEnv(t)
+			t.Setenv(setting.Env, "typo")
+			options := betaSettingsOptions(t)
+			options.Catalog = filepath.Join(t.TempDir(), "missing-catalog.json")
+			_, err := resolveDeployment(options, false)
+			if err == nil || !strings.Contains(err.Error(), setting.Env) ||
+				strings.Contains(err.Error(), "shard catalog") {
+				t.Fatalf("invalid beta setting before missing catalog: got %v", err)
+			}
+		})
+	}
+}
+
+/*
+================
+TestBetaSettingsSnapshotOwnsValidatedValues
+================
+*/
+func TestBetaSettingsSnapshotOwnsValidatedValues(t *testing.T) {
+	clearShardSettingsEnv(t)
+	t.Setenv("SRO_BETA_DROP_RATE", "7")
+	t.Setenv("SRO_GM_SETSPEED", "operator-specific")
+	settings := portOnlySettingsFromEnv()
+	t.Setenv("SRO_BETA_DROP_RATE", "typo")
+	if err := settings.validate(); err != nil {
+		t.Fatalf("captured valid snapshot rejected after environment change: %v", err)
+	}
+	variables := (&deployment{PortOnly: settings}).gameVariables(shardDeployment{})
+	if got := variables["beta_drop_rate"]; got != "7" {
+		t.Fatalf("captured beta_drop_rate = %#v, want 7", got)
+	}
+	if got := variables["gm_setspeed"]; got != "operator-specific" {
+		t.Fatalf("unchecked setting = %#v, want unchanged operator value", got)
+	}
+}

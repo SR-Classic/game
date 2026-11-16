@@ -1,0 +1,256 @@
+# ===========================================================================
+# source-linux.yml - prove release inputs on a clean Linux checkout.
+# These checks need no extracted game data or deployment credentials. Asset
+# verification remains in the full client check on a licensed asset workspace.
+# The full Go gate (check_go_server.mjs) runs here, once: Linux runners build
+# and restore the Go cache several times faster than Windows ones, and a
+# GOOS=windows vet keeps the operator tools building for Windows. A pull
+# request runs only the jobs its files can affect; a push to main runs all.
+# ===========================================================================
+name: Validate Linux source
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+# A newer push to the same pull request supersedes the running validation.
+concurrency:
+  group: source-linux-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      client: ${{ steps.diff.outputs.client }}
+      server: ${{ steps.diff.outputs.server }}
+    steps:
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -z "$PR" ]; then printf 'client=true\nserver=true\n' >> "$GITHUB_OUTPUT"; exit 0; fi
+          files=$(gh api "repos/${{ github.repository }}/pulls/$PR/files" --paginate --jq '.[].filename')
+          # Shared inputs (workflows, lockfile, task runner) affect both sides.
+          shared='^(\.github/|pnpm-lock\.yaml|pnpm-workspace\.yaml|package\.json|scripts/tasks/)'
+          match() { printf '%s\n' "$files" | grep -qE "$1|$shared" && echo true || echo false; }
+          echo "client=$(match '^(apps/client-next/|packages/)')" >> "$GITHUB_OUTPUT"
+          # The Go gate also reads the pipeline paths and its own scripts.
+          echo "server=$(match '^(apps/server/|scripts/checks/(check_go_server|checkStamps)\.mjs|scripts/build/world/paths\.mjs)')" >> "$GITHUB_OUTPUT"
+
+  client-source:
+    needs: changes
+    if: needs.changes.outputs.client == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/setup@v3
+        with:
+          runtime: node@24
+          require-lockfile: true
+      - name: Require dependency inputs to remain unchanged
+        run: git diff --exit-code HEAD -- pnpm-lock.yaml pnpm-workspace.yaml package.json ':(glob)apps/*/package.json'
+      - name: Verify client without generated retail assets
+        # The tight test budgets bind where the profile was measured
+        # (docs/agents/client-test-profile.md); the runner's defaults
+        # stay loose for the unmeasured full lane (#2929).
+        env:
+          SRO_TEST_FILE_BUDGET_MS: "20000"
+          SRO_TEST_SUITE_BUDGET_MS: "300000"
+        run: node apps/client-next/tools/check.mjs --source=gates
+
+  # Every runtime test file that reads no built asset (ops #335 row 1: the
+  # lane ran a hand-picked 17 of 766, so the rest regressed unseen until a
+  # release build). Its own runner: beside the typechecks on one two-core
+  # runner the ~600 test processes took the job from 87-132 s to 220-230 s.
+  client-runtime:
+    needs: changes
+    if: needs.changes.outputs.client == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/setup@v3
+        with:
+          runtime: node@24
+          require-lockfile: true
+      - name: Run the asset-free runtime tests
+        env:
+          SRO_TEST_FILE_BUDGET_MS: "20000"
+          SRO_TEST_SUITE_BUDGET_MS: "300000"
+        run: node apps/client-next/tools/check.mjs --source=runtime
+
+  # The repository source policies that cover server files too. source-check
+  # (check.yml) skips a server-only pull request, so without this job such a
+  # pull request ran none of them (#881 merged a file past the size limit).
+  # Each gate needs only Node and the runner's Python, no node_modules. A mixed pull
+  # request also runs them in source-check; this job does not depend on that
+  # workflow's file filter, at the cost of a minute.
+  server-policy:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # One step per gate (the task runner takes one task), each run even
+      # after an earlier one fails so a pull request sees every problem.
+      - name: Source size
+        run: node scripts/task.mjs check:source-size
+      - name: Source encoding
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:source-encoding
+      - name: Doc links
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:doc-links
+      - name: Generated root
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:generated-root
+      - name: Shared fixtures
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:shared-fixtures
+      # The whole-tree citation ledger: a server-only change that moves a
+      # ledgered line into another file must fail here, since source-check
+      # skips server-only pull requests.
+      - name: Server citations
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:server-citations
+      # The plane owner (#1646): on the server only simulation and movement
+      # plane.go may read the dungeon region bit; #1906 slipped one past.
+      - name: Plane branches
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:plane-branches
+      # Both check generated server outputs against their sources: the
+      # compiled quest package (internal/game/quest) and the loot catalogs
+      # (internal/game/item/loot/.generated). Standard-library Python only.
+      - name: Compiled quests
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:compiled-quests
+      - name: Loot catalog
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:loot-catalog
+      # The client's pet design module against the server's design JSON.
+      - name: Pet design
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:pet-design
+      # The client protocol against config/compatibility.json, the release
+      # declaration the server ships.
+      - name: Release
+        if: ${{ !cancelled() }}
+        run: node scripts/task.mjs check:release
+
+  server-source:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Every Go command of the job compiles with -trimpath, as the gate's
+      # own steps do (scripts/lib/goEnvironment.mjs): one build-cache key.
+      GOFLAGS: -trimpath
+    # The Go gate spread over four runners: on one 4-core runner its steps
+    # fought for the CPU (race 271 s). Each shard gets the whole machine.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - { name: static, gates: "tidy,tidy (lint tool),gofmt,vet,govulncheck,release contract" }
+          - { name: lint, gates: "golangci-lint" }
+          - { name: tests, gates: "tests" }
+          - { name: race, gates: "race" }
+    name: server-source (${{ matrix.shard.name }})
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: apps/server/go.mod
+          # The build, test and lint caches below are keyed per commit;
+          # setup-go's go.sum-only key never saved a newer cache.
+          cache: false
+      - name: Go build, test and lint caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            ~/.cache/golangci-lint
+          # Each run saves under its commit and restores the newest cache of
+          # the same shard and go.sum: unchanged packages keep their cached
+          # test results and compiled objects.
+          key: go-${{ matrix.shard.name }}-${{ hashFiles('apps/server/go.sum', 'apps/server/tools/golangci-lint/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ matrix.shard.name }}-${{ hashFiles('apps/server/go.sum', 'apps/server/tools/golangci-lint/go.sum') }}-
+      - name: Go server gate (${{ matrix.shard.gates }})
+        env:
+          SRO_GO_GATES: ${{ matrix.shard.gates }}
+        run: node scripts/checks/check_go_server.mjs
+      - name: Repeated handshake accounting
+        if: matrix.shard.name == 'race'
+        working-directory: apps/server
+        run: go test -race -count=100 -run '^TestTransportMetricsEndpoint$' ./internal/transport
+      - name: Windows build of the server and its operator tools
+        if: matrix.shard.name == 'static'
+        working-directory: apps/server
+        env:
+          GOOS: windows
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+  # The one check from this workflow a ruleset can require (a job skipped by
+  # `if:` satisfies a required check). It always runs and fails when a job
+  # failed, or was skipped although this pull request's files needed it.
+  gate-summary:
+    name: gate-summary (linux)
+    needs: [changes, client-source, client-runtime, server-policy, server-source]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every Linux gate this change needs passed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          CLIENT: ${{ needs.changes.outputs.client }}
+          SERVER: ${{ needs.changes.outputs.server }}
+          CLIENT_SOURCE: ${{ needs.client-source.result }}
+          CLIENT_RUNTIME: ${{ needs.client-runtime.result }}
+          SERVER_POLICY: ${{ needs.server-policy.result }}
+          SERVER_SOURCE: ${{ needs.server-source.result }}
+        run: |
+          [ "$CHANGES" = success ] || { echo "changes: $CHANGES"; exit 1; }
+          failed=0
+          # need NAME RESULT NEEDED: success passes, a skip passes only when
+          # the change did not need the job, anything else fails.
+          need() {
+            case "$2" in
+              success) echo "$1: success" ;;
+              skipped) if [ "$3" = true ]; then echo "$1 was skipped although this change needs it"; failed=1; else echo "$1: not needed"; fi ;;
+              *) echo "$1: $2"; failed=1 ;;
+            esac
+          }
+          need client-source "$CLIENT_SOURCE" "$CLIENT"
+          need client-runtime "$CLIENT_RUNTIME" "$CLIENT"
+          need server-policy "$SERVER_POLICY" "$SERVER"
+          need server-source "$SERVER_SOURCE" "$SERVER"
+          exit $failed

@@ -1,0 +1,216 @@
+/*
+===========================================================================
+
+time.go - admitted quest-minute pulses and mission-item cleanup
+
+Ordinary timed quests abort at zero. Captured-monster timers instead release
+their item and retain the quest. Both transitions commit under one character
+door and publish only the resulting inventory and journal state.
+
+===========================================================================
+*/
+package quest
+
+import (
+	"fmt"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/inventory"
+	"opensro.online/server/internal/game/item/wire"
+)
+
+/*
+================
+packQuestMinutes
+
+The server's journal timer packs hours/minutes, not milliseconds: the hours split into days
+(hours / 24) and the hour of the day. v1.150 5C2A30 consumes days at bit
+10, hours at bit 15 and minutes at bit 20.
+================
+*/
+func packQuestMinutes(minutes uint16) uint32 {
+	hours := uint32(minutes / 60)
+	return (hours/24)&0x1f<<10 | (hours%24)<<15 | uint32(minutes%60)&0x3f<<20
+}
+
+/*
+================
+AdvanceMinute
+
+Runs from the admitted character's action pulse. The server initializes +4
+when it accepts the quest, resumes it on login and advances ordinary quest
+time from its per-quest tick. Disconnect removes
+the actor and preserves remaining minutes instead of spending offline time.
+================
+*/
+func (rt *Runtime) AdvanceMinute(c *enterworld.Character) []wire.Frame {
+	var out []wire.Frame
+	committed := rt.deps.UpdateDeferred(c, "quest-minute", func() bool {
+		if c == nil || c.DeletePending {
+			return false
+		}
+		changed := false
+		for at := 0; at < len(c.ActiveQuests); {
+			record := c.ActiveQuests[at]
+			def, ok := rt.Defs.ByRefID(record.RefID)
+			if ok {
+				if rule, capture := captureRuleForQuest(def.Codename); capture {
+					var frames []wire.Frame
+					var advanced bool
+					if record.RemainingMinutes == 0 && captureItemCount(c, rule.item) > 0 {
+						frames, advanced = rt.releaseCapture(c, at, rule, rule.expired)
+					} else {
+						frames, advanced = rt.advanceCaptureMinute(c, at, rule)
+					}
+					out = append(out, frames...)
+					changed = changed || advanced
+					at++
+					continue
+				}
+			}
+			if ok && waitingBranch(def, record) {
+				frames, advanced := advanceWaitMinute(c, def, at)
+				out = append(out, frames...)
+				changed = changed || advanced
+				at++
+				continue
+			}
+			if !ok || def.TimeLimitMinutes == 0 {
+				at++
+				continue
+			}
+			if record.RemainingMinutes > 0 {
+				record.RemainingMinutes--
+			}
+			if record.RemainingMinutes == 0 {
+				// Native automatic abort uses the same mission-item cleanup as
+				// cancellation. Plan the complete removal before committing it.
+				rows, frames, err := rt.planQuestCleanup(c, def)
+				if err != nil {
+					// Retain an expired, non-rewardable record if the inventory
+					// transaction cannot commit. A later pulse retries cleanup.
+					if c.ActiveQuests[at].RemainingMinutes != 0 {
+						record.Progress = 0
+						record.Flags |= 4
+						c.ActiveQuests[at] = record
+						delta := record
+						delta.Flags = 4
+						out = append(out, wire.Frame{Opcode: OpQuestUpdate, Payload: EncodeQuestUpdateUpdate(delta)})
+						changed = true
+					}
+					at++
+					continue
+				}
+				c.MissionInventory = rows
+				out = append(out, frames...)
+				c.ActiveQuests = append(append([]enterworld.ActiveQuestRecord(nil), c.ActiveQuests[:at]...), c.ActiveQuests[at+1:]...)
+				if len(frames) > 0 {
+					updates, _ := rt.applyInventoryChange(c)
+					out = append(out, updates...)
+				}
+				out = append(out, wire.Frame{Opcode: OpQuestUpdate, Payload: EncodeQuestUpdateAbandon(record.RefID)})
+				if def.TimeoutSymbol != "" {
+					out = append(out, wire.Frame{Opcode: 0x36bf, Payload: wire.NewWriter(64).U16(uint16(len(def.TimeoutSymbol))).Bytes([]byte(def.TimeoutSymbol)).Payload()})
+				}
+				changed = true
+				continue
+			}
+			record.Progress = packQuestMinutes(uint16(record.RemainingMinutes))
+			record.Flags |= 4
+			c.ActiveQuests[at] = record
+			if record.RemainingMinutes%10 == 0 {
+				delta := record
+				delta.Flags = 4
+				out = append(out, wire.Frame{Opcode: OpQuestUpdate, Payload: EncodeQuestUpdateUpdate(delta)})
+			}
+			changed = true
+			at++
+		}
+		return changed
+	})
+	if !committed {
+		return nil
+	}
+	return out
+}
+
+/*
+================
+planQuestCleanup
+
+The server's abort-and-cleanup removes all stacks of each mission item. Display progress is capped
+at the objective count; cleanup uses inventory truth, including surplus.
+================
+*/
+func (rt *Runtime) planQuestCleanup(c *enterworld.Character, def *Definition) ([]enterworld.InventoryRow, []wire.Frame, error) {
+	codes := make(map[uint32]string)
+	for i := 0; i < missionCount(def); i++ {
+		m := missionDefinition(def, i)
+		if m.Objective == ObjectiveCollect {
+			codes[m.CollectItemRefID] = m.CollectItemCodename
+		}
+	}
+	counts := make(map[string]uint32)
+	var order []string
+	for _, row := range c.MissionInventory {
+		code := codes[uint32(row.RefObjID)]
+		if code == "" || !inventory.InBag(c, row.Slot) {
+			continue
+		}
+		if counts[code] == 0 {
+			order = append(order, code)
+		}
+		counts[code] += uint32(max(row.StackCount, 1))
+	}
+	var consume []inventory.ItemAmount
+	for _, code := range order {
+		consume = append(consume, inventory.ItemAmount{Codename: code, Count: counts[code]})
+	}
+	consume = append(consume, deliveryCleanup(c, def)...)
+	consume = append(consume, captureSupplyCleanup(c, def)...)
+	consume = append(consume, questToolCleanup(c, def)...)
+	if len(consume) == 0 {
+		return c.MissionInventory, nil, nil
+	}
+	if rt.PlanInventory == nil {
+		return nil, nil, fmt.Errorf("quest cleanup inventory owner unavailable")
+	}
+	return rt.PlanInventory(c, consume, nil)
+}
+
+/*
+================
+advanceWaitMinute
+
+The server's Rahid 2 wait tick, once per online minute while the branch is not yet achieved
+(+0xA): a positive count (+0xC) drops by one, and the journal timer is
+sent (0x30D5) unless the new count is a multiple of ten. A count
+already at zero sets the achieved word, announces the branch's achieved-now
+line and republishes the record (slot 0x114), so the branch stands
+achieved on the minute after the last one is spent.
+================
+*/
+func advanceWaitMinute(c *enterworld.Character, def *Definition, at int) ([]wire.Frame, bool) {
+	record := c.ActiveQuests[at]
+	if record.WaitAchieved {
+		return nil, false
+	}
+	if record.WaitMinutes == 0 {
+		record.WaitAchieved = true
+		c.ActiveQuests[at] = record
+		branch, _ := recordBranch(def, record)
+		delta := record
+		delta.Flags = 4
+		update := wire.Frame{Opcode: OpQuestUpdate, Payload: EncodeQuestUpdateUpdate(delta)}
+		return []wire.Frame{update, questNotification(branch.AchievedNowSymbol)}, true
+	}
+	record.WaitMinutes--
+	record.Progress = packQuestMinutes(record.WaitMinutes)
+	record.Flags |= 4
+	c.ActiveQuests[at] = record
+	if record.WaitMinutes%10 == 0 {
+		return nil, true
+	}
+	delta := record
+	delta.Flags = 4
+	return []wire.Frame{{Opcode: OpQuestUpdate, Payload: EncodeQuestUpdateUpdate(delta)}}, true
+}

@@ -1,0 +1,714 @@
+/*
+===========================================================================
+
+runtime_position.go - where a character stands, and writing it back
+
+Split from runtime.go on its own responsibility: reading a character's
+mutable state through the authority door (characterSnapshot) and every
+question about its live pose - spawn resolution, navigation constraint
+and ground-walk admission - ending in the record write-back
+(writeBackWorld). The movement lane's reads and the kill lane's victim
+lookups cross the package through these; nothing else lives here.
+
+===========================================================================
+*/
+package action
+
+import (
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+/*
+==================
+characterSnapshot
+
+characterSnapshot copies mutable character state while the authority read
+door is held. Identity fields (ID and Name) never change after creation,
+but inventory, progression, deletion state, and world state must never be
+read through the live pointer outside a door.
+==================
+*/
+func (rt *Runtime) characterSnapshot(
+	divisionID string,
+	character *enterworld.Character,
+) *enterworld.Character {
+	if character == nil {
+		return nil
+	}
+	// While a tick hook runs, this whole root family serves one
+	// epoch-checked copy per character and kind (tick_snapshots.go).
+	cached, epoch, ok := rt.tickSnapshot(tickSnapshotFull, character)
+	if ok {
+		return cached
+	}
+
+	var snapshot *enterworld.Character
+
+	rt.deps.Read(divisionID, func() {
+		snapshot = character.Snapshot()
+	})
+	rt.storeTickSnapshot(tickSnapshotFull, character, epoch, snapshot)
+
+	return snapshot
+}
+
+/*
+==================
+characterSnapshotAdmitted
+
+characterSnapshotAdmitted copies mutable character state while the
+authority read door is held, but only when admit accepts the live
+record: a rejected target never pays for its detached copy (#1820
+part C). admit reads record fields only - it opens no door, the same
+contract every read-door visitor already honours - so its verdict
+weighs the same inputs characterSnapshot's copy would carry. The
+copy's only normalizations (stat points, mission mask) feed neither
+the life, deletion, world-instance nor companion facts admission
+reads, and an admitted record detaches exactly as characterSnapshot
+detaches it: same door, same publication lock, same copy.
+==================
+*/
+func (rt *Runtime) characterSnapshotAdmitted(
+	divisionID string,
+	character *enterworld.Character,
+	admit func(*enterworld.Character) bool,
+) *enterworld.Character {
+	if character == nil {
+		return nil
+	}
+	cached, epoch, ok := rt.tickSnapshot(tickSnapshotFull, character)
+	if ok {
+		// Admission still judges the live record under the door; the
+		// cached copy stands in for the clone because its epoch proves
+		// the record unchanged since the copy was taken.
+		if rt.characterAdmitted(divisionID, character, admit) {
+			return cached
+		}
+		return nil
+	}
+
+	var snapshot *enterworld.Character
+
+	rt.deps.Read(divisionID, func() {
+		if admit != nil && !admit(character) {
+			return
+		}
+		snapshot = character.Snapshot()
+	})
+	rt.storeTickSnapshot(tickSnapshotFull, character, epoch, snapshot)
+
+	return snapshot
+}
+
+/*
+==================
+characterAdmitted
+
+characterSnapshotAdmitted's door contract without the copy: the
+admission verdict alone, judged on the live record under the one read
+door, for readers that ask only whether the record passes (#2139).
+admit reads record fields only, the same contract as above, so its
+verdict weighs the same inputs the copy would carry.
+==================
+*/
+func (rt *Runtime) characterAdmitted(
+	divisionID string,
+	character *enterworld.Character,
+	admit func(*enterworld.Character) bool,
+) bool {
+	if character == nil {
+		return false
+	}
+
+	admitted := false
+
+	rt.deps.Read(divisionID, func() {
+		admitted = admit == nil || admit(character)
+	})
+
+	return admitted
+}
+
+/*
+==================
+characterSnapshotEquipment
+
+characterSnapshot for readers that never leave the worn equipment and
+never read the avatar inventory: the copy keeps only the equipment
+rows and no AvatarInventory. Convert a call site only when every
+reader of the copy is cleared for the narrow rows root by root (#1943
+transitive audit) - a bag or avatar reader would silently see its
+rows missing. Companion resolution walks bag rows (Companions reaches
+the row Summon records), so a reader of this copy must never resolve
+companions.
+==================
+*/
+func (rt *Runtime) characterSnapshotEquipment(
+	divisionID string,
+	character *enterworld.Character,
+) *enterworld.Character {
+	if character == nil {
+		return nil
+	}
+	cached, epoch, ok := rt.tickSnapshot(tickSnapshotEquipment, character)
+	if ok {
+		return cached
+	}
+
+	var snapshot *enterworld.Character
+
+	rt.deps.Read(divisionID, func() {
+		snapshot = character.SnapshotEquipment()
+	})
+	rt.storeTickSnapshot(tickSnapshotEquipment, character, epoch, snapshot)
+
+	return snapshot
+}
+
+/*
+==================
+characterSnapshotCombat
+
+characterSnapshot for the combat roots (#1943): equipment rows and the
+whole avatar inventory, no bag rows. A root takes it only when no
+reader of its copy reads a bag row or resolves companions; the
+combat-copy differential test pins each converted root against the full
+copy.
+==================
+*/
+func (rt *Runtime) characterSnapshotCombat(
+	divisionID string,
+	character *enterworld.Character,
+) *enterworld.Character {
+	if character == nil {
+		return nil
+	}
+	if rt.combatCopy != nil {
+		return rt.combatCopy(divisionID, character)
+	}
+	cached, epoch, ok := rt.tickSnapshot(tickSnapshotCombat, character)
+	if ok {
+		return cached
+	}
+
+	var snapshot *enterworld.Character
+
+	rt.deps.Read(divisionID, func() {
+		snapshot = character.SnapshotCombat()
+	})
+	rt.storeTickSnapshot(tickSnapshotCombat, character, epoch, snapshot)
+
+	return snapshot
+}
+
+/*
+==================
+characterSnapshotCast
+
+characterSnapshot for the skill press, the prepared-cast release
+(#1943), the entry action-speed read (#2140) and the abnormal killer
+capture (abnormal_sources.go, #1943): the combat rows plus
+every companion-carrying bag row and the whole avatar inventory. The
+press flows resolve the caster's companions through this copy (the
+crow lane walks the bag-row Summon records, at the strike both routes
+reach); the entry read's load-bearing inventory inputs are its slot-8
+suit and cape verdicts, and its stat writers walk the same kept
+companion rows, so the copy keeps exactly those bag rows; a root takes it only when
+every reader of its copy is cleared for the dropped plain bag rows
+root by root, and the cast-copy differential tests pin every root
+against the full copy.
+==================
+*/
+func (rt *Runtime) characterSnapshotCast(
+	divisionID string,
+	character *enterworld.Character,
+) *enterworld.Character {
+	if character == nil {
+		return nil
+	}
+	if rt.castCopy != nil {
+		return rt.castCopy(divisionID, character)
+	}
+	cached, epoch, ok := rt.tickSnapshot(tickSnapshotCast, character)
+	if ok {
+		return cached
+	}
+
+	var snapshot *enterworld.Character
+
+	rt.deps.Read(divisionID, func() {
+		snapshot = character.SnapshotCast()
+	})
+	rt.storeTickSnapshot(tickSnapshotCast, character, epoch, snapshot)
+
+	return snapshot
+}
+
+/*
+==================
+characterSnapshotCombatAdmitted
+
+characterSnapshotCombat with characterSnapshotAdmitted's door
+contract: the copy is detached only when admit accepts the live
+record. A root takes it under the same audit as characterSnapshotCombat
+- no reader of the copy reads a bag row or resolves companions. The
+combatCopy seam replaces the copy in tests exactly as it does for
+characterSnapshotCombat; admission still judges the live record
+first, in its own door pass, so a refused record pays for no copy
+under the seam either.
+=================
+*/
+func (rt *Runtime) characterSnapshotCombatAdmitted(
+	divisionID string,
+	character *enterworld.Character,
+	admit func(*enterworld.Character) bool,
+) *enterworld.Character {
+	if character == nil {
+		return nil
+	}
+	if rt.combatCopy != nil {
+		admitted := admit == nil
+		if !admitted {
+			rt.deps.Read(divisionID, func() {
+				admitted = admit(character)
+			})
+		}
+		if !admitted {
+			return nil
+		}
+		return rt.combatCopy(divisionID, character)
+	}
+
+	cached, epoch, ok := rt.tickSnapshot(tickSnapshotCombat, character)
+	if ok {
+		// Admission still judges the live record under the door; the
+		// cached copy stands in for the clone because its epoch proves
+		// the record unchanged since the copy was taken.
+		if rt.characterAdmitted(divisionID, character, admit) {
+			return cached
+		}
+		return nil
+	}
+
+	var snapshot *enterworld.Character
+
+	rt.deps.Read(divisionID, func() {
+		if admit != nil && !admit(character) {
+			return
+		}
+		snapshot = character.SnapshotCombat()
+	})
+	rt.storeTickSnapshot(tickSnapshotCombat, character, epoch, snapshot)
+
+	return snapshot
+}
+
+/*
+==================
+characterSnapshotCompanionAdmitted
+
+characterSnapshotAdmitted for the per-tick pet and brood passes
+(#2030): the pet-owner view (domain SnapshotCompanion) - identity,
+world, companions, life and status, the PvP and relation facts, and
+the inventory's companion rows and relation slot. A root takes it only
+when every reader of its copy reads within that list; companion
+resolution and the relation rules see exactly what the full copy
+shows. The companionCopy seam replaces the copy in tests
+exactly as combatCopy does for the combat roots; admission still
+judges the live record first, in its own door pass, so a refused
+record pays for no copy under the seam either. Both door passes
+take the stack read guard instead of the callback door: the
+callback boxed the admission closure and the captured snapshot
+slot on every pet tick, and the guard holds the same store read
+lock the callback runs between (#2033).
+==================
+*/
+func (rt *Runtime) characterSnapshotCompanionAdmitted(
+	divisionID string,
+	character *enterworld.Character,
+	admit func(*enterworld.Character) bool,
+) *enterworld.Character {
+	if character == nil {
+		return nil
+	}
+	if rt.companionCopy != nil {
+		admitted := admit == nil
+		if !admitted {
+			guard := rt.deps.AcquireRead(divisionID)
+			admitted = admit(character)
+			guard.Release()
+		}
+		if !admitted {
+			return nil
+		}
+		return rt.companionCopy(divisionID, character)
+	}
+
+	cached, epoch, ok := rt.tickSnapshot(tickSnapshotCompanion, character)
+	if ok {
+		// Admission still judges the live record under the door (the
+		// epoch read stays outside it - the read door does not
+		// re-enter); the cached copy stands in for the clone because
+		// its epoch proves the record unchanged since it was taken.
+		guard := rt.deps.AcquireRead(divisionID)
+		admitted := admit == nil || admit(character)
+		guard.Release()
+		if !admitted {
+			return nil
+		}
+		return cached
+	}
+
+	guard := rt.deps.AcquireRead(divisionID)
+	if admit != nil && !admit(character) {
+		guard.Release()
+		return nil
+	}
+	snapshot := character.SnapshotCompanion()
+	guard.Release()
+	rt.storeTickSnapshot(tickSnapshotCompanion, character, epoch, snapshot)
+	return snapshot
+}
+
+/*
+================
+petTickFacts
+
+The facts one pet tick judges on, read as values under one store
+read door (#2139): whether the companion exists at all, whether this
+tick admits pet action (the admitted seam's own verdict), whether
+the owner has fallen, and - only when admitted - the companion
+values the judged lane reads: identity (the ref resolution and the
+follower binding), brood stage (the egg stop) and cosParameter's
+pet inputs (satiety, the installed follow-run factor, and the
+mercenary attributes for that one function's other arm, though the
+band itself abstains before any read). A tick that can finish on
+these values pays for neither an owner copy nor a companion-record
+copy: advancePetJudged rebuilds its pet view from the values, and
+abstains the moment a tick must commit through the record, when the
+companion copy judges exactly as before.
+================
+*/
+type petTickFacts struct {
+	companionSeen bool
+	admitted      bool
+	ownerDead     bool
+
+	petGID                 uint32
+	petRefObjID            uint32
+	petCodename            string
+	petBroodStage          uint8
+	petSatiety             uint16
+	petMercenaryAttributes uint8
+	petFollowRunFactor     float32
+	petFollowRunSet        bool
+}
+
+/*
+================
+readPetTickFacts
+================
+*/
+func (rt *Runtime) readPetTickFacts(
+	divisionID string,
+	character *enterworld.Character,
+	gid uint32,
+) *petTickFacts {
+	return rt.readPetTickFactsInto(&petTickFacts{}, divisionID, character, gid)
+}
+
+/*
+================
+readPetTickFactsInto
+
+readPetTickFacts into caller-owned storage: advancePet passes its
+session scratch, so the settled tick's fact read allocates nothing -
+no fresh container and no door closure (#2030). The facts are
+scalars only (the codename header aside, a copy of the record's own
+header), so the scratch is zeroed per call and reused tick after
+tick; the facts travel by pointer, so the one heap hand-off to
+advancePetJudged stays a few dozen bytes and never grows a record
+copy.
+================
+*/
+func (rt *Runtime) readPetTickFactsInto(
+	facts *petTickFacts,
+	divisionID string,
+	character *enterworld.Character,
+	gid uint32,
+) *petTickFacts {
+	*facts = petTickFacts{}
+	if character == nil {
+		return facts
+	}
+
+	guard := rt.deps.AcquireRead(divisionID)
+	pet := character.CompanionByGID(gid)
+	if pet != nil {
+		facts.companionSeen = true
+		facts.ownerDead = enterworld.CurrentHP(character) == 0
+		facts.admitted = !character.DeletePending && !facts.ownerDead &&
+			pet.Summoned && !pet.Mounted && pet.CurrentHP != 0
+		if facts.admitted {
+			facts.petGID = pet.GID
+			facts.petRefObjID = pet.RefObjID
+			facts.petCodename = pet.Codename
+			facts.petBroodStage = pet.BroodStage
+			facts.petSatiety = pet.Satiety
+			facts.petMercenaryAttributes = pet.MercenaryAttributes
+			facts.petFollowRunFactor = pet.FollowRunFactor
+			facts.petFollowRunSet = pet.FollowRunSet
+		}
+	}
+	guard.Release()
+
+	return facts
+}
+
+/*
+==================
+characterLifeState
+
+The life facts a refused monster strike revalidates - alive, deletion
+pending, native body status - read as values under the authority read
+door. The strike lane used to detach the whole record for these three
+fields (#1820 part C). Aliveness weighs the same inputs on the live
+record as on the copy: the copy's only normalizations (stat points,
+mission mask) feed neither vitals derivation nor these fields.
+==================
+*/
+func (rt *Runtime) characterLifeState(
+	divisionID string,
+	character *enterworld.Character,
+) (alive, deletePending bool, nativeBodyStatus uint8) {
+	if character == nil {
+		return false, false, 0
+	}
+
+	rt.deps.Read(divisionID, func() {
+		alive = enterworld.CharacterAlive(character)
+		deletePending = character.DeletePending
+		nativeBodyStatus = character.NativeBodyStatus
+	})
+
+	return alive, deletePending, nativeBodyStatus
+}
+
+/*
+==================
+characterPartyJobClass
+
+The party job class a job-admission refusal weighs, read as a value
+under the authority read door. A COS target answers the job test with
+its owner's state, and the owner's whole record used to be detached
+for this one byte (#1943): the class derives from the dressed job
+suit row, a record field the copy would carry unchanged.
+==================
+*/
+func (rt *Runtime) characterPartyJobClass(
+	divisionID string,
+	character *enterworld.Character,
+) uint8 {
+	if character == nil {
+		return enterworld.NoJobClass
+	}
+
+	class := enterworld.NoJobClass
+
+	rt.deps.Read(divisionID, func() {
+		class = enterworld.PartyJobClass(character)
+	})
+
+	return class
+}
+
+/*
+=================
+mountedCosGID
+
+The movement gate's mounted question, read as values under the
+authority read door. The gate used to detach the whole record -
+equipment, bag rows and companions - to read the active COS's mounted
+flag and GID (#1943); both are plain record fields the copy would
+carry unchanged. An absent character or COS answers unmounted.
+=================
+*/
+func (rt *Runtime) mountedCosGID(
+	divisionID, characterName string,
+) (petGID uint32, mounted bool) {
+	character := rt.findCharacter(divisionID, characterName)
+	if character == nil {
+		return 0, false
+	}
+
+	rt.deps.Read(divisionID, func() {
+		if character.ActiveCOS != nil {
+			petGID, mounted = character.ActiveCOS.GID, character.ActiveCOS.Mounted
+		}
+	})
+
+	return petGID, mounted
+}
+
+/*
+==================
+writeBackWorld
+
+writeBackWorld persists the accepted ground pose onto the character record.
+Authored displacement state keeps its existing destination semantics; the
+ordinary ground mover never persists a destination it has not reached.
+
+The write-back owns ONLY spawn/movementMode/spawnSet; every other world
+field (dungeonMinimap, movementSourceSeeded, updatedAt, moveSegment echo,
+and any future record keys) copies through untouched, like the Node
+handlers' {...world} spread (item-lane mirror of SCOUT-B FINDING 500).
+Copy-then-swap so aliases of the old record (the character snapshot's
+shallow copy) stay unchanged.
+==================
+*/
+func writeBackWorld(character *enterworld.Character, state simulation.WorldState) {
+	spawn := state.PersistedSpawn()
+	regionID := int64(spawn.RegionID)
+	x, y, z := spawn.X, spawn.Y, spawn.Z
+	angle := int64(spawn.Angle)
+	mode := int64(state.MovementMode)
+	next := enterworld.CharacterWorld{}
+	if character.World != nil {
+		next = *character.World
+	}
+
+	next.Spawn = &enterworld.WorldSpawn{
+		RegionID: &regionID,
+		X:        &x,
+		Y:        &y,
+		Z:        &z,
+		Angle:    &angle,
+	}
+
+	next.MovementMode = &mode
+	next.SpawnSet = state.SpawnSet
+	character.World = &next
+}
+
+/*
+==================
+liveSpawn
+
+liveSpawn samples the character's LIVE position - the bug-D plane. Every
+position-dependent op reads THIS, never the goal in WorldState.Spawn.
+==================
+*/
+func (rt *Runtime) liveSpawn(
+	worldKey string,
+	character *enterworld.Character,
+	nowMs int64,
+) simulation.Spawn {
+	snapshot := rt.Worlds.Snapshot(worldKey, func() simulation.WorldState {
+		return simulation.SeedWorldState(character)
+	})
+
+	return snapshot.LiveSpawnAt(nowMs)
+}
+
+/*
+==================
+LiveSpawnFor
+
+The character's live position now, for lanes outside action that gate on
+native range (the party invite's hit-range check).
+==================
+*/
+func (rt *Runtime) LiveSpawnFor(divisionID string, character *enterworld.Character) simulation.Spawn {
+	return rt.liveSpawn(simulation.WorldKey(divisionID, character.Name), character, rt.Now().UnixMilli())
+}
+
+/*
+==================
+LiveRegionFor
+
+The live region for the GM /FINDUSER answer (gmcommand.LivePositions):
+the saved spawn trails the walk, the live world does not.
+==================
+*/
+func (rt *Runtime) LiveRegionFor(divisionID string, character *enterworld.Character) uint16 {
+	return rt.LiveSpawnFor(divisionID, character).RegionID
+}
+
+/*
+==================
+liveNav
+
+liveNav is liveSpawn plus the surface owner retained at that point.
+==================
+*/
+func (rt *Runtime) liveNav(
+	worldKey string,
+	character *enterworld.Character,
+	nowMs int64,
+) (simulation.Spawn, simulation.NavOwner) {
+	snapshot := rt.Worlds.Snapshot(worldKey, func() simulation.WorldState {
+		return simulation.SeedWorldState(character)
+	})
+
+	return snapshot.LiveSpawnAt(nowMs), snapshot.LiveOwnerAt(nowMs)
+}
+
+/*
+==================
+constrainWalk
+
+constrainWalk routes a character move through the owner-aware constraint,
+degrading to the owner-less one only in compositions that lack it.
+==================
+*/
+func (rt *Runtime) constrainWalk(
+	characterName string,
+	from simulation.Spawn,
+	fromOwner simulation.NavOwner,
+	to simulation.Spawn,
+) (simulation.Spawn, simulation.NavWalk, *simulation.MoveError) {
+	if rt.ConstrainWalk != nil {
+		return rt.ConstrainWalk(characterName, from, fromOwner, to)
+	}
+
+	if rt.ConstrainMovement != nil {
+		committed, refusal := rt.ConstrainMovement(characterName, from, to)
+		return committed, simulation.NavWalk{}, refusal
+	}
+
+	return to, simulation.NavWalk{}, nil
+}
+
+/*
+==================
+admitGroundWalk
+
+Player approaches retain their intended goal while the world owner checks
+each elapsed movement step. A skill displacement still resolves its whole
+authored chord through constrainWalk before it commits.
+==================
+*/
+func (rt *Runtime) admitGroundWalk(
+	characterName string,
+	from simulation.Spawn,
+	fromOwner simulation.NavOwner,
+	to simulation.Spawn,
+) (simulation.Spawn, simulation.NavWalk, *simulation.MoveError) {
+	if rt.AdmitGroundWalk != nil {
+		return rt.AdmitGroundWalk(characterName, from, fromOwner, to)
+	}
+	return rt.constrainWalk(characterName, from, fromOwner, to)
+}
+
+/*
+==================
+samePlacement
+
+samePlacement compares where a move lands. Walked goals stand on their
+surface's height, so the requested int16 Y is not part of the comparison.
+==================
+*/
+func samePlacement(a, b simulation.Spawn) bool {
+	return a.RegionID == b.RegionID && a.X == b.X && a.Z == b.Z
+}

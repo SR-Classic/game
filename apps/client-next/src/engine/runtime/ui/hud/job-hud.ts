@@ -1,0 +1,274 @@
+/*
+===========================================================================
+
+job-hud.ts - the job guild dialogs: join and withdraw confirmations and
+the alias window, and the storage NPC's Academy opening question
+
+CIFNpcTalk_OnSimpleMsgBoxResult (5D26F0) sends the join (box type 4,
+field tri_job_type) and the withdrawal (type 5) after their questions, and
+the Academy opening (type 6, 0x72EC) after its fee question: one native
+owner (CIFNpcTalk_ShowJobGuildMsgBox 5D3880) raises all three boxes;
+the job menu's alias rows open CIFJobAlias (CIFJobAlias_OpenForMode
+645E90). A name is checked first (6461C0); the server's "free" answer marks
+it checked (646110), which enables OK; any edit away from the checked name
+clears it (646340). OK raises the create or modify confirm (646470), whose
+Yes sends the checked name and closes the window (645BA0). The rank rows open CIFJobRank or
+CIFJobContributionRank on the worker's answer (JobRanks.opened), and the
+outcome row turns the talk into the outcome page (5D7870) until it is
+collected. The UI draws from this owner every frame.
+
+===========================================================================
+*/
+
+import { JOB_ALIAS_MAX_LENGTH } from "@/engine/foundation/gameplay/job-guild";
+
+/*
+================
+JobConfirm
+================
+*/
+interface JobConfirm {
+	readonly kind: "join" | "withdraw" | "academy-open";
+	readonly npc: number;
+	readonly job: number;
+}
+
+/*
+================
+JobAliasWindow
+================
+*/
+interface JobAliasWindow {
+	readonly npc: number;
+	readonly modify: boolean;
+	readonly text: string;
+	// The name the server called free (+0x7BC); empty until then.
+	readonly checked: string;
+	// The create or modify confirm is up (+0x7E0).
+	readonly confirming: boolean;
+}
+
+/*
+================
+JobRankWindow
+
+The open rank window: its job, its kind (0 activity, 1 contribution) and
+the page its spin control shows.
+================
+*/
+export interface JobRankWindow {
+	readonly job: number;
+	readonly kind: number;
+	readonly page: number;
+}
+
+/*
+================
+createJobHud
+================
+*/
+export function createJobHud() {
+	let confirm: JobConfirm | null = null, alias: JobAliasWindow | null = null;
+	let rank: JobRankWindow | null = null, rankSeen = 0, checkSeen = 0;
+	// The outcome page: the answer sequence shown, and the collections seen.
+	let outcome: { readonly npc: number; readonly sequence: number; } | null = null, outcomeSeen = 0, collectedSeen = 0;
+	return {
+		/*
+		================
+		observe
+
+		Opens a rank window for each new 0xB37E answer or cached open, and the
+		outcome page for each new outcome told. True when a collection ended
+		the outcome: the caller closes the talk, as 75D5C0 does.
+		================
+		*/
+		observe(
+			opened: { readonly job: number; readonly kind: number; readonly sequence: number; } | null | undefined,
+			told: { readonly npc: number; readonly sequence: number; readonly collected: number; } | null | undefined
+		): boolean {
+			if ( opened && opened.sequence > rankSeen ) {
+				rankSeen = opened.sequence;
+				rank = { job: opened.job, kind: opened.kind, page: 0 };
+			}
+			if ( !told ) return false;
+			if ( told.collected > collectedSeen ) {
+				collectedSeen = told.collected;
+				outcomeSeen = told.sequence;
+				outcome = null;
+				return true;
+			}
+			if ( told.sequence > outcomeSeen ) {
+				outcomeSeen = told.sequence;
+				outcome = { npc: told.npc, sequence: told.sequence };
+			}
+			return false;
+		},
+		/*
+		================
+		rank
+		================
+		*/
+		rank(): JobRankWindow | null {
+			return rank;
+		},
+		/*
+		================
+		pageRank
+
+		The spin control: one page back or forward within pages.
+		================
+		*/
+		pageRank( step: number, pages: number ) {
+			if ( rank ) rank = { ...rank, page: Math.max( 0, Math.min( pages - 1, rank.page + step ) ) };
+		},
+		/*
+		================
+		closeRank
+		================
+		*/
+		closeRank() {
+			rank = null;
+		},
+		/*
+		================
+		outcome
+
+		The NPC whose talk shows the outcome page, or null.
+		================
+		*/
+		outcome(): number | null {
+			return outcome?.npc ?? null;
+		},
+		/*
+		================
+		closeOutcome
+		================
+		*/
+		closeOutcome() {
+			outcome = null;
+		},
+		/*
+		================
+		ask
+
+		Raises the join or withdrawal question for a guild NPC, or the
+		Academy opening question for a storage NPC (job 0).
+		================
+		*/
+		ask( kind: JobConfirm["kind"], npc: number, job: number ) {
+			alias = null;
+			confirm = { kind, npc, job };
+		},
+		/*
+		================
+		confirm
+		================
+		*/
+		confirm(): JobConfirm | null {
+			return confirm;
+		},
+		/*
+		================
+		takeConfirm
+
+		Closes the question, returning it.
+		================
+		*/
+		takeConfirm(): JobConfirm | null {
+			const taken = confirm;
+			confirm = null;
+			return taken;
+		},
+		/*
+		================
+		openAlias
+		================
+		*/
+		openAlias( npc: number, modify: boolean ) {
+			confirm = null;
+			alias = { npc, modify, text: "", checked: "", confirming: false };
+		},
+		/*
+		================
+		observeChecked
+
+		Marks each new "name is free" answer on the open window (646110 takes
+		the answer's name as it is). An answer while no window is open is
+		spent.
+		================
+		*/
+		observeChecked( answer: { readonly alias: string; readonly sequence: number; } | null | undefined ) {
+			if ( !answer || answer.sequence <= checkSeen ) return;
+			checkSeen = answer.sequence;
+			if ( alias ) alias = { ...alias, checked: answer.alias };
+		},
+		/*
+		================
+		openAliasConfirm
+
+		OK is enabled only with a checked name (646110 / 646340).
+		================
+		*/
+		openAliasConfirm() {
+			if ( alias?.checked ) alias = { ...alias, confirming: true };
+		},
+		/*
+		================
+		answerAliasConfirm
+
+		645BA0: Yes with a checked name returns what to send and closes the
+		window; the box always closes.
+		================
+		*/
+		answerAliasConfirm( yes: boolean ): { readonly npc: number; readonly alias: string; } | null {
+			if ( !alias ) return null;
+			if ( yes && alias.checked ) {
+				const sent = { npc: alias.npc, alias: alias.checked };
+				alias = null;
+				return sent;
+			}
+			alias = { ...alias, confirming: false };
+			return null;
+		},
+		/*
+		================
+		alias
+		================
+		*/
+		alias(): JobAliasWindow | null {
+			return alias;
+		},
+		/*
+		================
+		typeAlias
+
+		The field keeps the name shape: letters, digits and underscores. A
+		text other than the checked name clears the check (646340).
+		================
+		*/
+		typeAlias( value: string ) {
+			if ( alias ) {
+				const text = value.replace( /[^A-Za-z0-9_]/g, "" ).slice( 0, JOB_ALIAS_MAX_LENGTH );
+				alias = { ...alias, text, checked: alias.checked && text !== alias.checked ? "" : alias.checked };
+			}
+		},
+		/*
+		================
+		closeAlias
+		================
+		*/
+		closeAlias() {
+			alias = null;
+		},
+		/*
+		================
+		reset
+		================
+		*/
+		reset() {
+			confirm = null;
+			alias = null;
+			outcome = null;
+		}
+	};
+}

@@ -1,0 +1,386 @@
+/*
+===========================================================================
+
+storage_test.go - warehouse admission, fees and transfers
+
+===========================================================================
+*/
+package action
+
+import (
+	"testing"
+
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+/*
+================
+memoryStorage
+
+An in-memory StorageAuthority with the store's detached-copy contract.
+================
+*/
+type memoryStorage struct {
+	room domain.AccountStorage
+}
+
+func (m *memoryStorage) AccountStorage(*domain.Character) (domain.AccountStorage, error) {
+	return m.room, nil
+}
+
+func (m *memoryStorage) TransactStorage(character *domain.Character, mutate func(*domain.Character, *domain.AccountStorage) error) (domain.AccountStorage, error) {
+	next := character.Snapshot()
+	room := m.room
+	room.Rows = append([]domain.InventoryRow(nil), m.room.Rows...)
+	if err := mutate(next, &room); err != nil {
+		return m.room, err
+	}
+	m.room = room
+	character.MissionInventory = next.MissionInventory
+	character.Gold = next.Gold
+	return room, nil
+}
+
+/*
+================
+potionRow
+
+The bag row holding the fixture's HP potions.
+================
+*/
+func potionRow(t *testing.T, c *enterworld.Character) enterworld.InventoryRow {
+	t.Helper()
+	for _, row := range c.MissionInventory {
+		if row.Codename == "ITEM_ETC_HP_POTION_01" && row.Slot >= 13 {
+			return row
+		}
+	}
+	t.Fatal("fixture has no bag potion")
+	return enterworld.InventoryRow{}
+}
+
+/*
+================
+storageFixture
+
+The merchant fixture's NPC turned into a warehouse keeper, with the room
+opened through the client's own request (0x7338 storage); the potion is
+storable with a one-gold keeping fee.
+================
+*/
+func storageFixture(t *testing.T) (*Runtime, *enterworld.Character, *memoryStorage) {
+	t.Helper()
+	rt, c := merchantFixture(t)
+	potion := rt.deps.ItemReferences().(staticItemSource)["ITEM_ETC_HP_POTION_01"]
+	potion.NativeFields = potion.NativeFields.With("canBorrow", 255).With("keepingFee", 1)
+	rt.NpcRoster[0].TalkFlags = simulation.NpcTalkFlagStorage
+	c.MissionInventory = append(c.MissionInventory, enterworld.InventoryRow{Slot: 14, RefObjID: 3630,
+		Codename: "ITEM_ETC_HP_POTION_01", TypeFlags: wire.PackTypeFlags(3, 3, 1, 1), StackCount: 30, VarianceBits: "0"})
+	authority := &memoryStorage{room: domain.NewAccountStorage()}
+	rt.ConfigureStorage(authority)
+	openStorageRoom(t, rt, c, 17)
+	return rt, c, authority
+}
+
+/*
+================
+openStorageRoom
+
+The keeper's storage function, opened as the talk menu's warehouse row
+does.
+================
+*/
+func openStorageRoom(t *testing.T, rt *Runtime, c *enterworld.Character, gid uint32) {
+	t.Helper()
+	rt.Selected.Set(testDivision, c.Name, gid)
+	open, refusal := rt.HandleNpcAction(testDivision, c, wire.NewWriter(8).U32(gid).U32(wire.StorageFunctionMask).Payload())
+	if refusal != "" || len(open) != 1 || open[0].Opcode != wire.OpNpcInteractionAck {
+		t.Fatalf("storage open = %+v / %q", open, refusal)
+	}
+}
+
+func TestStorageListAndOpenAnswerTheNativeShapes(t *testing.T) {
+	rt, c, authority := storageFixture(t)
+	authority.room.Gold = 77
+	frames, refusal := rt.HandleStorageList(testDivision, c, wire.NewWriter(5).U32(17).U8(0).Payload())
+	if refusal != "" || len(frames) != 3 || frames[0].Opcode != opCommerceItemReferences || frames[1].Opcode != wire.OpStorageGold || frames[2].Opcode != wire.OpStorageList {
+		t.Fatalf("list = %+v / %q", frames, refusal)
+	}
+	if frames[2].Payload[0] != domain.StorageDefaultCapacity || frames[2].Payload[1] != 0 {
+		t.Fatalf("empty room list = %v", frames[2].Payload)
+	}
+	open, refusal := rt.HandleNpcAction(testDivision, c, wire.NewWriter(8).U32(17).U32(wire.StorageFunctionMask).Payload())
+	if refusal != "" || len(open) != 1 || open[0].Opcode != wire.OpNpcInteractionAck {
+		t.Fatalf("open = %+v / %q", open, refusal)
+	}
+	rt.Selected.Set(testDivision, c.Name, 99)
+	if _, refusal := rt.HandleStorageList(testDivision, c, wire.NewWriter(5).U32(17).U8(0).Payload()); refusal == "" {
+		t.Fatal("listed a warehouse the player does not have selected")
+	}
+}
+
+func TestStorageDepositChargesTheKeepingFeeAndWithdrawReturns(t *testing.T) {
+	rt, c, authority := storageFixture(t)
+	row := potionRow(t, c)
+	slot, stack := uint8(row.Slot), row.StackCount
+	gold := goldOf(c)
+	r := trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageDeposit, SourceSlot: slot, DestSlot: 3, NpcGID: 17})
+	if r.Frames[0].Payload[0] != 1 || len(authority.room.Rows) != 1 || authority.room.Rows[0].Slot != 3 {
+		t.Fatalf("deposit = %+v, room %+v", r, authority.room)
+	}
+	if goldOf(c) != gold-uint64(stack) {
+		t.Fatalf("keeping fee: gold %d, want %d", goldOf(c), gold-uint64(stack))
+	}
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageWithdraw, SourceSlot: 3, DestSlot: slot, NpcGID: 17})
+	if r.Frames[0].Payload[0] != 1 || len(authority.room.Rows) != 0 || len(c.MissionInventory) == 0 {
+		t.Fatalf("withdraw = %+v, room %+v", r, authority.room)
+	}
+}
+
+func TestStorageRefusesUnstorableItemsAndOverdrafts(t *testing.T) {
+	rt, c, authority := storageFixture(t)
+	potion := rt.deps.ItemReferences().(staticItemSource)["ITEM_ETC_HP_POTION_01"]
+	potion.NativeFields = potion.NativeFields.With("canBorrow", 0)
+	slot := uint8(potionRow(t, c).Slot)
+	r := trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageDeposit, SourceSlot: slot, DestSlot: 0, NpcGID: 17})
+	if r.Frames[0].Payload[0] != 2 || r.Frames[0].Payload[1] != errCodeInvalidStorageTarget || len(authority.room.Rows) != 0 {
+		t.Fatalf("unstorable deposit = %v", r.Frames[0].Payload)
+	}
+	gold := goldOf(c)
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageGoldDeposit, GoldAmount: 300})
+	if r.Frames[0].Payload[0] != 1 || authority.room.Gold != 300 || goldOf(c) != gold-300 {
+		t.Fatalf("gold deposit = %+v room %d", r, authority.room.Gold)
+	}
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageGoldWithdraw, GoldAmount: 301})
+	if r.Frames[0].Payload[0] != 2 || r.Frames[0].Payload[1] != wire.ErrCodeNotEnoughGold || authority.room.Gold != 300 {
+		t.Fatalf("overdraft = %v room %d", r.Frames[0].Payload, authority.room.Gold)
+	}
+}
+
+/*
+================
+TestStorageGoldDepositCaps
+
+Off, one deposit moves at most the native 100,000,000. On, a
+1,000,000,000 deposit is accepted and one above the raised cap is
+refused. The guild warehouse shares storageMutation, so it shares this.
+================
+*/
+func TestStorageGoldDepositCaps(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		on       bool
+		amount   uint32
+		accepted bool
+	}{
+		{"off native ceiling", false, 100_000_000, true},
+		{"off above native", false, 100_000_001, false},
+		{"on one billion", true, 1_000_000_000, true},
+		{"on above raised", true, 1_000_000_001, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, c, authority := storageFixture(t)
+			rt.RaisedGoldCaps = tc.on
+			setGold(c, 2_000_000_000)
+			// The test's encoder applies the native client's 100,000,000
+			// clamp, so the payload is written by hand: the server must
+			// refuse a larger amount on its own.
+			r := rt.HandleItemMove(testDivision, c, []byte{
+				wire.MoveTypeStorageGoldDeposit,
+				byte(tc.amount), byte(tc.amount >> 8), byte(tc.amount >> 16), byte(tc.amount >> 24),
+			})
+			accepted := r.Frames[0].Payload[0] == 1
+			if accepted != tc.accepted {
+				t.Fatalf("deposit %d answered % X, want accepted=%v", tc.amount, r.Frames[0].Payload, tc.accepted)
+			}
+			if tc.accepted && authority.room.Gold != int64(tc.amount) {
+				t.Fatalf("room gold %d, want %d", authority.room.Gold, tc.amount)
+			}
+			if !tc.accepted && authority.room.Gold != 0 {
+				t.Fatalf("refused deposit changed the room to %d", authority.room.Gold)
+			}
+		})
+	}
+}
+
+/*
+================
+TestStorageFollowsTheNpcRangeAndFunctionState
+
+The room list takes the hit-range gate and answers too far; moves need
+the storage function an in-range request opened, as trades do.
+================
+*/
+func TestStorageFollowsTheNpcRangeAndFunctionState(t *testing.T) {
+	rt, c, authority := storageFixture(t)
+	slot := uint8(potionRow(t, c).Slot)
+	// No warehouse open (the window's close ended it): the deposit is refused.
+	rt.closeStorageSession(testDivision, c.Name)
+	rt.Selected.Set(testDivision, c.Name, 17)
+	r := trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageDeposit, SourceSlot: slot, DestSlot: 0, NpcGID: 17})
+	if r.Frames[0].Payload[0] != 2 || len(authority.room.Rows) != 0 {
+		t.Fatalf("deposit before the room opened = %+v", r)
+	}
+	moveMerchantAway(rt, npcHitRange+10)
+	frames, refusal := rt.HandleStorageList(testDivision, c, wire.NewWriter(5).U32(17).U8(0).Payload())
+	if refusal == "" || len(frames) != 1 || frames[0].Opcode != wire.OpNpcInteractionAck ||
+		string(frames[0].Payload) != string([]byte{2, hitRangeTooFar}) {
+		t.Fatalf("far list = %+v / %q", frames, refusal)
+	}
+}
+
+/*
+================
+TestWarehouseTicketOpensTheRoomAnywhere
+
+A spent ticket selects the player's own gid with the storage function
+open: the list, the open and a deposit name that gid far from any keeper,
+and a new selection ends the session.
+================
+*/
+func TestWarehouseTicketOpensTheRoomAnywhere(t *testing.T) {
+	rt, c, authority := storageFixture(t)
+	moveMerchantAway(rt, npcHitRange+10)
+	ticket := &enterworld.ItemRef{RefObjID: 3788, Codename: "ITEM_MALL_WAREHOUSE_TICKET", Country: 3,
+		TypeIDs: [4]int64{3, 3, 13, 10}, ReqQuadTypes: [4]int64{-1, -1, -1, -1},
+		NativeFields: enterworld.NewNativeFields(map[string]float64{"canUse": 1, "maxStack": 50})}
+	rt.deps.ItemReferences().(staticItemSource)[ticket.Codename] = ticket
+	c.MissionInventory = append(c.MissionInventory, enterworld.InventoryRow{Slot: 25, RefObjID: ticket.RefObjID,
+		Codename: ticket.Codename, TypeFlags: ticket.TypeFlags(), StackCount: 2})
+	self := enterworld.ObjectIDForCharacter(c)
+	use := rt.HandleItemUse(testDivision, c, wire.NewWriter(3).U8(25).U16(ticket.TypeFlags()).Payload())
+	if len(use.Frames) == 0 || use.Frames[0].Opcode != wire.OpItemUseResponse || use.Frames[0].Payload[0] != wire.ResultSuccess {
+		t.Fatalf("ticket use = %+v", use.Frames)
+	}
+	frames, refusal := rt.HandleStorageList(testDivision, c, wire.NewWriter(5).U32(self).U8(0).Payload())
+	if refusal != "" || len(frames) != 3 || frames[2].Opcode != wire.OpStorageList {
+		t.Fatalf("remote list = %+v / %q", frames, refusal)
+	}
+	open, refusal := rt.HandleNpcAction(testDivision, c, wire.NewWriter(8).U32(self).U32(wire.StorageFunctionMask).Payload())
+	if refusal != "" || len(open) != 1 || open[0].Opcode != wire.OpNpcInteractionAck {
+		t.Fatalf("remote open = %+v / %q", open, refusal)
+	}
+	slot := uint8(potionRow(t, c).Slot)
+	r := trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageDeposit, SourceSlot: slot, DestSlot: 0, NpcGID: self})
+	if r.Frames[0].Payload[0] != 1 || len(authority.room.Rows) != 1 {
+		t.Fatalf("remote deposit = %+v", r)
+	}
+	// A new selection leaves the ticket's room open (native reads the
+	// warehouse-open record); the window's close ends it.
+	rt.Selected.Set(testDivision, c.Name, 17)
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageWithdraw, SourceSlot: 0, DestSlot: slot, NpcGID: self})
+	if r.Frames[0].Payload[0] != 1 || len(authority.room.Rows) != 0 {
+		t.Fatalf("withdraw after a new selection = %+v", r)
+	}
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageDeposit, SourceSlot: slot, DestSlot: 0, NpcGID: self})
+	if r.Frames[0].Payload[0] != 1 || len(authority.room.Rows) != 1 {
+		t.Fatalf("deposit back = %+v", r)
+	}
+	if out := rt.HandleTargetRelease(testDivision, c, wire.NewWriter(4).U32(17).Payload()); len(out.Frames) == 0 {
+		t.Fatalf("release = %+v", out)
+	}
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageWithdraw, SourceSlot: 0, DestSlot: slot, NpcGID: self})
+	if r.Frames[0].Payload[0] != 2 || len(authority.room.Rows) != 1 {
+		t.Fatalf("withdraw after the window closed = %+v", r)
+	}
+}
+
+/*
+================
+TestStorageStaysOpenAcrossANewSelection
+
+BR-261011-1342-EE58 ("can not put gold in storage"): the client selects
+the keeper again (0x745A) when it is clicked with the window open, which
+ended the port's selection-held function state, so every gold move was
+refused. Native warehouse moves read the player's own warehouse-open
+record (the gold and deposit moves), never the selection.
+================
+*/
+func TestStorageStaysOpenAcrossANewSelection(t *testing.T) {
+	rt, c, authority := storageFixture(t)
+	gold := goldOf(c)
+	// The keeper is clicked again, then something else is selected.
+	rt.Selected.Set(testDivision, c.Name, 17)
+	r := trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageGoldDeposit, GoldAmount: 250})
+	if r.Frames[0].Payload[0] != 1 || authority.room.Gold != 250 || goldOf(c) != gold-250 {
+		t.Fatalf("gold deposit after the keeper was clicked again = %+v room %d", r, authority.room.Gold)
+	}
+	rt.Selected.Set(testDivision, c.Name, 99)
+	slot := uint8(potionRow(t, c).Slot)
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageDeposit, SourceSlot: slot, DestSlot: 4, NpcGID: 17})
+	if r.Frames[0].Payload[0] != 1 || len(authority.room.Rows) != 1 {
+		t.Fatalf("item deposit with another selection = %+v", r)
+	}
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageGoldWithdraw, GoldAmount: 50})
+	if r.Frames[0].Payload[0] != 1 || authority.room.Gold != 200 {
+		t.Fatalf("gold withdraw with another selection = %+v room %d", r, authority.room.Gold)
+	}
+	// An item move still names its keeper: another NPC's gid is refused.
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageWithdraw, SourceSlot: 4, DestSlot: slot, NpcGID: 99})
+	if r.Frames[0].Payload[0] != 2 || len(authority.room.Rows) != 1 {
+		t.Fatalf("withdraw naming another NPC = %+v", r)
+	}
+	// Leaving the world ends the session.
+	rt.closeStorageSession(testDivision, c.Name)
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageGoldDeposit, GoldAmount: 1})
+	if r.Frames[0].Payload[0] != 2 || authority.room.Gold != 200 {
+		t.Fatalf("gold deposit with no warehouse open = %+v", r)
+	}
+}
+
+/*
+================
+TestStorageQuickMovesOntoAStackMergeAsTheDragDoes
+
+The auto-stack quick move (port-only, storageautostack.go) aims a deposit
+or a withdrawal at a matching stack. The server needs no new rule: the
+client whole transfer (TransferWholeTo, 756A60) merges it.
+================
+*/
+func TestStorageQuickMovesOntoAStackMergeAsTheDragDoes(t *testing.T) {
+	rt, c, authority := storageFixture(t)
+	potion := rt.deps.ItemReferences().(staticItemSource)["ITEM_ETC_HP_POTION_01"]
+	potion.NativeFields = potion.NativeFields.With("maxStack", 100)
+	row := potionRow(t, c)
+	slot := uint8(row.Slot)
+	authority.room.Rows = []enterworld.InventoryRow{{Slot: 3, RefObjID: row.RefObjID, Codename: row.Codename,
+		TypeFlags: row.TypeFlags, StackCount: 20, VarianceBits: "0"}}
+	r := trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageDeposit, SourceSlot: slot, DestSlot: 3, NpcGID: 17})
+	if r.Frames[0].Payload[0] != 1 || len(authority.room.Rows) != 1 || authority.room.Rows[0].StackCount != 20+row.StackCount {
+		t.Fatalf("deposit onto the stack = %+v, room %+v", r, authority.room.Rows)
+	}
+	for _, bag := range c.MissionInventory {
+		if bag.Slot == row.Slot {
+			t.Fatalf("the merged potions stayed in the bag: %+v", bag)
+		}
+	}
+	// A bag stack of the same potion takes the room's stack back whole.
+	c.MissionInventory = append(c.MissionInventory, enterworld.InventoryRow{Slot: row.Slot, RefObjID: row.RefObjID,
+		Codename: row.Codename, TypeFlags: row.TypeFlags, StackCount: 5, VarianceBits: "0"})
+	r = trade(t, rt, c, wire.ItemMoveRequest{MovementType: wire.MoveTypeStorageWithdraw, SourceSlot: 3, DestSlot: slot, NpcGID: 17})
+	if r.Frames[0].Payload[0] != 1 || len(authority.room.Rows) != 0 {
+		t.Fatalf("withdraw onto the stack = %+v, room %+v", r, authority.room.Rows)
+	}
+	for _, bag := range c.MissionInventory {
+		if bag.Slot == row.Slot && bag.StackCount != 5+20+row.StackCount {
+			t.Fatalf("bag stack %d, want %d", bag.StackCount, 5+20+row.StackCount)
+		}
+	}
+}
+
+/*
+================
+TestStorageAutoStackFromEnv
+================
+*/
+func TestStorageAutoStackFromEnv(t *testing.T) {
+	for value, want := range map[string]bool{"": false, "off": false, "0": false, "on": true, "1": true, "TRUE": true} {
+		t.Setenv(EnvStorageAutoStack, value)
+		if got := StorageAutoStackFromEnv(); got != want {
+			t.Fatalf("%s=%q: %v, want %v", EnvStorageAutoStack, value, got, want)
+		}
+	}
+}

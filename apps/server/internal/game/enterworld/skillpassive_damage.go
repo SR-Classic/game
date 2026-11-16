@@ -1,0 +1,460 @@
+/*
+===========================================================================
+
+skillpassive_damage.go - setv / getv parameter slots
+
+Projects native parameter keys into compact values owned by the combat stat
+snapshot. Admission validates the whole passive program before enabling it.
+
+===========================================================================
+*/
+
+package enterworld
+
+/*
+================
+SkillParameter
+
+By-value slots for the native setv/getv dictionary the server consumes.
+These identities are separate from skill IDs and displayed character stats.
+================
+*/
+type SkillParameter uint8
+
+const (
+	ParameterTwoHandPower SkillParameter = iota
+	ParameterOneHandPower
+	ParameterDualPower
+	ParameterCrossbowPower
+	ParameterDaggerPower
+	ParameterEarthPower
+	ParameterColdPower
+	ParameterFirePower
+	ParameterLightningPower
+	ParameterDotPower
+	ParameterBloodPower
+	ParameterMusicPower
+	ParameterHolyPower
+	ParameterDaggerHit
+	ParameterDualHit
+	// Abnormal-status modifiers read by the server's status roll through getv: poison damage
+	// (RPDU, +500), poison duration (RPTU, +504) and trap damage (TRAA, +53C).
+	ParameterPoisonDamage
+	ParameterPoisonDuration
+	ParameterTrapDamage
+	// MP Decrease keys. The instant action and the persistent cast
+	// lifecycle look these up in the
+	// caster's modifier map and scale prepared MP cost (+0x14), not damage.
+	// WIMD +0x4E4, BDMD +0x554 (0x42444D44), HLMD +0x55C (0x484C4D44).
+	ParameterWizardMPDecrease
+	ParameterBardMPDecrease
+	ParameterHealerMPDecrease
+	// Area range keys. The persistent cast lifecycle adds these
+	// caster getv values to the efr radius: MUER +0x544, DSER +0x54C.
+	ParameterMusicRange
+	ParameterDanceRange
+	// Reach keys. The command actor adds the caster's value to the action
+	// range: CBRA +0x50C, WIRU +0x4E8.
+	ParameterCrossbowRange
+	ParameterWizardRange
+	// DGAA +0x524: added to the physical attack point of a strike whose
+	// command was issued in stealth (hit flag 8).
+	ParameterStealthStrike
+	// Stealth keys a hide reads through getv. STDU +0x518 adds milliseconds
+	// to the effect's duration (and the B5ED/hit-data rider); STSP
+	// +0x514 adds a percentage back onto the hide's speed cut.
+	ParameterStealthDuration
+	ParameterStealthSpeed
+	// Bless keys. The persistent cast lifecycle copies the
+	// caster's HLBP (+0x56C) into a recipient's context +0x34, else its HLSM
+	// (+0x570) into +0x38; the defense installer adds them to defp's physical and magical.
+	ParameterBlessPhysical
+	ParameterBlessMagical
+	// Charity's keys for the stat blessings: HLFS +0x564, HLMI +0x568.
+	ParameterBlessStrength
+	ParameterBlessIntellect
+	// HLRU +0x558: the server's effect application adds the
+	// caster's value to both percent words of a heal (Faith).
+	ParameterHealRecoveryUp
+	// DTDR +0x52C extends a linked effect by a percentage of its base
+	// duration, independent of DTAT's damage scaling.
+	ParameterDotDuration
+	// RPBU +0x508 adds milliseconds to the coating, not its poison victim.
+	ParameterPoisonCoatingDuration
+	// MUCR +0x548: the Bard's music keep addend. A row that reads getv MUCR
+	// adds the caster's value to its skc keep chance; see
+	// action.damageKeepPercent. DSER (ParameterDanceRange) is the dance
+	// addend.
+	ParameterMusicCutResist
+	// DSCR +0x550: indexed by the server's parameter index and authored by the dances and Screen
+	// Dance, but no native code reads it (whole-image scan); it changes
+	// nothing and stays a known key only so those rows admit.
+	ParameterDanceCutResist
+	// The Warlock's Blood Increase keys. BSHP (getv slot +0x534) is added to
+	// a life steal's base (the server's heal formula, Life Drain);
+	// SAAA (+0x538) to a fixed hit's amount (its fixed-damage formula,
+	// Soul Chaos).
+	ParameterLifeStealPower
+	ParameterFixedDamagePower
+	SkillParameterCount
+)
+
+/*
+================
+SkillParameterMask
+
+Records which parameter values a fully compiled program consumes.
+================
+*/
+type SkillParameterMask uint64
+
+/*
+================
+Has
+================
+*/
+func (m SkillParameterMask) Has(p SkillParameter) bool {
+	return p < SkillParameterCount && m&(SkillParameterMask(1)<<p) != 0
+}
+
+/*
+================
+SkillParameterValues
+
+An actor snapshot owns these values; readers never consult mutable dictionaries.
+================
+*/
+type SkillParameterValues [SkillParameterCount]uint32
+
+/*
+================
+SkillParameterFromKey
+
+Resolve authored four-character keys without accepting unknown parameters.
+================
+*/
+func SkillParameterFromKey(key uint32) (SkillParameter, bool) {
+	switch key {
+	case 0x45325341:
+		return ParameterTwoHandPower, true
+	case 0x45315341:
+		return ParameterOneHandPower, true
+	case 0x45324141:
+		return ParameterDualPower, true
+	case 0x43424154:
+		return ParameterCrossbowPower, true
+	case 0x44474154:
+		return ParameterDaggerPower, true
+	case 0x45414154:
+		return ParameterEarthPower, true
+	case 0x434f4154:
+		return ParameterColdPower, true
+	case 0x46494154:
+		return ParameterFirePower, true
+	case 0x4c494154:
+		return ParameterLightningPower, true
+	case 0x44544154:
+		return ParameterDotPower, true
+	case 0x44544452:
+		return ParameterDotDuration, true
+	case 0x424c4154:
+		return ParameterBloodPower, true
+	case 0x4d554154:
+		return ParameterMusicPower, true
+	case 0x484c4154:
+		return ParameterHolyPower, true
+	case 0x44474852:
+		return ParameterDaggerHit, true
+	case 0x45324148:
+		return ParameterDualHit, true
+	case 0x52504455:
+		return ParameterPoisonDamage, true
+	case 0x52505455:
+		return ParameterPoisonDuration, true
+	case 0x52504255:
+		return ParameterPoisonCoatingDuration, true
+	case 0x54524141:
+		return ParameterTrapDamage, true
+	case 0x57494d44:
+		return ParameterWizardMPDecrease, true
+	case 0x42444d44:
+		return ParameterBardMPDecrease, true
+	case 0x484c4d44:
+		return ParameterHealerMPDecrease, true
+	case 0x4d554552:
+		return ParameterMusicRange, true
+	case 0x44534552:
+		return ParameterDanceRange, true
+	case 0x43425241:
+		return ParameterCrossbowRange, true
+	case 0x57495255:
+		return ParameterWizardRange, true
+	case 0x44474141:
+		return ParameterStealthStrike, true
+	case 0x53544455:
+		return ParameterStealthDuration, true
+	case 0x53545350:
+		return ParameterStealthSpeed, true
+	case 0x484c4250:
+		return ParameterBlessPhysical, true
+	case 0x484c534d:
+		return ParameterBlessMagical, true
+	case 0x484c4653:
+		return ParameterBlessStrength, true
+	case 0x484c4d49:
+		return ParameterBlessIntellect, true
+	case 0x484c5255:
+		return ParameterHealRecoveryUp, true
+	case 0x4d554352:
+		return ParameterMusicCutResist, true
+	case 0x44534352:
+		return ParameterDanceCutResist, true
+	case 0x42534850:
+		return ParameterLifeStealPower, true
+	case 0x53414141:
+		return ParameterFixedDamagePower, true
+	}
+	return 0, false
+}
+
+/*
+================
+SkillPassiveParameters
+
+A complete passive program, including the status resistance instructions that
+may accompany its parameter values.
+================
+*/
+type SkillPassiveParameters struct {
+	Pinned bool
+	Mask   SkillParameterMask
+	Values SkillParameterValues
+	// Reat is reat {mask, value} (+0x2FC): the server adds value to the
+	// keeper's flat status reduction 0x91+i for each mask bit i (0..5).
+	Reat SkillPassiveReat
+	// Real is real {status mask, flat, grade} (+0x300): the server files the flat
+	// under the grade in each masked status's resistance bucket.
+	Real SkillPassiveReal
+	// Br is br {lane mask, value}: the server adds value to
+	// the flat block-rate parameter of each lane the normalized mask selects;
+	// see combat.BlockRateWrites.
+	Br SkillPassiveBlockRate
+	// HitRate, Evasion, MaxHP and MaxMP are hr (+0x24C), er (+0x27C), hpi
+	// (+0x2AC) and mpi (+0x2B0), each {flat, percent}. A learned passive is
+	// a standing skill instance, so the server installs them on the keeper as
+	// it does a buff's: word 0 flat and word 1 percent on parameters 11, 9,
+	// 3 and 4. The bow, lightning,
+	// spear and water mastery passives author one each.
+	HitRate, Evasion, MaxHP, MaxMP SkillFlatRate
+	// Dru is dru {word 0, word 1} (+0x3E4): the server adds word 0 to
+	// parameters 0x80 and 0x81 and word 1 to 0x82 and 0x83 (the fire mastery
+	// passive).
+	Dru [2]uint32
+	// CriticalEvasion is dcri (+0x42C): the server adds it to the
+	// defender's evade-critical keeper 0x39 (the Warrior's shield passive).
+	CriticalEvasion uint32
+	// IncomingReduction marks odar (+0x270) in a passive (the Rogue's
+	// bow-absorb passive); its bits and word ride the row's BuffModifiers.
+	IncomingReduction bool
+	// DamageReturn is dmgr (+0x204, the Warrior's two-hand return passive).
+	DamageReturn SkillDamageReturn
+}
+
+/*
+================
+SkillPassiveReat
+
+Flat status reduction applied to each selected resistance lane.
+================
+*/
+type SkillPassiveReat struct{ Mask, Value uint32 }
+
+/*
+================
+SkillPassiveReal
+
+Grade-specific resistance, kept separate from flat status reduction.
+================
+*/
+type SkillPassiveReal struct{ Mask, Flat, Grade uint32 }
+
+/*
+================
+SkillPassiveBlockRate
+
+A passive block-rate addend. Mask is already normalized by the server's lane
+rule, the same form the timed br buff stores.
+================
+*/
+type SkillPassiveBlockRate struct{ Mask, Value uint32 }
+
+/*
+================
+encodedPassiveParameters
+
+Native stores up to five three-argument setv blocks. Repeated keys overwrite
+in source order. reat, real and the reqi/reqn gate complete the resistance
+passives; br is the block-rate passive (a duplicate br, a zero mask or a
+value above maxBlockRatePercent is malformed); hpi, mpi, er and hr are the
+Chinese maximum-HP, maximum-MP, parry and attack-rate passives (a duplicate
+block is malformed). Refuse the whole program if any operation lacks
+execution.
+
+Any one consumed block pins the program: none of the native installers for
+reat, real, br or hpi reads a
+setv.
+Protection is reat + real + reqi and Blockade br + reqi; a program holding
+only its reqi gate has nothing to install and stays unpinned.
+================
+*/
+func encodedPassiveParameters(fields []string) SkillPassiveParameters {
+	var out SkillPassiveParameters
+	if len(fields) <= 72 || fields[68] != "4" || fields[8] != "0" || fields[9] != "0" {
+		return out
+	}
+	program, err := CompileSkillProgram(fields)
+	if err != nil {
+		return out
+	}
+	count := 0
+	for i := 0; i < program.Len(); i++ {
+		op := program.Instruction(i)
+		switch op.Tag {
+		case 0x73657476: // setv
+			if count == 5 || op.Arguments[2] != 0 {
+				return SkillPassiveParameters{}
+			}
+			// The value is an unsigned word; a negative column is malformed.
+			if v, ok := textdataInt(fields[int(op.Column)+2]); !ok || v < 0 {
+				return SkillPassiveParameters{}
+			}
+			slot, known := SkillParameterFromKey(op.Arguments[0])
+			if !known {
+				return SkillPassiveParameters{}
+			}
+			out.Mask |= SkillParameterMask(1) << slot
+			out.Values[slot] = op.Arguments[1]
+			count++
+		case 0x72656174: // reat
+			if out.Reat.Mask != 0 || op.Arguments[0] == 0 || op.Arguments[0]&^0x3f != 0 {
+				return SkillPassiveParameters{}
+			}
+			out.Reat = SkillPassiveReat{Mask: op.Arguments[0], Value: op.Arguments[1]}
+		case 0x7265616c: // real
+			if out.Real.Mask != 0 || op.Arguments[0] == 0 {
+				return SkillPassiveParameters{}
+			}
+			out.Real = SkillPassiveReal{Mask: op.Arguments[0], Flat: op.Arguments[1], Grade: op.Arguments[2]}
+		case tagTimedBlock:
+			if out.Br.Mask != 0 || op.Count != 2 || op.Arguments[0] == 0 || op.Arguments[1] > maxBlockRatePercent {
+				return SkillPassiveParameters{}
+			}
+			out.Br = SkillPassiveBlockRate{Mask: normalizeLaneMask(op.Arguments[0]), Value: op.Arguments[1]}
+		case skillTagHitRate, 0x6572, 0x687069, 0x6d7069: // hr, er, hpi, mpi
+			if op.Count != 2 {
+				return SkillPassiveParameters{}
+			}
+			slot := &out.HitRate
+			switch op.Tag {
+			case 0x6572:
+				slot = &out.Evasion
+			case 0x687069:
+				slot = &out.MaxHP
+			case 0x6d7069:
+				slot = &out.MaxMP
+			}
+			if slot.Present {
+				return SkillPassiveParameters{}
+			}
+			*slot = SkillFlatRate{Present: true, Flat: op.Arguments[0], Percent: op.Arguments[1]}
+		case 0x647275: // dru
+			if op.Count != 2 || out.Dru != [2]uint32{} || op.Arguments == [6]uint32{} {
+				return SkillPassiveParameters{}
+			}
+			out.Dru = [2]uint32{op.Arguments[0], op.Arguments[1]}
+		case 0x64637269: // dcri
+			if op.Count != 1 || out.CriticalEvasion != 0 || op.Arguments[0] == 0 {
+				return SkillPassiveParameters{}
+			}
+			out.CriticalEvasion = op.Arguments[0]
+		case 0x6f646172: // odar
+			if op.Count != 2 || out.IncomingReduction || op.Arguments[1] == 0 {
+				return SkillPassiveParameters{}
+			}
+			out.IncomingReduction = true
+		case tagDamageReturn:
+			rule, ok := parseDamageReturn(op)
+			if out.DamageReturn.Present || !ok {
+				return SkillPassiveParameters{}
+			}
+			out.DamageReturn = rule
+		case 0x72657169, 0x7265716e: // reqi/reqn: row.Reqi
+		default:
+			return SkillPassiveParameters{}
+		}
+	}
+	out.Pinned = count > 0 || out.Reat.Mask != 0 || out.Real.Mask != 0 || out.Br.Mask != 0 ||
+		out.HitRate.Present || out.Evasion.Present || out.MaxHP.Present || out.MaxMP.Present || out.Dru != [2]uint32{} ||
+		out.CriticalEvasion != 0 || out.IncomingReduction || out.DamageReturn.Present
+	return out
+}
+
+/*
+================
+encodedAttackParameters
+
+Metadata extraction is independent of execution admission. Offense validates
+every getv key separately; unknown keys cannot silently become neutral buffs.
+================
+*/
+func encodedAttackParameters(fields []string) SkillParameterMask {
+	var mask SkillParameterMask
+	for i := skilldataColEncodedTail; i < len(fields); {
+		tag, ok := textdataInt(fields[i])
+		if !ok || tag == 0x73736f75 {
+			return mask
+		}
+		arity := spawnParamArity(uint32(tag))
+		if i+arity >= len(fields) {
+			return mask
+		}
+		if tag == tagGetv {
+			key, valid := textdataInt(fields[i+1])
+			if valid && key >= 0 && key <= 0xffffffff {
+				if slot, known := SkillParameterFromKey(uint32(key)); known {
+					mask |= 1 << slot
+				}
+			}
+		}
+		i += 1 + arity
+	}
+	return mask
+}
+
+/*
+================
+encodedTailHasParameter
+
+Walk instruction boundaries; argument values that equal a tag are not programs.
+================
+*/
+func encodedTailHasParameter(fields []string, wantedTag, wantedKey uint32) bool {
+	for i := skilldataColEncodedTail; i < len(fields); {
+		tag, ok := textdataInt(fields[i])
+		if !ok || tag == 0x73736f75 {
+			return false
+		}
+		arity := spawnParamArity(uint32(tag))
+		if i+arity >= len(fields) {
+			return false
+		}
+		if uint32(tag) == wantedTag && arity > 0 {
+			key, valid := textdataInt(fields[i+1])
+			if valid && key == int64(wantedKey) {
+				return true
+			}
+		}
+		i += arity + 1
+	}
+	return false
+}

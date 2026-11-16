@@ -1,0 +1,176 @@
+/*
+===========================================================================
+
+npccapability.go - the 0xB45A talk word an NPC's select answer carries
+
+The client menu builder (CIFNPCTalk_BuildMenuFromCapabilities 5D9100) turns
+the u32 into talk-window rows, and a row's click sends that bit back as the
+0x7338 mask. The word is the NPC's service set (npcservice.go) in the
+v1.150 bit layout, plus the services other owners grant: the shop of a
+refshopgroup association, the talk row of npcchat speech, the teleport
+bits of teleportdata (ConfigurePortals) and the Magic POP binding.
+
+===========================================================================
+*/
+
+package simulation
+
+// NPC talk capability bits: bit 1 << (option - 1) of the service option.
+const (
+	NpcTalkFlagShop        uint32 = 0x1  // option 1, row 1
+	NpcTalkFlagTalk        uint32 = 0x2  // option 2, row 4
+	NpcTalkFlagStorage     uint32 = 0x4  // option 3, rows 3, 0x2D, 0x2E
+	NpcTalkFlagRepair      uint32 = 0x8  // option 4, no row; shows the NPC quest tab
+	NpcTalkFlagRecallPoint uint32 = 0x40 // option 7, row 9
+	NpcTalkFlagTeleport    uint32 = 0x80 // option 8, row 0xA
+	// NpcTalkFlagResurrectPoint is service 9, which the reference server's
+	// teleport row reader grants for teleportdata CanGotoResurrectPos: row
+	// 0x10, "Teleport to return point", whose click sends 0x7495 type 1.
+	NpcTalkFlagResurrectPoint uint32 = 0x100   // option 9, row 0x10
+	NpcTalkFlagWithdrawSkill  uint32 = 0x200   // option 0xA, row 0x16
+	NpcTalkFlagStable         uint32 = 0x400   // option 0xB, no row
+	NpcTalkFlagSpecialTrade   uint32 = 0x800   // option 0xC, the shop row sends 0x800
+	NpcTalkFlagThiefBuy       uint32 = 0x1000  // option 0xD, no row
+	NpcTalkFlagGeneral        uint32 = 0x2000  // option 0xE, no row
+	NpcTalkFlagGuild          uint32 = 0x4000  // option 0xF, rows 0x12..0x1D
+	NpcTalkFlagGachaMachine   uint32 = 0x10000 // option 0x11, row 0x27
+	NpcTalkFlagGachaOperator  uint32 = 0x20000 // option 0x12, row 0x28 (client 5D9750): the voucher exchange
+	NpcTalkFlagJobTrader      uint32 = 0x80000
+	NpcTalkFlagJobThief       uint32 = 0x100000
+	NpcTalkFlagJobHunter      uint32 = 0x200000
+	// NpcTalkFlagTeleportGate is service 0x1C, the runtime gate a quest
+	// instance raises on its boss's death: on a teleport-gate object the
+	// client reads the gate's choice rows after the word and draws them as
+	// action 0x2A, whose click sends 0x7495 type 3 (questgate.go).
+	NpcTalkFlagTeleportGate  uint32 = 0x8000000  // option 0x1C, rows 0x2A
+	NpcTalkFlagReverseReturn uint32 = 0x20000000 // option 0x1E, rows 0x2B
+	NpcTalkFlagGatePulley    uint32 = 0x40000000 // option 0x1F, a u16 tail follows
+	NpcTalkFlagMagicOption   uint32 = 0x80000000 // option 0x20, row 0x2F
+	// NpcTalkFlagFortressOfficial is the fortress official's row (option
+	// 0x18): client 5D8FF0 tests 0x800000 and 5D7AD0 appends action 0x34
+	// (SN_FORTRESS_OFFICIAL_WARAPPLY), whose click sends 0x71E1 subtype 6.
+	// The port grants it to the official of every fortress in
+	// siegefortress.txt.
+	NpcTalkFlagFortressOfficial uint32 = 0x800000
+	// NpcTalkFlagFortressAide is the battle aide's row (option 0x19): client
+	// client 5D8FF0 tests 0x1000000 and 5D7AD0 appends action 0x32 (Structure
+	// management) only for a member of the holding guild, so the word is
+	// the NPC's and the holder rule stays the client's. INFERENCE: the
+	// server sends every viewer the same select word, as it does for the
+	// official; the row's 0x71E1 0x18 list answer is fortressServiceQuery's.
+	NpcTalkFlagFortressAide uint32 = 0x1000000
+	// NpcTalkFlagFortressManager is the fortress manager's rows (option
+	// 0x17): client 5D8FF0 tests 0x400000 and 5D7AD0 appends action 0x33
+	// (tax, staff and service), drawn for the holding guild and its allies
+	// with the staff row holder-only, so the word is the NPC's and the
+	// holder rules stay the client's, as for the aide. The rows' 0x71E1
+	// answers are fortressServiceQuery's tax and staff services.
+	NpcTalkFlagFortressManager uint32 = 0x400000
+	// NpcTalkFlagFortressSmith is the fortress smith's row (option 0x1A):
+	// client 5D8FF0 tests 0x2000000 and 5D7AD0 appends action 0x36
+	// (production). Its 0x71E1 answers are fortressProductionService's.
+	NpcTalkFlagFortressSmith uint32 = 0x2000000
+	// NpcTalkFlagFortressTrainer is the fortress trainer's row (option
+	// 0x1B): client 5D8FF0 tests 0x4000000 and 5D7AD0 appends action 0x37
+	// (training). Its 0x71E1 answers are fortressProductionService's.
+	NpcTalkFlagFortressTrainer uint32 = 0x4000000
+
+	// NpcTalkImplementedFlags is the subset whose request -> authority ->
+	// response lifecycle exists in this port; a row the client would draw
+	// for any other bit could only be refused. Bits without a row (repair,
+	// stable, thief buy, general) carry nothing to refuse. Still closed:
+	// gate pulleys, whose u16 tail the select answer does not write.
+	NpcTalkImplementedFlags uint32 = NpcTalkFlagShop | NpcTalkFlagTalk | NpcTalkFlagStorage |
+		NpcTalkFlagRepair | NpcTalkFlagRecallPoint | NpcTalkFlagTeleport | NpcTalkFlagResurrectPoint | NpcTalkFlagWithdrawSkill | NpcTalkFlagStable |
+		NpcTalkFlagSpecialTrade | NpcTalkFlagThiefBuy | NpcTalkFlagGeneral | NpcTalkFlagGachaMachine | NpcTalkFlagGachaOperator |
+		NpcTalkFlagJobTrader | NpcTalkFlagJobThief | NpcTalkFlagJobHunter | NpcTalkFlagReverseReturn |
+		NpcTalkFlagGuild | NpcTalkFlagMagicOption | NpcTalkFlagFortressOfficial |
+		NpcTalkFlagFortressAide | NpcTalkFlagFortressManager | NpcTalkFlagFortressSmith |
+		NpcTalkFlagFortressTrainer
+)
+
+// npcGachaMachines are the NPCs the reference data binds a Magic POP to
+// (the retail server registers option 0x11 when its gacha-name lookup
+// finds one).
+// INFERENCE: the v1.150 media ships no gacha binding table; the one machine
+// the client knows (row 0x27, SN_TALK_CH_GACHA_MACHINE_2) is the binding.
+var npcGachaMachines = map[string]bool{"NPC_CH_GACHA_MACHINE": true}
+
+// npcPotionMerchants are the five herbalists carrying the withdrawal
+// service (option 0xA, row 0x16): the same five towns the quest owner
+// serves through OpenResuscitation. Exact names, as there.
+var npcPotionMerchants = map[string]bool{
+	"NPC_CH_POTION": true, "NPC_WC_POTION": true, "NPC_KT_POTION": true,
+	"NPC_EU_POTION": true, "NPC_CA_POTION": true,
+}
+
+// npcTownSpecialTraders are v1.150's first specialty traders: npcpos spawns
+// them in Jangan, Donwhang and Hotan and refshopgroup binds each to its
+// GROUP_STORE_<town>_SPECIAL of trade goods. INFERENCE: the later retail
+// server's chains no longer name them (the later trade rework moved the
+// trade to the SPECIAL2 traders), so the v1.150 server, whose data still
+// sells goods through them, classified them as special traders like their
+// successors.
+// Exact names: a substring would also catch the SPECIAL2 rows.
+var npcTownSpecialTraders = map[string]bool{"NPC_CH_SPECIAL": true, "NPC_WC_SPECIAL": true, "NPC_KT_SPECIAL": true}
+
+/*
+================
+ResolveNpcServices
+
+The service set of a roster row: the retail server's codename chains, the
+shop a refshopgroup association grants, the talk row of npcchat speech,
+the Magic POP binding and v1.150's town specialty traders. INFERENCE: the
+later retail server registers option 2 nowhere in its chains; the quest
+and Lua plane adds conversation, which npcchat speech stands for.
+================
+*/
+func ResolveNpcServices(npc NpcDef) NpcServices {
+	services := NpcServicesForCodename(npc.Codename)
+	if len(npc.NpcTalkStoreGroups) != 0 {
+		services = services.With(NpcServiceShop)
+	}
+	if npc.BaseSpeechSymbol != "" || npc.QuestSpeechSymbol != "" {
+		services = services.With(NpcServiceTalk)
+	}
+	if npcGachaMachines[npc.Codename] {
+		services = services.With(NpcServiceGachaMachine)
+	}
+	if npcPotionMerchants[npc.Codename] {
+		services = services.With(NpcServiceWithdrawSkill)
+	}
+	if npcTownSpecialTraders[npc.Codename] {
+		services = services.With(NpcServiceSpecialTrade)
+	}
+	return services
+}
+
+/*
+================
+ResolveNpcTalkFlags
+
+The talk word composed at the data boundary, limited to implemented rows.
+================
+*/
+func ResolveNpcTalkFlags(npc NpcDef) uint32 {
+	return npc.Services.TalkFlags() & NpcTalkImplementedFlags
+}
+
+/*
+================
+NpcJobGuild
+
+The job (1 trader, 2 thief, 3 hunter) whose guild an NPC keeps, or 0.
+================
+*/
+func NpcJobGuild(npc NpcDef) uint8 {
+	switch {
+	case npc.Services.Has(NpcServiceJobTrader):
+		return 1
+	case npc.Services.Has(NpcServiceJobThief):
+		return 2
+	case npc.Services.Has(NpcServiceJobHunter):
+		return 3
+	}
+	return 0
+}

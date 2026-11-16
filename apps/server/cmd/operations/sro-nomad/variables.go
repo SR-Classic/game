@@ -1,0 +1,648 @@
+/*
+===========================================================================
+
+variables.go - the Nomad variables a deployment owns
+
+Secrets reach the jobs only as Nomad variables (the Agent's signing ring,
+provisioning token, account catalog chunks and, when configured, the bug
+report webhook; each GameWorld's public verifier ring). Writes use
+check-and-set so two deployers never silently overwrite each other.
+
+===========================================================================
+*/
+package main
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+
+	nomad "github.com/hashicorp/nomad/api"
+	"opensro.online/server/internal/agent/bugreport"
+)
+
+const (
+	agentVariablePath        = "nomad/jobs/sro-agent/agent/agent"
+	accountChunkPathPrefix   = agentVariablePath + "/accounts/"
+	accountChunkIndexDigits  = 6
+	gameWorldVariablePrefix  = "nomad/jobs/"
+	gameWorldVariableSuffix  = "/gameworld/gameworld"
+	accountChunkVariableItem = "payload"
+	bugReportWebhookItem     = "bug_report_discord_webhook"
+	// publicAPITokenItem is the GameWorld variable item the job template
+	// renders into secrets/public-api-token.
+	publicAPITokenItem      = "public_api_token"
+	nomadVariablePathBytes  = 128
+	nomadVariableItemsBytes = 64 << 10
+	// requiresStopPrefix opens validate -assume-stopped's report line.
+	requiresStopPrefix = "requires-stop"
+)
+
+/*
+================
+desiredVariable
+================
+*/
+type desiredVariable struct {
+	jobID string
+	path  string
+	items nomad.VariableItems
+}
+
+/*
+================
+variablePlan
+================
+*/
+type variablePlan struct {
+	desired            []desiredVariable
+	current            map[string]*nomad.Variable
+	staleAccountChunks []*nomad.VariableMetadata
+	// requiresStop lists the credential variables that differ while their
+	// job is registered; only a plan made with assumeStopped holds any.
+	requiresStop []stopRequirement
+}
+
+/*
+================
+stopRequirement
+
+One credential variable a deployment would replace, and the registered job
+that has to stop first.
+================
+*/
+type stopRequirement struct {
+	jobID string
+	path  string
+}
+
+/*
+================
+variableStops
+
+Decides what the changed credential variables need. Nomad renders a job's
+variables only when it starts, so a variable differing while its job is
+registered refuses (the operator stops the fleet first). assumeStopped is
+the staging rehearsal (validate -assume-stopped): it plans as if the fleet
+were already stopped, as a maintenance release's validate after its stop
+will, and returns each such variable instead of refusing.
+================
+*/
+func variableStops(
+	changedJobs map[string]string,
+	registered func(jobID string) (bool, error),
+	assumeStopped bool,
+) ([]stopRequirement, error) {
+	jobIDs := make([]string, 0, len(changedJobs))
+	for jobID := range changedJobs {
+		jobIDs = append(jobIDs, jobID)
+	}
+	sort.Strings(jobIDs)
+	var stops []stopRequirement
+	for _, jobID := range jobIDs {
+		live, err := registered(jobID)
+		if err != nil {
+			return nil, err
+		}
+		if !live {
+			continue
+		}
+		if !assumeStopped {
+			return nil, fmt.Errorf(
+				"nomad variable %s differs while job %s is registered; "+
+					"run `sro-nomad stop`, replace the operator-owned "+
+					"credential input, then run `sro-nomad deploy`",
+				changedJobs[jobID],
+				jobID,
+			)
+		}
+		stops = append(stops, stopRequirement{jobID: jobID, path: changedJobs[jobID]})
+	}
+	return stops, nil
+}
+
+/*
+================
+putVariables
+================
+*/
+func (deployment *deployment) putVariables(
+	ctx context.Context,
+	client *nomadClient,
+) error {
+	plan, err := deployment.planVariables(ctx, client, false)
+	if err != nil {
+		return err
+	}
+	for _, variable := range plan.desired {
+		existing := plan.current[variable.path]
+		if existing != nil &&
+			stringMapsEqual(existing.Items, variable.items) {
+			fmt.Printf("Nomad variable %s is unchanged\n", variable.path)
+			continue
+		}
+		value := nomad.NewVariable(variable.path)
+		value.Namespace = client.namespace
+		value.Items = variable.items
+		if existing == nil {
+			_, _, err := client.api.Variables().CheckedCreate(
+				value,
+				(&nomad.WriteOptions{}).WithContext(ctx),
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"create Nomad variable %s with CAS: %w",
+					variable.path,
+					err,
+				)
+			}
+			fmt.Printf("Created Nomad variable %s\n", variable.path)
+			continue
+		}
+		value.ModifyIndex = existing.ModifyIndex
+		_, _, err := client.api.Variables().CheckedUpdate(
+			value,
+			(&nomad.WriteOptions{}).WithContext(ctx),
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"update Nomad variable %s with CAS: %w",
+				variable.path,
+				err,
+			)
+		}
+		fmt.Printf("Updated Nomad variable %s\n", variable.path)
+	}
+	for _, variable := range plan.staleAccountChunks {
+		_, err := client.api.Variables().CheckedDelete(
+			variable.Path,
+			variable.ModifyIndex,
+			(&nomad.WriteOptions{}).WithContext(ctx),
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"delete stale account variable %s with CAS: %w",
+				variable.Path,
+				err,
+			)
+		}
+		fmt.Printf("Deleted stale account variable %s\n", variable.Path)
+	}
+	return nil
+}
+
+/*
+================
+validateVariables
+================
+*/
+func (deployment *deployment) validateVariables(
+	ctx context.Context,
+	client *nomadClient,
+	assumeStopped bool,
+) error {
+	plan, err := deployment.planVariables(ctx, client, assumeStopped)
+	if err != nil {
+		return err
+	}
+	// One parseable line per variable that needs the fleet stopped: the
+	// release receiver's staging rehearsal refuses a plain release with any.
+	for _, stop := range plan.requiresStop {
+		fmt.Printf("%s %s %s\n", requiresStopPrefix, stop.jobID, stop.path)
+	}
+	fmt.Printf(
+		"Validated %d Nomad Variable input(s) without mutation\n",
+		len(plan.desired),
+	)
+	return nil
+}
+
+/*
+================
+planVariables
+================
+*/
+func (deployment *deployment) planVariables(
+	ctx context.Context,
+	client *nomadClient,
+	assumeStopped bool,
+) (variablePlan, error) {
+	desired, err := deployment.desiredVariables()
+	if err != nil {
+		return variablePlan{}, err
+	}
+	if err := validateDesiredVariables(desired); err != nil {
+		return variablePlan{}, err
+	}
+	current := make(map[string]*nomad.Variable, len(desired))
+	changedJobs := make(map[string]string)
+	desiredPaths := make(map[string]struct{}, len(desired))
+
+	for index, variable := range desired {
+		desiredPaths[variable.path] = struct{}{}
+		existing, _, err := client.api.Variables().Peek(
+			variable.path,
+			(&nomad.QueryOptions{}).WithContext(ctx),
+		)
+		if err != nil {
+			return variablePlan{}, fmt.Errorf(
+				"read Nomad variable %s: %w",
+				variable.path,
+				err,
+			)
+		}
+		// The items each variable may change while its job runs without
+		// demanding a stop: the Agent's bug-report webhook (its template
+		// restarts the Agent with it), and the GameWorld's two webhooks
+		// (their templates are change_mode noop - the new value reaches
+		// the running task's files and applies as their banners say:
+		// the staff file at the next post, the bug-report env at the
+		// next boot). A difference confined to these never needs a stop.
+		var restartable []string
+		if variable.path == agentVariablePath {
+			variable.items = keepBugReportWebhook(variable.items, existing, deployment.BugReports.Off)
+			desired[index] = variable
+			restartable = []string{bugReportWebhookItem}
+		} else if _, gameWorld := managedGameWorldVariableJobID(variable.path); gameWorld {
+			variable.items = keepStaffWebhook(variable.items, existing, deployment.StaffWebhookOff)
+			variable.items = keepBugReportWebhook(variable.items, existing, deployment.BugReports.Off)
+			desired[index] = variable
+			restartable = []string{staffWebhookItem, bugReportWebhookItem}
+		}
+		current[variable.path] = existing
+		if existing == nil ||
+			!stringMapsEqual(existing.Items, variable.items) && !onlyItemsDiffer(existing.Items, variable.items, restartable) {
+			changedJobs[variable.jobID] = variable.path
+		}
+	}
+
+	staleAccountChunks, err := client.staleAccountChunkVariables(
+		ctx,
+		desiredPaths,
+	)
+	if err != nil {
+		return variablePlan{}, err
+	}
+	if len(staleAccountChunks) != 0 {
+		changedJobs[agentJobName] = staleAccountChunks[0].Path
+	}
+	stops, err := variableStops(changedJobs, func(jobID string) (bool, error) {
+		return client.jobExists(ctx, jobID)
+	}, assumeStopped)
+	if err != nil {
+		return variablePlan{}, err
+	}
+
+	return variablePlan{
+		desired:            desired,
+		current:            current,
+		staleAccountChunks: staleAccountChunks,
+		requiresStop:       stops,
+	}, nil
+}
+
+/*
+================
+keepBugReportWebhook
+
+The bug report webhook is set once by an operator and then lives only in
+the Agent's credential variable. A deploy that names none (every release:
+deploy.py runs with a clean environment) keeps the stored one; before, it
+rewrote the variable without it, which turned bug reports off on every
+release (or refused the release while the Agent ran). Only an explicit
+SRO_BUG_REPORT_DISCORD_WEBHOOK=off removes it.
+================
+*/
+func keepBugReportWebhook(items nomad.VariableItems, existing *nomad.Variable, off bool) nomad.VariableItems {
+	if off {
+		delete(items, bugReportWebhookItem)
+		return items
+	}
+	if _, named := items[bugReportWebhookItem]; named || existing == nil {
+		return items
+	}
+	if stored := existing.Items[bugReportWebhookItem]; bugreport.ValidWebhookURL(stored) {
+		items[bugReportWebhookItem] = stored
+	}
+	return items
+}
+
+/*
+================
+onlyBugReportWebhookDiffers
+
+Whether the two Agent credential sets differ in the bug report webhook
+alone. That item reaches the Agent through its own template (change_mode
+restart), so Nomad restarts the Agent with it: unlike the session keyring
+or the account catalog it needs no stop, and a release may set, change or
+remove it while the Agent runs.
+================
+*/
+func onlyBugReportWebhookDiffers(current, desired nomad.VariableItems) bool {
+	return onlyItemsDiffer(current, desired, []string{bugReportWebhookItem})
+}
+
+/*
+================
+onlyItemsDiffer
+
+Whether the two item sets are equal once the named items are set aside.
+No named items sets nothing aside.
+================
+*/
+func onlyItemsDiffer(current, desired nomad.VariableItems, names []string) bool {
+	strip := func(items nomad.VariableItems) map[string]string {
+		out := make(map[string]string, len(items))
+		for name, value := range items {
+			skip := false
+			for _, named := range names {
+				if name == named {
+					skip = true
+					break
+				}
+			}
+			if !skip {
+				out[name] = value
+			}
+		}
+		return out
+	}
+	return stringMapsEqual(strip(current), strip(desired))
+}
+
+/*
+================
+validateDesiredVariables
+================
+*/
+func validateDesiredVariables(variables []desiredVariable) error {
+	seen := make(map[string]struct{}, len(variables))
+	for _, variable := range variables {
+		if err := validateNomadVariablePath(variable.path); err != nil {
+			return fmt.Errorf(
+				"nomad variable for job %s: %w",
+				variable.jobID,
+				err,
+			)
+		}
+		if _, exists := seen[variable.path]; exists {
+			return fmt.Errorf(
+				"nomad variable path %q is generated more than once",
+				variable.path,
+			)
+		}
+		seen[variable.path] = struct{}{}
+
+		itemBytes := 0
+		for key, value := range variable.items {
+			itemBytes += len(key) + len(value)
+		}
+		if itemBytes > nomadVariableItemsBytes {
+			return fmt.Errorf(
+				"nomad variable %s items total %d bytes; limit is %d",
+				variable.path,
+				itemBytes,
+				nomadVariableItemsBytes,
+			)
+		}
+	}
+	return nil
+}
+
+/*
+================
+validateNomadVariablePath
+================
+*/
+func validateNomadVariablePath(path string) error {
+	if len(path) < 1 || len(path) > nomadVariablePathBytes {
+		return fmt.Errorf(
+			"path %q is %d bytes; limit is 1..%d",
+			path,
+			len(path),
+			nomadVariablePathBytes,
+		)
+	}
+	for _, character := range []byte(path) {
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '-' ||
+			character == '_' ||
+			character == '~' ||
+			character == '/' {
+			continue
+		}
+		return fmt.Errorf(
+			"path %q contains non-Nomad character %q",
+			path,
+			character,
+		)
+	}
+	return nil
+}
+
+/*
+================
+desiredVariables
+================
+*/
+func (deployment *deployment) desiredVariables() ([]desiredVariable, error) {
+	agentItems := nomad.VariableItems{
+		"agent_session_keyring":    deployment.Secrets.SessionPrivate,
+		"agent_provisioning_token": deployment.Secrets.ProvisioningToken,
+	}
+	// Absent, not empty, when bug reports are off: the job template renders
+	// SRO_BUG_REPORT_DISCORD_WEBHOOK only when the item exists.
+	if webhook := deployment.BugReports.WebhookURL; webhook != "" {
+		agentItems[bugReportWebhookItem] = webhook
+	}
+	desired := []desiredVariable{{
+		jobID: agentJobName,
+		path:  agentVariablePath,
+		items: agentItems,
+	}}
+	for index, chunk := range deployment.Secrets.AccountChunks {
+		desired = append(desired, desiredVariable{
+			jobID: agentJobName,
+			path:  accountChunkVariablePath(index),
+			items: nomad.VariableItems{
+				accountChunkVariableItem: chunk,
+			},
+		})
+	}
+	for _, game := range deployment.Shards {
+		gameWorldItems := nomad.VariableItems{
+			"agent_session_public_keys": deployment.Secrets.SessionPublic,
+		}
+		// Absent, not empty, without a token: the job template then renders
+		// an empty file and the GameWorld leaves the privacy write unserved.
+		if token := deployment.Secrets.PublicAPIToken; token != "" && game.PublicAPIAddr != "off" {
+			gameWorldItems[publicAPITokenItem] = token
+		}
+		// Absent, not empty, without one: the template renders an empty
+		// file and the GameWorld's certificate alert only logs.
+		if webhook := deployment.StaffWebhook; webhook != "" {
+			gameWorldItems[staffWebhookItem] = webhook
+		}
+		// Absent, not empty, without one: the same item the Agent's
+		// variable carries, mirrored so the /report chat intake
+		// (opensro#2959) delivers through the sink exactly when the
+		// Agent's bug reports do. The GameWorld job reads only its own
+		// variable, so its template renders SRO_BUG_REPORT_DISCORD_WEBHOOK
+		// from this item and nothing while it is absent.
+		if webhook := deployment.BugReports.WebhookURL; webhook != "" {
+			gameWorldItems[bugReportWebhookItem] = webhook
+		}
+		jobID := gameWorldJobPrefix + game.Definition.ID
+		desired = append(desired, desiredVariable{
+			jobID: jobID,
+			path: gameWorldVariablePrefix + jobID +
+				gameWorldVariableSuffix,
+			items: gameWorldItems,
+		})
+	}
+	return desired, nil
+}
+
+/*
+================
+accountChunkVariablePath
+================
+*/
+func accountChunkVariablePath(index int) string {
+	return accountChunkPathPrefix + fmt.Sprintf(
+		"%0*d",
+		accountChunkIndexDigits,
+		index,
+	)
+}
+
+/*
+================
+staleAccountChunkVariables
+================
+*/
+func (client *nomadClient) staleAccountChunkVariables(
+	ctx context.Context,
+	desiredPaths map[string]struct{},
+) ([]*nomad.VariableMetadata, error) {
+	variables, _, err := client.api.Variables().PrefixList(
+		accountChunkPathPrefix,
+		(&nomad.QueryOptions{}).WithContext(ctx),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list Agent account variables: %w", err)
+	}
+	stale := make([]*nomad.VariableMetadata, 0)
+	for _, variable := range variables {
+		if !managedAccountChunkPath(variable.Path) {
+			continue
+		}
+		if _, keep := desiredPaths[variable.Path]; !keep {
+			stale = append(stale, variable)
+		}
+	}
+	return stale, nil
+}
+
+/*
+================
+managedAccountChunkPath
+================
+*/
+func managedAccountChunkPath(path string) bool {
+	index := strings.TrimPrefix(path, accountChunkPathPrefix)
+	if index == path || len(index) != accountChunkIndexDigits {
+		return false
+	}
+	_, err := strconv.ParseUint(index, 10, 32)
+	return err == nil
+}
+
+/*
+================
+stringMapsEqual
+================
+*/
+func stringMapsEqual(
+	left map[string]string,
+	right map[string]string,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+/*
+================
+deleteDisabledGameWorldVariables
+================
+*/
+func (client *nomadClient) deleteDisabledGameWorldVariables(
+	ctx context.Context,
+	enabled map[string]struct{},
+) error {
+	variables, _, err := client.api.Variables().PrefixList(
+		gameWorldVariablePrefix+gameWorldJobPrefix,
+		(&nomad.QueryOptions{}).WithContext(ctx),
+	)
+	if err != nil {
+		return fmt.Errorf("list managed GameWorld variables: %w", err)
+	}
+	for _, variable := range variables {
+		jobID, managed := managedGameWorldVariableJobID(variable.Path)
+		if !managed {
+			continue
+		}
+		if _, keep := enabled[jobID]; keep {
+			continue
+		}
+		_, err := client.api.Variables().CheckedDelete(
+			variable.Path,
+			variable.ModifyIndex,
+			(&nomad.WriteOptions{}).WithContext(ctx),
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"delete disabled GameWorld variable %s with CAS: %w",
+				variable.Path,
+				err,
+			)
+		}
+		fmt.Printf(
+			"Deleted disabled GameWorld variable %s\n",
+			variable.Path,
+		)
+	}
+	return nil
+}
+
+/*
+================
+managedGameWorldVariableJobID
+================
+*/
+func managedGameWorldVariableJobID(path string) (string, bool) {
+	if !strings.HasPrefix(path, gameWorldVariablePrefix) ||
+		!strings.HasSuffix(path, gameWorldVariableSuffix) {
+		return "", false
+	}
+	jobID := strings.TrimSuffix(
+		strings.TrimPrefix(path, gameWorldVariablePrefix),
+		gameWorldVariableSuffix,
+	)
+	if !strings.HasPrefix(jobID, gameWorldJobPrefix) ||
+		path != gameWorldVariablePrefix+jobID+gameWorldVariableSuffix {
+		return "", false
+	}
+	return jobID, true
+}

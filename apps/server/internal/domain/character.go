@@ -1,0 +1,978 @@
+/*
+===========================================================================
+
+character.go - the persisted character record
+
+Character authority owns this graph. Transport projects it into native wire
+records; detached snapshots must copy every mutable child before use.
+
+===========================================================================
+*/
+
+package domain
+
+import (
+	"encoding/json"
+)
+
+/*
+==================
+InventoryRow
+
+InventoryRow is one persisted missionInventory row: the character's
+AUTHORITATIVE inventory (item moves and drops mutate it; bootstrap only
+reads it). varianceBits persists as a decimal string because JSON has no
+64-bit integer type the Node side trusts (BigInt).
+==================
+*/
+type InventoryRow struct {
+	// TradeOwner is the original job alias in the goods record's owner string
+	// (the server's goods record). A transfer changes the holder, never this
+	// sale-admission identity.
+	TradeOwner string        `json:"tradeOwner,omitempty"`
+	Summon     *CharacterCOS `json:"summon,omitempty"`
+	// Portable persistence for an already supplied native +20/+24 identity.
+	// This is not a serial allocator or a native SQL column declaration.
+	RecordID     uint64 `json:"recordId,omitempty,string"`
+	Slot         int64  `json:"slot"`
+	RefObjID     uint32 `json:"refObjId"`
+	Codename     string `json:"codename"`
+	TypeFlags    uint16 `json:"typeFlags"`
+	Plus         int64  `json:"plus"`
+	VarianceBits string `json:"varianceBits"`
+	Durability   int64  `json:"durability"`
+	StackCount   int64  `json:"stackCount"`
+
+	// MagicOptions are the item's encoded magic-option params, EXACTLY the
+	// u64 values the CSOItem wire carries after the count byte (the client
+	// fold CSOItem_Deserialize -> CSOItem_DeserializeMagicOptions: u8 count
+	// asserted <= 12, then count x u64 LE). Encoding is the SRO-standard
+	// reinforce shape the
+	// client's REINFORCE leg decodes for ordinary gear: low u16 = the
+	// magicoption.txt param id (MUST resolve in the client's
+	// magicOptionDefsByParamId3e4 table or the parse throws "missing
+	// required magic-option definition"), high u32 = the signed modifier
+	// magnitude. Param ids are v1.150-native magicoption.txt rows resolved
+	// by MATTR_* codename (see internal/game/enterworld/magicoptions.go). Absent =
+	// no options (the BlockedWhisperers omitempty posture, no schema
+	// bump). Persisted as JSON numbers: real option magnitudes are u32, so
+	// every encoded value stays far below the 2^53 float boundary.
+	MagicOptions []uint64 `json:"magicOptions,omitempty"`
+	// Data is the item record's data word (+0x38), whose meaning the
+	// item's type gives: a monster capsule's is the monster the mask turns
+	// its user into; a Devil's Spirit's (3/1/14, port-only behind
+	// SRO_NASRUN) is its awakening expiry in Unix seconds, 0 while
+	// dormant (nasrun/clock.go). No item is both. The JSON key keeps the
+	// capsule's original name so every saved record still decodes.
+	Data uint32 `json:"transformRefObjId,omitempty"`
+	// ForgeBound marks an item forged by the GM item-forge tool (port
+	// only, issue #1980): it refuses trade, NPC sale, stall offer and
+	// player drop. Absent on every native row.
+	ForgeBound bool `json:"forgeBound,omitempty"`
+}
+
+/*
+================
+WorldSpawn
+
+Settled position. The movement owner retains the in-flight segment separately.
+================
+*/
+type WorldSpawn struct {
+	RegionID *int64   `json:"regionId"`
+	X        *float64 `json:"x"`
+	Y        *float64 `json:"y"`
+	Z        *float64 `json:"z"`
+	Angle    *int64   `json:"angle"`
+}
+
+/*
+================
+WorldPoint
+
+A recorded position and the RefGameWorld it lies in: the native char-data
+point blocks keep the world's u16 GameWorldID beside the region and
+coordinates (recall +0xEE, death +0xF0). World is omitted for INS_DEFAULT,
+so a field point stays the record it always was.
+================
+*/
+type WorldPoint struct {
+	WorldSpawn
+	World uint16 `json:"world,omitempty"`
+}
+
+/*
+==================
+CharacterWorld
+
+CharacterWorld is the persisted character.world record: the fields the
+bootstrap start profile reads, plus opaque passthrough for the
+movement-lane bookkeeping so the character snapshot does not drop keys the
+Node record carries (moveSegment stays raw - the live plane belongs to the
+movement lane, the snapshot only echoes it).
+==================
+*/
+type CharacterWorld struct {
+	// SavedReturn is the native CSO return world/region/position. Region
+	// admission updates it only in type-0 worlds on layer 1 (the server's
+	// region admission). It is independent of the movement goal and
+	// appointed rebirth town.
+	SavedReturn *SavedReturnLocation `json:"savedReturn,omitempty"`
+	// PackedInstance is the native world identity: definition in the low
+	// word, instance in the high word. An absent legacy record belongs to
+	// INS_DEFAULT instance 1; explicit values are never inferred from region.
+	PackedInstance *uint32 `json:"packedInstance,omitempty"`
+	// InstanceReturn is the anchor recorded when a character enters an
+	// instanced world (a quest instance, a match world): the world and pose
+	// the character returns to when the instance ends. The transfer writes
+	// it before the move commits and the return clears it, so a present
+	// anchor means the character is inside an instance programme. Absent
+	// outside one (schema 29).
+	InstanceReturn *InstanceReturnAnchor `json:"instanceReturn,omitempty"`
+	Spawn          *WorldSpawn           `json:"spawn"`
+	// AuthoredAreaReturn is the settled ordinary-world spawn captured before
+	// entering a server-authored area. Authored areas are real world regions,
+	// so movement continues to update Spawn normally; this independent return
+	// anchor lets an explicit leave operation restore the previous world
+	// location without client-owned coordinates or area-specific server hacks.
+	AuthoredAreaReturn *WorldSpawn `json:"authoredAreaReturn,omitempty"`
+	// RebirthPoint is the resolved town return position appointed through an eligible
+	// NPC or teleport gate (retail AppointedTeleport). It is independent of Spawn:
+	// ordinary movement must never overwrite the designated return city.
+	RebirthPoint *WorldSpawn `json:"rebirthPoint,omitempty"`
+	// Native char-data +0xa4 stores the appointed RefObj identity, not a runtime GID.
+	// RebirthPoint remains the durable fallback for legacy records and removed gates.
+	RebirthGateRefID uint32 `json:"rebirthGateRefId,omitempty"`
+	// LastRecallPoint is where the player last used a return scroll (native
+	// char-data +0xCC.., saved by the server's recall-position routine, called
+	// from the return scroll's location check); LastDeathPoint is where the
+	// player last died (+0xDC.., saved by the death-position routine from the
+	// normal death path). Both record only in a type-0 world. The reverse
+	// return scroll takes the player back to either, in its world.
+	LastRecallPoint *WorldPoint `json:"lastRecallPoint,omitempty"`
+	LastDeathPoint  *WorldPoint `json:"lastDeathPoint,omitempty"`
+	MovementMode    *int64      `json:"movementMode"`
+	SpawnSet        bool        `json:"spawnSet"`
+	// DungeonFloorIndex is semantic game state. The browser combines it with
+	// its packed minimap catalogue; presentation prefixes, labels, tile paths
+	// and bounds never belong in the authority record.
+	DungeonFloorIndex    *int64          `json:"dungeonFloorIndex,omitempty"`
+	MovementSourceSeeded bool            `json:"movementSourceSeeded,omitempty"`
+	UpdatedAt            string          `json:"updatedAt,omitempty"`
+	MoveSegment          json.RawMessage `json:"moveSegment,omitempty"`
+}
+
+/*
+================
+SavedReturnLocation
+
+World identity and position saved for native return-location skills.
+================
+*/
+type SavedReturnLocation struct {
+	Definition uint16  `json:"definition"`
+	RegionID   uint16  `json:"regionId"`
+	X          float32 `json:"x"`
+	Y          float32 `json:"y"`
+	Z          float32 `json:"z"`
+}
+
+/*
+================
+InstanceReturnAnchor
+
+The world and pose a character returns to when an instanced world ends.
+PackedInstance carries the full world identity (definition in the low
+word, layer in the high word), unlike SavedReturnLocation's
+definition-only native return point: the layer is what makes the anchor
+an instance address rather than a town address.
+================
+*/
+type InstanceReturnAnchor struct {
+	PackedInstance uint32  `json:"packedInstance"`
+	RegionID       uint16  `json:"regionId"`
+	X              float32 `json:"x"`
+	Y              float32 `json:"y"`
+	Z              float32 `json:"z"`
+	Angle          uint16  `json:"angle"`
+}
+
+/*
+==================
+BuybackEntry
+
+Character mirrors the persisted character record fields the bootstrap /
+appearance / visual-loadout path reads. Pointer fields distinguish "absent"
+from zero the way the Node coercers do (Number(undefined) -> NaN -> the
+fallback), which is load-bearing for e.g. bodyShapeByte vs heightIndex.
+
+MissionInventory nil vs empty matters and maps 1:1 onto the Node
+Array.isArray gate: nil means the inventory was never seeded (first-ever
+bootstrap, overlay early-returns), an empty non-nil slice means "seeded and
+empty" (an unworn weapon must NOT render).
+BuybackEntry retains the exact sold item in the character transaction.
+Entries belong to a live player lifetime and are deliberately not persisted.
+Native pool reset clears PC+2008; no wall-clock TTL is inferred from that.
+==================
+*/
+type BuybackEntry struct {
+	ID          uint32       `json:"id"`
+	MerchantRef uint32       `json:"merchantRef"`
+	Price       uint64       `json:"price"`
+	Item        InventoryRow `json:"item"`
+}
+
+/*
+================
+Character
+
+One authority transaction owns inventory, progression and quest state together.
+Pointers distinguish absent legacy values from meaningful zero values.
+================
+*/
+type Character struct {
+	// Actor-only teleport state. Character-store snapshots carry it; reconnect
+	// never resurrects a timer belonging to the previous native actor lifetime.
+	NativeTeleportMode uint8     `json:"-"`
+	PK                 *PKRecord `json:"pk,omitempty"`
+	// Online is the port-only time-online record (public boards); nil
+	// until the character first enters the world. character_online.go
+	// owns its crediting rules.
+	Online *OnlineRecord `json:"online,omitempty"`
+	// LastSeenUnixMs is when the character last left the world (guild
+	// votes measure a master's and a voter's absence from it).
+	LastSeenUnixMs  int64             `json:"lastSeenUnixMs,omitempty"`
+	Aggressions     map[uint32]uint32 `json:"-"`
+	EventMembership *EventMembership  `json:"-"`
+	// NativeBodyStatus is runtime-only state, copied under the character store
+	// door. Writers use TransitionBodyStatus; presentation never owns it.
+	BerserkPoints  uint8 `json:"berserkPoints"`
+	BerserkUntilMs int64 `json:"-"`
+	// BattleUntilMs ends the battle state (the player object's state+0xD,
+	// channel 8). Striking or being struck restarts its countdown; zero is
+	// peace.
+	BattleUntilMs int64 `json:"-"`
+	// LastExpLoss is the player object's +0x1CE0, the size of the last
+	// negative EXP change (recorded by the server's EXP delta routine).
+	// Resurrection returns a percent of it; every revival clears it.
+	LastExpLoss int64 `json:"-"`
+	// DeathKind is the player object's +0x1CB4, the last death's kind
+	// (pk.DeathKind): the server's death routine records it, the 0x37CE
+	// notice carries it, and the rebirth revives a team death where it
+	// fell. Every revival clears it (as the server's town teleport does).
+	// Runtime-only, as natively.
+	DeathKind uint8 `json:"-"`
+	// SiegeDeathAtMs is the player object's +0x1CD4 kept as the death
+	// instant: the server's player death handler sets the counter to 180
+	// ticks on every death, the player tick decays it one a tick while a
+	// siege war runs and the corpse waits, and the rebirth refuses
+	// outright while it still
+	// reads above 165. The port measures elapsed ticks from the stamp
+	// instead of ticking every corpse. One tick is one second, inferred
+	// from the native constants: a 180-tick corpse clock and a 15-tick
+	// refusal window are round, meaningful spans in seconds and noise
+	// at any finer rate. Zero: no death is on the clock.
+	SiegeDeathAtMs   int64  `json:"-"`
+	NativeBodyStatus uint8  `json:"-"`
+	BodyStatusOwner  uint64 `json:"-"`
+	// CommitRevision counts the store commit doors that have written
+	// this record: the tick's presentation caches key their kept inputs
+	// on it, so the store - the record's owner - does the invalidation
+	// when equipment, a job suit, an avatar or a companion changes.
+	// Runtime-only: a loaded record starts at zero and primes its first
+	// capture from there.
+	CommitRevision uint64 `json:"-"`
+	// TransformRefObjID is the transform block (player object +0x21A0): the
+	// monster a mask made the player (msch 1), or the player a Duplicate
+	// copies (msch 2). Runtime-only; the effect instance that set it clears
+	// it (through the server's transform reset).
+	TransformRefObjID uint32 `json:"-"`
+	// TransformMode is that instance's msch word (1 mask, 2 duplicate), the
+	// value the server's transform-mode query answers; 0 when none.
+	TransformMode uint8 `json:"-"`
+	// TransformShape and TransformEquipment are a Duplicate's copy of the
+	// other player's record byte and nine worn slots (the server's copy
+	// step).
+	TransformShape     uint8          `json:"-"`
+	TransformEquipment [9]uint32      `json:"-"`
+	BuybackNext        uint32         `json:"buybackNext,omitempty"`
+	Buyback            []BuybackEntry `json:"-"`
+	BuybackSession     uint64         `json:"-"`
+	ID                 int64          `json:"id"`
+	// AccountID is the authoritative owner identity minted by title login.
+	// It is mandatory for every live record: character-select reads and
+	// writes are tenant-scoped by it, while names remain division-global.
+	AccountID string `json:"accountId,omitempty"`
+	Name      string `json:"name"`
+	// PendingRenameName is the name a name-change scroll queued for the
+	// next login (port-only, #1689, SRO_NAME_CHANGE_SCROLL). Empty means
+	// no rename is queued. The runtime rename door applies and clears it
+	// before the character list is answered; it never applies mid-session.
+	PendingRenameName string `json:"pendingRenameName,omitempty"`
+	// PendingRenameQueuedMs is the instant the pending rename was queued.
+	PendingRenameQueuedMs int64 `json:"pendingRenameQueuedMs,omitempty"`
+	// LastRenameMs is the instant the last queued rename was applied; the
+	// 30-day rename cooldown is measured from it. Zero: never renamed.
+	LastRenameMs int64 `json:"lastRenameMs,omitempty"`
+	// RenameNoticeFrom is the pre-rename name while the "X is now known
+	// as Y" notice still owes the character's friends and guild members
+	// (port-only, #1689). Applied with the rename; the world-bind fanout
+	// clears it once the notice has been sent. Empty: nothing owed.
+	RenameNoticeFrom string `json:"renameNoticeFrom,omitempty"`
+	DeletePending    bool   `json:"deletePending"`
+	// DeleteReservedAt is the ISO instant the deletion reservation was
+	// placed. The character-select screen renders the countdown from it and
+	// the deletion reaper archives matured reservations. Empty means no
+	// reservation is pending.
+	DeleteReservedAt string `json:"deleteReservedAt,omitempty"`
+
+	RaceIndex *int64 `json:"raceIndex"`
+	Gender    *int64 `json:"gender"`
+
+	ModelCodename string `json:"modelCodename"`
+	ModelRef      *int64 `json:"modelRef"`
+
+	WeaponSelected bool   `json:"weaponSelected"`
+	WeaponIndex    *int64 `json:"weaponIndex"`
+	ArmorSelected  bool   `json:"armorSelected"`
+	ProtectorIndex *int64 `json:"protectorIndex"`
+
+	BodyShapeByte *int64   `json:"bodyShapeByte"`
+	HeightIndex   *int64   `json:"heightIndex"`
+	VolumeIndex   *int64   `json:"volumeIndex"`
+	HeightScale   *float64 `json:"heightScale"`
+	VolumeScale   *float64 `json:"volumeScale"`
+
+	AnimationSetName string `json:"animationSetName"`
+
+	MissionInventory []InventoryRow  `json:"missionInventory"`
+	World            *CharacterWorld `json:"world,omitempty"`
+
+	// ActiveCOS is the server-authoritative summoned companion/transport.
+	// The item use that creates it consumes the ITEM_COS_* row and persists
+	// this identity in the same character transaction; later 0x769E commands
+	// must match this exact GID and never trust a client-proposed vehicle.
+	ActiveCOS *CharacterCOS `json:"activeCos,omitempty"`
+	// Guild soldiers are character-owned rows, independent of the consumed
+	// scroll. The server's re-entry restores their remaining calendar leases.
+	Mercenaries []*CharacterCOS `json:"mercenaries,omitempty"`
+	// Owner timed job (2, 4), created by the summon for 1,200 seconds.
+	MercenarySummonUntilMs int64 `json:"mercenarySummonUntilMs,omitempty"`
+	// CapturedCOS is a capture-escort quest's captured monster (TypeID
+	// 1/2/3/6, RefObjType_IsCosBand6_CaptureMonster): runtime-only, never
+	// persisted. The quest
+	// record keeps the capture; a relog either re-summons it or fails it.
+	CapturedCOS *CharacterCOS `json:"-"`
+	// Port-only spell summons have no summoner item and never survive reentry.
+	BroodGeneration uint64           `json:"-"`
+	Brood           []*CharacterCOS  `json:"-"`
+	PetSkillWindows []PetSkillWindow `json:"petSkillWindows,omitempty"`
+	// ParamJobs are the live item parameter jobs (the server's param keeper
+	// job): EXP/skill-EXP scroll bonuses with an absolute deadline.
+	ParamJobs []ParamJob `json:"paramJobs,omitempty"`
+	// CompositeJobs are the premium package's limited uses and booth buffs
+	// (the server's composite item keeper works UIL1, UQL1, BFI1).
+	CompositeJobs []CompositeJob `json:"compositeJobs,omitempty"`
+	// StallDecoration is the stall booth decoration (ITEM_MALL_BOOTH_*, TID
+	// 3.3.3.4) the character applied for good: the v1.188 expendable item use
+	// stores the item's reference id in the persistent record. Zero is the
+	// country's default stall.
+	StallDecoration uint32 `json:"stallDecoration,omitempty"`
+	// PublicHidden keeps the character off the community site's public read
+	// API (port-only, not native: the opensro.online privacy choice). Its
+	// kills read as "a hunter" there and its profile answers 404.
+	PublicHidden bool `json:"publicHidden,omitempty"`
+	// PublicGearHidden keeps the character's worn gear details (white-stat
+	// rolls, blue stats, durability) off its public profile while the
+	// profile itself stays visible (port-only, not native: the
+	// opensro.online "hide my gear" choice, schema 23).
+	PublicGearHidden bool `json:"publicGearHidden,omitempty"`
+	// BreakNotice is the character's opt-in to the shard's item-break
+	// notices (port-only, not native: SRO_ALCHEMY_BREAK_NOTICE, #1738,
+	// the opensro.online account-page choice, schema 32). Off: their
+	// alchemy breaks are never announced.
+	BreakNotice bool `json:"breakNotice,omitempty"`
+	// MostWanted is the character's job-kill streak (port-only, not native:
+	// SRO_MOST_WANTED, action/mostwanted.go; schema 24). Nil is no streak.
+	MostWanted *MostWanted `json:"mostWanted,omitempty"`
+	// SookArenaActive marks a character inside (or entering) an Event
+	// So-ok survival run (port-only, not native: SRO_SOOK_SURVIVAL_ARENA).
+	// SookArenaDay and SookArenaEntries were the schema 42 per-character
+	// daily count; since schema 43 the account's SookArenaAccount owns it
+	// (#3322), and these two are only the seed that record is derived
+	// from at first load, kept so schema 42 records still load.
+	SookArenaActive  bool        `json:"sookArenaActive,omitempty"`
+	SookArenaDay     int32       `json:"sookArenaDay,omitempty"`
+	SookArenaEntries uint8       `json:"sookArenaEntries,omitempty"`
+	SookChest        *ArenaChest `json:"sookChest,omitempty"`
+	// HalloweenBoxDay is the 04:00-UTC day (progression.HalloweenDayKey)
+	// the character's daily jewelry-box count belongs to, and
+	// HalloweenBoxCount the boxes minted that day from every source
+	// (port-only, not native: SRO_HALLOWEEN_EVENT, action/halloween.go;
+	// schema 34). Zero day: nothing counted yet. Since schema 36 the
+	// account's HalloweenBoxAccount owns the count (#2547); these fields
+	// are the legacy per-character seed the account record is derived
+	// from at first load, kept so schema 34/35 records still load.
+	HalloweenBoxDay   int64 `json:"halloweenBoxDay,omitempty"`
+	HalloweenBoxCount int64 `json:"halloweenBoxCount,omitempty"`
+	// NasrunTokens is the character's Devil's Spirit token balance, earned
+	// on unique kills and spent at the token shop; NasrunTokenDay is the
+	// token day (nasrun.TokenDay) NasrunTokenDayCount belongs to, the
+	// tokens earned that day under the daily cap (port-only, not native:
+	// SRO_NASRUN, game/nasrun/tokens.go; schema 46). Bound to the
+	// character: nothing moves a balance to another.
+	NasrunTokens        int64 `json:"nasrunTokens,omitempty"`
+	NasrunTokenDay      int64 `json:"nasrunTokenDay,omitempty"`
+	NasrunTokenDayCount int64 `json:"nasrunTokenDayCount,omitempty"`
+	// LevelReachedAt is when the character first reached each milestone level
+	// (PublicLevelMilestones), in Unix milliseconds, for the site's
+	// world-firsts (port-only, not native).
+	LevelReachedAt map[uint8]int64 `json:"levelReachedAt,omitempty"`
+	// LastLoginAtMs is the character's latest world entry, in Unix
+	// milliseconds, for the site's player database (port-only, not native).
+	LastLoginAtMs int64 `json:"lastLoginAtMs,omitempty"`
+	// PremiumClock is the running premium ticket's daily allotment
+	// (the server's premium keeper job); nil when no ticket runs.
+	PremiumClock *PremiumClock `json:"premiumClock,omitempty"`
+	// ItemGroupCooldowns maps an item COOLTIME group to its absolute end.
+	ItemGroupCooldowns map[uint32]int64 `json:"itemGroupCooldowns,omitempty"`
+	TimedSkillJobs     []TimedSkillJob  `json:"timedSkillJobs,omitempty"`
+	// FortressReturnUntilMs ends the fortress-return cooldown, the owner
+	// timed job (2, 5) of 600 s the server's 0x705D fortress-return handler
+	// creates; zero when none runs.
+	FortressReturnUntilMs int64 `json:"fortressReturnUntilMs,omitempty"`
+	// CampDisbandedAtMs is when the character last dissolved a training
+	// camp (the reference server's camp disband: 7-day / 604,800 s reopen
+	// cooldown, error 0x681C -> client 0x1C UIIT_MSG_TC_ERROR_NOT_OPEN_7D).
+	CampDisbandedAtMs int64 `json:"campDisbandedAtMs,omitempty"`
+
+	// InventorySize is the inventory capacity byte the client was given at
+	// its last world entry (13 equipment sockets plus the bag); zero is the
+	// creation capacity DefaultInventorySize. Every inventory rule bounds
+	// the bag by it (InventoryCapacity). InventoryExpansion holds slots a
+	// quest has paid since then: the v1.150 client reads capacity only at
+	// world entry (inventory_capacity.go), so they join InventorySize when
+	// the next entry presents them.
+	InventorySize      uint8 `json:"inventorySize,omitempty"`
+	InventoryExpansion uint8 `json:"inventoryExpansion,omitempty"`
+
+	// AvatarInventory is the persisted costume inventory. Rows reuse the
+	// equipment item body and occupy native avatar slots 0..3. Every row's
+	// reference object must be present in the enter-world item snapshot.
+	AvatarInventory *AvatarInventory `json:"avatarInventory,omitempty"`
+
+	// Current progression values. Maxima are derived from level and stats and
+	// are deliberately not persisted.
+	Level       *int64 `json:"level,omitempty"`
+	MaxLevel    *int64 `json:"maxLevel,omitempty"`
+	CurrentHP   *int64 `json:"currentHp,omitempty"`
+	CurrentMP   *int64 `json:"currentMp,omitempty"`
+	SkillPoints *int64 `json:"skillPoints,omitempty"`
+	StatPoints  *int64 `json:"statPoints,omitempty"`
+	Experience  *int64 `json:"experience,omitempty"`
+	SkillExp    *int64 `json:"skillExp,omitempty"`
+	Gold        *int64 `json:"gold,omitempty"`
+	// VisualFlags is the complete CICUser+0x779 byte. Bit 0 is the
+	// beginner/rudiment nameplate mark; bit 1 is the server-owned attached
+	// state-effect flag. The client always submits and receives the complete
+	// byte (0x7683 -> 0xB683), so this must be persisted atomically rather
+	// than represented as an independent UI preference.
+	VisualFlags *int64 `json:"visualFlags,omitempty"`
+	// Strength/Intellect are the native player STR/INT words used by the
+	// login-stat block and item requirement gates. Current records always
+	// carry them; detached fixtures use the creation fallback.
+	Strength  *int64 `json:"strength,omitempty"`
+	Intellect *int64 `json:"intellect,omitempty"`
+
+	// Masteries contain the complete racial mastery set. Creation installs
+	// each row at MasterySeedLevel and training raises its level.
+	Masteries []CharacterMastery `json:"masteries,omitempty"`
+
+	// Skills contains one current skill id per group. Creation installs the
+	// racial base attacks; learning an upgrade replaces its group's previous
+	// id.
+	Skills []uint32 `json:"skills,omitempty"`
+	// Absolute authority deadlines survive reconnects and skill-level upgrades.
+	OffensiveSkillCooldowns map[uint32]int64 `json:"offensiveSkillCooldowns,omitempty"`
+	// Native nonzero CoolTimeGroup shares one deadline across skill families.
+	SharedSkillCooldowns map[uint8]int64 `json:"sharedSkillCooldowns,omitempty"`
+	// The native reuse manager also retains one action-recovery deadline.
+	// Different skill groups cannot bypass it at the execution phase.
+	SkillActionRecoveryUntilMs int64 `json:"skillActionRecoveryUntilMs,omitempty"`
+
+	// ItemUseCooldowns holds absolute server deadlines for native recovery
+	// categories 1/2/3 (HP/MP/universal), independent of bag slots and item IDs.
+	// Value storage keeps snapshots detached and bounds the state without a
+	// timer/map per item. Only the successful item-use transaction writes it;
+	// reconnect, stack movement and rebirth must not reset these deadlines.
+	ItemUseCooldowns [3]int64 `json:"itemUseCooldowns,omitempty"`
+	// ItemCureCooldowns are the cure lanes of the same reuse mask (the
+	// server's cure check): [0] the universal pill (bit 0x100), [1] every
+	// other cure (bit 0x40).
+	ItemCureCooldowns [2]int64 `json:"itemCureCooldowns,omitempty"`
+	// PetPotionCooldowns are the server's pet potion 1.1 s recovery lock on
+	// the owner, one lane per pet-potion TID4 the v1.150 client sends (4,
+	// 5, 7).
+	PetPotionCooldowns [3]int64 `json:"petPotionCooldowns,omitempty"`
+	// Port-only recipient cooldown survives relogging and changing crows.
+	RavenRefugeReadyAtMs int64 `json:"ravenRefugeReadyAtMs,omitempty"`
+
+	// Job is the job guild membership (the v1.188 job record at player
+	// object +0x1FB4).
+	Job CharacterJob `json:"job,omitzero"`
+
+	// QuickSlots are the persisted CIFUnderBar bindings. The entered-player
+	// HUD-state block replays these records before mission reveal; live changes
+	// arrive through client opcode 0x7541. The list contains at most one
+	// non-empty binding per native slot 0..50 and is stored in slot order.
+	QuickSlots []QuickSlotBinding `json:"quickSlots,omitempty"`
+
+	// Mission is the authoritative event-guide runtime record.
+	Mission *MissionRuntime `json:"mission,omitempty"`
+
+	// CompletedQuestIds are the finished-quest questdata ids the 0x32B3
+	// quest block's FIRST section emits (CICPlayer_DeserializeQuestSections
+	// section 1: u8 count + count x u32 refId into the CICPlayer +0x18d0
+	// container's completed list). Content ids are v1.150-NATIVE: rows of
+	// the shipped
+	// server_dep/silkroad/textdata/questdata.txt (also mirrored to the
+	// client at assets/data/questData.json), resolved by CODENAME - e.g.
+	// 2 = QTUTORIAL_CH, 3 = QNO_CH_SMITH_1 - never transplanted from the
+	// v1.188 shard dump. Absent = none completed (the BlockedWhisperers
+	// posture: optional omitempty list, no schema version bump - strict
+	// decode knows the key from this struct).
+	CompletedQuestIds []uint32 `json:"completedQuestIds,omitempty"`
+	// Completion counts are server-side repeat limits; the native login wire
+	// continues to carry only the unique completed quest IDs.
+	QuestCompletionCounts map[uint32]uint32           `json:"questCompletionCounts,omitempty"`
+	QuestSupplies         map[uint32]QuestSupplyState `json:"questSupplies,omitempty"`
+	// EndedQuestIds are quests closed for good without being completed
+	// (native quest state 5, written by the server's ended-record routine): a
+	// branch the character turned down. Server-side only, like the
+	// counts: the native server sends no update for state 5. A completed
+	// quest that is also ended keeps its completion and count.
+	EndedQuestIds []uint32 `json:"endedQuestIds,omitempty"`
+
+	// ActiveQuests are the in-progress quest records the 0x32B3 quest
+	// block's SECOND section emits (CICPlayer_DeserializeQuestSections
+	// section 2: u8 count + count x [u32 refId + SQuestInfo body], client
+	// parse SQuestInfo_Deserialize).
+	// Quest ids follow the CompletedQuestIds content rule (v1.150-native
+	// questdata rows resolved by codename). The client registry insert is
+	// insert-if-absent (a duplicate refId keeps the FIRST record), so
+	// persisted lists should not carry duplicates. Absent =
+	// none active (the same no-bump omitempty posture as above).
+	ActiveQuests []ActiveQuestRecord `json:"activeQuests,omitempty"`
+
+	// TrackedQuests are the tracker records the 0x32B3 quest block's
+	// THIRD section emits (CICPlayer_DeserializeQuestSections section 3,
+	// consumed by the client's quest manager) - the browser client hosts
+	// it over its quest plane and drives the CIFQuest +0x398 tracked id
+	// the minimap quest pass gates on. Absent = none tracked.
+	TrackedQuests []TrackedQuestRecord `json:"trackedQuests,omitempty"`
+
+	// EnterEventGroupIds are the event-group ids the entered tail emits
+	// (client fold CPSMission_OnMyCharacterEntered: u8 count + count x u32,
+	// right after the fortress-war dword and before the discarded
+	// mission-mode byte). Client behavior per id: EVERY id sets the
+	// event-start slot (RefObjDataManager head record +0x10 := 1); id 1
+	// ADDITIONALLY fires MapRenderer_SetRenderOption(3,3)/(4,0x14) and
+	// the UIIT_MSG_EVENT_START guide message. POLICY CONTENT (declared
+	// choice, the internal/game/world/monster/tactics.go posture): no v1.150 table
+	// constrains these ids - the wire grammar and the id-1 special case
+	// are the only client authority - so values are a server-side event
+	// schedule decision, not data-resolved content. Absent = no events
+	// running (the same no-bump omitempty posture as above).
+	EnterEventGroupIds []uint32 `json:"enterEventGroupIds,omitempty"`
+
+	// BlockedWhisperers is the persisted whisper-block name list (the
+	// retail _BlockedWhisperer(OwnerID, TargetName) shape carried as a
+	// JSON list on the character record; the Eternity dump is schema
+	// reference only). Mutated exclusively by the community lane's
+	// 0x766F handler through the Mutate door; read by the entered
+	// chunk-C emission (BuildLocalPlayerEntryPayload), which is the
+	// client's ONLY reflection channel for this list -
+	// CPSMission_ReadBlockedWhispererList reads it mid-entered-stream, and
+	// no standalone S->C ack opcode is pinned. Capacity is the client
+	// panel's literal 0x14 cap (ClientChat_WriteBlockCountLabel ": %d / %d").
+	BlockedWhisperers []string `json:"blockedWhisperers,omitempty"`
+
+	// Friends is the persisted friend-edge list (the retail
+	// _Friend(CharID, FriendCharID, FriendCharName, RefObjID) shape
+	// carried as a JSON list on the character record; DuckSoup/Eternity
+	// are schema reference only). Edges are MUTUAL by construction: the
+	// community friend-add handler appends to BOTH characters through
+	// one multi-record Mutate door, and delete removes both sides through
+	// the same door. The online
+	// state byte is deliberately NOT persisted - it is derived from live
+	// session presence at every encode (roster seed 0x3769, event 0x3F9A
+	// case 4). Cross-session reads go through FriendsView and writers publish
+	// replacements through SwapFriends inside the multi-character door.
+	Friends []FriendRecord `json:"friends,omitempty"`
+
+	// GuildID is the FK into the authority store's guilds table: the guild
+	// this character is a member of, nil when
+	// guildless. The guild entity itself - name, notice, member set -
+	// lives in the guilds/guild_members tables behind the GuildStore
+	// door, never on the character record. The enter-world 0x32C4 seed
+	// emits ONLY when this FK resolves to a real stored guild row;
+	// a dangling FK logs loud and emits nothing (absence over
+	// invention - the internal/game/social/guild package doc).
+	GuildID *int64 `json:"guildId,omitempty"`
+
+	// GMPrivilege is the v1.150 GM privilege flag: bit 0 of the u8 the
+	// entered 0x32B3 stream deposits at CICPlayer+0x1890
+	// (CICPlayer_DeserializeEnteredInventoryAndInitializeHud; tested by
+	// CICPlayer_IsTestGM). The client gates on it:
+	// Client_IsDebugCommandAllowed (console / GM-command availability),
+	// the GM default chat channel
+	// mode 3 in CIFChatViewer_HandleChatInputKey, and the 30F2/33C4/3647
+	// mission handlers. It is never writable from any
+	// network path. Normal startup requires strict accounts plus
+	// character-bound EnterWorld tickets; even the explicitly insecure
+	// local-development posture has no privilege setter. The only setter
+	// is the boot-time division-qualified operator allowlist reconcile
+	// (store.ReconcileGMPrivilege over SRO_GM_CHARACTERS), which is
+	// host-access-only by construction.
+	// False means an ordinary player.
+	GMPrivilege bool `json:"gmPrivilege,omitempty"`
+
+	// PC-room event eligibility is server-owned: client
+	// CICPlayer_PcRoomEventEligible_862a80 -> CIFEventInterface_OnCreate(1).
+	PCRoomEvent bool               `json:"pcRoomEvent,omitempty"`
+	AutoPotion  AutoPotionSettings `json:"autoPotion"`
+
+	// Additional persisted presentation fields carried by the full snapshot.
+	CreatedAt string `json:"createdAt,omitempty"`
+	// Legacy snapshot compatibility only. Roster presentation derives XP from
+	// Experience and leveldata; progression does not maintain this old cache.
+	ExperiencePercent *float64 `json:"experiencePercent,omitempty"`
+	FigureIndex       *int64   `json:"figureIndex,omitempty"`
+}
+
+/*
+==================
+HalloweenBoxAccount
+
+One account's daily Halloween jewelry-box count (port-only, not native:
+SRO_HALLOWEEN_EVENT, #2547; schema 36). The cap counts per account, so
+an alt adds no boxes: every character of the account mints against this
+one record, kept in the store's metadata plane and mutated only inside
+a settlement door, like a character record. Day is the 04:00-UTC day
+(progression.HalloweenDayKey) Count belongs to. An account with no
+record has minted nothing; at first load the record is seeded from the
+characters' legacy per-character counts (schema 34 fields above).
+==================
+*/
+type HalloweenBoxAccount struct {
+	Day   int64 `json:"day"`
+	Count int64 `json:"count"`
+	// GourdCount is the day's Gourd-kill boxes, under their own cap
+	// (progression.HalloweenGourdBoxDailyCap, #2950). Rows written
+	// before it existed decode it as zero.
+	GourdCount int64 `json:"gourdCount"`
+}
+
+/*
+==================
+PetSkillWindow
+
+CharacterCOS is the durable half of one summoned COS lifecycle. Static
+model/speed/TID data remains in characterdata and is re-resolved by
+codename; only mutable entity identity/state belongs on the character.
+PetSkillWindow is one live ITEM_MALL_PET_SKILL_* / growth-potion usage
+window. CIFMagicStateBoard_AddOrRemoveSlot keys its board row by kind and
+item id, so the ref id is the identity. EndUnixMs is absolute rather than a countdown, the way retail
+persists _CharCOS.RentEndTime, so a save keeps the real deadline.
+==================
+*/
+type PetSkillWindow struct {
+	ItemRefObjID uint32 `json:"itemRefObjId"`
+	// Codename keeps the item's reference resolvable once the stack is spent:
+	// the browser resolves a window's icon and limit from refItemSnapshot,
+	// which is otherwise seeded only from what the character still carries.
+	Codename  string `json:"codename"`
+	EndUnixMs int64  `json:"endUnixMs"`
+}
+
+/*
+================
+ParamJob
+
+One live param keeper job of the reference server: an internal param item
+(TID 3/3/3/10) writes Value to ParamKeeper parameter Param until EndUnixMs.
+The internal item's reference id is the client board row's identity
+(UpdateMagicStateSlot kind 4).
+================
+*/
+type ParamJob struct {
+	ItemRefObjID uint32 `json:"itemRefObjId"`
+	Codename     string `json:"codename"`
+	Param        uint16 `json:"param"`
+	Value        int64  `json:"value"`
+	EndUnixMs    int64  `json:"endUnixMs"`
+}
+
+// Composite work kinds (the server's composite keeper entry tags).
+const (
+	CompositeUsedItemLimit  = "UIL1" // used-item limit: an item's effect N times a period
+	CompositeUsedQuestLimit = "UQL1" // used-quest limit: a premium quest N times a period
+	CompositeBuffItem       = "BFI1" // buff item: a stall booth decoration for a period
+)
+
+/*
+================
+CompositeJob
+
+One composite item keeper work, identified by its package and target.
+The package's reference id is the client board's kind-5 slot (its icon and
+period); Target is the limited item's or booth item's reference id, the
+board's count key, or zero for a quest limit, whose quest is QuestCodename. A limited work holds Uses of
+MaxUses until NextRefillUnixMs, when every PeriodSeconds the count returns
+to MaxUses (the server's limit refill). The work ends at EndUnixMs.
+================
+*/
+type CompositeJob struct {
+	Kind             string `json:"kind"`
+	PackageRefObjID  uint32 `json:"packageRefObjId"`
+	Target           uint32 `json:"target,omitempty"`
+	TargetCodename   string `json:"targetCodename,omitempty"`
+	QuestCodename    string `json:"questCodename,omitempty"`
+	Uses             uint8  `json:"uses,omitempty"`
+	MaxUses          uint8  `json:"maxUses,omitempty"`
+	PeriodSeconds    int64  `json:"periodSeconds,omitempty"`
+	NextRefillUnixMs int64  `json:"nextRefillUnixMs,omitempty"`
+	EndUnixMs        int64  `json:"endUnixMs"`
+}
+
+/*
+================
+PremiumClock
+
+The server's premium keeper daily allotment (its tick). The
+ticket's period starts at StartUnixMs; each 86,400 s day grants
+DailyAllotmentMs, and what a day leaves unspent carries into the next day
+only (CarriedMs), spent first. Today is what remains of the current day's
+grant; Day is the day index both were computed for. While both are spent
+the EXP and skill-EXP keepers are off until the next day.
+================
+*/
+type PremiumClock struct {
+	ItemRefObjID     uint32 `json:"itemRefObjId"`
+	StartUnixMs      int64  `json:"startUnixMs"`
+	EndUnixMs        int64  `json:"endUnixMs"`
+	DailyAllotmentMs int64  `json:"dailyAllotmentMs"`
+	Day              int64  `json:"day"`
+	TodayMs          int64  `json:"todayMs"`
+	CarriedMs        int64  `json:"carriedMs"`
+}
+
+/*
+================
+CharacterCOS
+
+Owned companion state; its inventory commits with the owning character.
+================
+*/
+type CharacterCOS struct {
+	// Port-only Stormbrood actor: 1 egg, 2 unhealable clone.
+	BroodStage   uint8  `json:"-"`
+	BroodSource  uint32 `json:"-"`
+	BroodUntil   int64  `json:"-"`
+	BroodHatchHP uint32 `json:"-"`
+	BroodMaxHP   uint32 `json:"-"`
+	BroodBook    uint8  `json:"-"`
+	BroodRank    uint8  `json:"-"`
+	// Port-only, not native. Lives on the summoner item, including cooldowns.
+	Training PetTraining `json:"training,omitzero"`
+	// Port-only combat stacks; never restored from a summoner item.
+	ResolveStacks uint8 `json:"-"`
+	// Port-only Arcane Resonance projection; cleared on re-entry.
+	ArcaneMagicPercent float64 `json:"-"`
+	// Runtime source-zero movement multiplier the server's follow run
+	// installs.
+	FollowRunFactor float32 `json:"-"`
+	FollowRunSet    bool    `json:"-"`
+	// The installed guild-soldier attribute source, refreshed by the guild
+	// owner on a purchase.
+	MercenaryAttributes    uint8         `json:"mercenaryAttributes,omitempty"`
+	SummonGeneration       uint64        `json:"summonGeneration,omitempty"`
+	RentalExpiresAtUnix    int64         `json:"rentalExpiresAtUnix,omitempty"`
+	RentalRemainingSeconds int32         `json:"rentalRemainingSeconds,omitempty"`
+	Rentals                []COSRental   `json:"rentals,omitempty"`
+	NativeBodyStatus       uint8         `json:"-"`
+	Experience             uint64        `json:"experience,omitempty"`
+	Level                  uint8         `json:"level,omitempty"`
+	Satiety                uint16        `json:"satiety,omitempty"`
+	InventorySlot          uint8         `json:"inventorySlot,omitempty"`
+	Container              *COSContainer `json:"container,omitempty"`
+	CommandMode            uint32        `json:"commandMode,omitempty"`
+	GID                    uint32        `json:"gid"`
+	RefObjID               uint32        `json:"refObjId"`
+	Codename               string        `json:"codename"`
+	Name                   string        `json:"name,omitempty"`
+	CurrentHP              uint32        `json:"currentHp"`
+	CurrentMP              uint32        `json:"currentMp"`
+	// StateFlags bit 0 is the COS data's +0x38 (the pet potion check):
+	// revival refuses while it is set and sets it when the revive succeeds.
+	StateFlags uint32 `json:"stateFlags,omitempty"`
+	Summoned   bool   `json:"summoned"`
+	Mounted    bool   `json:"mounted"`
+}
+
+/*
+================
+PetTraining
+
+The optional attack-pet skill tree and gear (port-only;
+companion/training.go and gear.go own the rules). Levels is indexed by a
+skill's slot in its pet's tree (row x 3 + option - 1); Slotted names the
+active passive option (1..3, 0 none) of each passive row. Queued is the
+action the owner asked for on the pet's next attack (not saved). Rows are the two active rows' shared cooldowns.
+Every field is a value or a fixed array, so a snapshot copy never
+aliases the live pet. BonusPoints are operator-provisioned.
+================
+*/
+type PetTraining struct {
+	TreeVersion      uint8             `json:"treeVersion,omitempty"`
+	Levels           [15]uint8         `json:"levels,omitzero"`
+	Slotted          [3]uint8          `json:"slotted,omitzero"`
+	Queued           uint8             `json:"-"`
+	Rows             [2]PetRowCooldown `json:"rows,omitzero"`
+	PassiveReadyAtMs [3]int64          `json:"passiveReadyAtMs,omitzero"`
+	BonusPoints      uint8             `json:"bonusPoints,omitempty"`
+	Gear             [3]PetGear        `json:"gear,omitzero"`
+}
+
+/*
+================
+PetRowCooldown
+
+An active row's cooldown: a timer (ReadyAtMs) or a counter of Left events
+of Kind ("Attacks", "Hits taken", "Kills", "Spells").
+================
+*/
+type PetRowCooldown struct {
+	// Port-only stored casts; ReadyAtMs is the next sequential recharge.
+	Capacity   uint8  `json:"capacity,omitempty"`
+	Charges    uint8  `json:"charges,omitempty"`
+	RechargeMs int64  `json:"rechargeMs,omitempty"`
+	ReadyAtMs  int64  `json:"readyAtMs,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	Left       uint16 `json:"left,omitempty"`
+}
+
+/*
+================
+PetGear
+
+One worn pet gear item: its reference and blue options (the native
+magic-option encoding, companion.EncodeAffix), 0 for an empty slot.
+================
+*/
+type PetGear struct {
+	RefObjID uint32    `json:"refObjId,omitempty"`
+	Options  [6]uint64 `json:"options,omitzero"`
+}
+
+/*
+================
+COSContainer
+
+Capacity comes from admitted companion state, never from a client request.
+================
+*/
+type COSContainer struct {
+	Capacity uint8          `json:"capacity"`
+	Rows     []InventoryRow `json:"rows"`
+}
+
+// Job types (v1.150 CICPlayer+0x782; the reference server's job-type read).
+const (
+	JobNone   uint8 = 0
+	JobTrader uint8 = 1
+	JobThief  uint8 = 2
+	JobHunter uint8 = 3
+)
+
+/*
+==================
+CharacterJob
+
+A job guild membership: the job type joined at a guild NPC, its grade
+(+0x783, 1 on joining) and experience (+0x18B4), the alias a dressed job
+player shows, and the time before a thief or hunter who withdrew may join
+again (the seven-day timed job of the v1.188 0x70E2 job leave handler).
+
+WeeklyReward is the native _CharTrijob.Contribution (job record +0x24,
+raised by the server's contribution routine): a trader's sale share or a
+thief's or hunter's job experience this week. Reward (+0x28) is the outcome
+a thief or hunter collects at the guild; the weekly cycle (jobweek.go)
+credits it.
+==================
+*/
+type CharacterJob struct {
+	WeeklyReward int32  `json:"weeklyReward,omitempty"`
+	Reward       int32  `json:"reward,omitempty"`
+	Type         uint8  `json:"type,omitempty"`
+	Grade        uint8  `json:"grade,omitempty"`
+	Exp          uint32 `json:"exp,omitempty"`
+	Alias        string `json:"alias,omitempty"`
+	RejoinAtMs   int64  `json:"rejoinAtMs,omitempty"`
+}
+
+/*
+==================
+AvatarInventory
+
+AvatarInventory is the persisted avatar (costume) inventory record: the
+wire capacity byte plus the worn avatar rows (see the Character field doc
+for the wire grammar and content constraints).
+==================
+*/
+type AvatarInventory struct {
+	// Capacity is the avatar block's capacity byte. Zero coerces to
+	// AvatarCapacityDefault at emission so a rows-only record cannot
+	// accidentally emit capacity 0.
+	Capacity int64 `json:"capacity"`
+	// Rows are the worn avatar items, one per avatar socket (slot 0..3).
+	Rows []InventoryRow `json:"rows,omitempty"`
+}
+
+/*
+================
+TimedSkillJob
+
+The native timed-job type 0 checkpoints remaining online time across login.
+================
+*/
+type TimedSkillJob struct {
+	SkillID     uint32 `json:"skillId"`
+	Token       uint32 `json:"token"`
+	RemainingMs uint32 `json:"remainingMs"`
+}
+
+/*
+================
+MostWanted
+
+A suited player's streak of counted job kills (port-only, not native;
+action/mostwanted.go). Death clears it; the wanted level also decays
+one level per day without a counted kill (NextDecayAtMs). Taking the
+suit off keeps it: only the bonuses shelve while the suit is off.
+================
+*/
+type MostWanted struct {
+	Streak int64 `json:"streak"`
+	// ExpiresAtMs was the seven-day lapse stamp (schema 35), retired
+	// by the decay at schema 40: no reader remains, and the field
+	// stays only so records a rolled-back release writes still
+	// decode. Dropping it is a later schema step's work.
+	ExpiresAtMs int64 `json:"expiresAtMs,omitempty"`
+	// NextDecayAtMs is when the next decay step lands (Unix
+	// milliseconds), restamped by every counted kill. Streaks saved
+	// before the field existed carry zero: the first door that judges
+	// the streak stamps a fresh day instead of dropping a level, so
+	// no saved streak ever decays early.
+	NextDecayAtMs int64 `json:"nextDecayAtMs,omitempty"`
+}

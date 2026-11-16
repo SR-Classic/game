@@ -1,0 +1,28 @@
+{
+  "comment": "Level-transition regression fixture over shipped leveldata. SR_GameServer 4E5065..4E50AF invokes reduced HP/MP recovery on an upward crossing; the v1.150 client reads absolute currents through 77A080 (33A6), independently of 343C maxima and 30D2 experience. The burst carries presentation, final maxima, recovered currents with source 0080, then the experience delta and absolute stat-point tail. Values are little-endian; expected bytes are authored independently of the emitter.",
+  "playerGid": 100002,
+  "leveldataCol1Rows": { "1": 118, "2": 470, "3": 1058 },
+  "scenarios": [
+    {
+      "name": "S1_gain50_noCrossing",
+      "seed": { "characterId": 2, "level": 1, "experience": 0, "statPoints": 1, "skillPoints": 0, "skillExp": 0, "strength": 20, "intellect": 20 },
+      "grant": { "expDelta": 50, "skillExpDelta": 0, "sourceGid": 0 },
+      "frames": [
+        { "opcode": "0x30D2", "payloadHex": "00000000320000000000000000" }
+      ],
+      "persisted": { "level": 1, "experience": 50, "statPoints": 1, "strength": 20, "intellect": 20 }
+    },
+    {
+      "name": "S2_gain550_twoLevelsOneGrant",
+      "seed": { "characterId": 2, "level": 1, "experience": 50, "statPoints": 1, "skillPoints": 0, "skillExp": 0, "strength": 20, "intellect": 20 },
+      "grant": { "expDelta": 550, "skillExpDelta": 0, "sourceGid": 0 },
+      "frames": [
+        { "opcode": "0x36B0", "payloadHex": "a2860100" },
+        { "opcode": "0x343C", "payloadHex": "06000000070000000a0000000c000000040006000d000d00e4000000e400000016001600" },
+        { "opcode": "0x33A6", "payloadHex": "a2860100800003e4000000e4000000" },
+        { "opcode": "0x30D2", "payloadHex": "000000002602000000000000000700" }
+      ],
+      "persisted": { "level": 3, "experience": 12, "statPoints": 7, "strength": 22, "intellect": 22, "maxLevel": 3 }
+    }
+  ]
+}

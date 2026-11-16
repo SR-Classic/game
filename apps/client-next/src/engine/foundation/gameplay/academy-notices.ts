@@ -1,0 +1,216 @@
+/*
+===========================================================================
+
+academy-notices.ts - Academy response acknowledgments and 0x3AC5 notices
+
+Decodes the camp action acknowledgments (0xB4D4, 0xB785, 0xB10A, 0xB36D,
+0xB220, 0xB7C5) and maps authoritative 0x3AC5 transitions onto their
+native child-23 notice banners and system chat messages (773C60). The
+cumulated-buff prints of 0x3CC1 / 0xB00C live here too.
+
+===========================================================================
+*/
+
+import type { WireFrame } from "@/engine/contracts/network";
+import type { AcademyState } from "./academy";
+import { constantNativeNotice } from "./native-notice";
+import type { SystemNotice } from "./system-notices";
+
+// 76FC90 reads one extra u32 when 0xB7C5 fails with error 0x1D.
+const ACADEMY_DISBAND_WAIT_CODE = 0x1d;
+
+/*
+================
+academyAcknowledgment
+
+76FC90, 76FD40/90/E0, 76FE30/80: these acknowledgments never change academy
+membership or notice text. Authoritative changes arrive separately in 3AC5.
+================
+*/
+export function academyAcknowledgment( frame: WireFrame ): { readonly notice: SystemNotice | null; } | null {
+	if ( ![ 0xb4d4, 0xb785, 0xb10a, 0xb36d, 0xb220, 0xb7c5 ].includes( frame.opcode ) ) return null;
+	const p = frame.payload;
+	const expected = p[0] === 2 ?
+		(frame.opcode === 0xb7c5 && p[1] === ACADEMY_DISBAND_WAIT_CODE ? 6 : 2) :
+		1;
+	if ( !p.length || p.length !== expected ) throw Error( "Invalid academy acknowledgment" );
+	if ( p[0] === 2 ) return { notice: constantNativeNotice( 0x1d, p[1]! ) };
+	// 76FE9B -> 67D030 -> child 23: seven-second notice window, no guide.
+	if ( frame.opcode === 0xb220 && p[0] === 1 ) {
+		return {
+			notice: {
+				key: "UIIT_MSG_TC_COMMON_KNOW_REMIND_UPDATE",
+				value: 0,
+				notificationBanner: true,
+				bannerOnly: true
+			}
+		};
+	}
+	return { notice: null };
+}
+
+/*
+================
+academyStatusNotice
+
+773C60: maps authoritative 0x3AC5 state transitions onto child 23 or chat.
+================
+*/
+export function academyStatusNotice(
+	state: AcademyState,
+	next: AcademyState,
+	frame: WireFrame
+): SystemNotice | null {
+	const p = frame.payload;
+	// 769CA0: a join answer (outer 1) of detail 1 raises the
+	// matching-complete centre banner (67D030, the resolved text
+	// alone, so no arguments); detail 0 prints the cancel line and
+	// detail 2 the no-reply line, both system chat type 4 (67A600).
+	// An outer-2 refusal goes through category 0x1D in gameplay.
+	if ( frame.opcode === 0xb592 ) {
+		if ( p[0] !== 1 || p.length !== 2 ) return null;
+		if ( p[1] === 1 ) return { key: "UIIT_STT_TC_MACHING_COMPLETE", value: 0, banner: true, bannerOnly: true };
+		if ( p[1] === 0 ) return { key: "UIIT_MSG_TC_JOIN_CANCEL", value: 0, nativeType: 4 };
+		if ( p[1] === 2 ) return { key: "UIIT_MSG_TC_JOIN_NOREPLY", value: 0, nativeType: 4 };
+		return null;
+	}
+	if ( frame.opcode !== 0x3ac5 ) return null;
+	// 773FA5: dissolution shows the child-23 notice banner.
+	if ( p[0] === 1 ) {
+		return {
+			key: "UIIT_STT_TC_DISSOLUTION_SUCCESS",
+			value: 0,
+			notificationBanner: true,
+			bannerOnly: true
+		};
+	}
+	// 773F25: a joining member prints to system chat.
+	if ( p[0] === 2 ) {
+		const joined = next.members?.[next.members.length - 1];
+		return joined ? { key: "UIIT_MSG_TC_MACHING_JOINING_MEMBER", value: 0, arguments: [ joined.name ] } : null;
+	}
+	// 7740F9: subtype 3 is voluntary leave (1), expulsion (2) or silent (3).
+	if ( p[0] === 3 ) {
+		const id = new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint32( 1, true );
+		const flag = p[5]!;
+		const member = state.members?.find( m => m.id === id );
+		if ( flag === 1 ) {
+			if ( id === state.localMemberId ) {
+				return {
+					key: "UIIT_STT_TC_OUT_TRAININGCAMP_ANNOUNCE",
+					value: 0,
+					notificationBanner: true,
+					bannerOnly: true
+				};
+			}
+			return member ?
+				{ key: "UIIT_STT_TC_OUT_TRAININGCAMP_OTHER_USER", value: 0, arguments: [ member.name ] } :
+				null;
+		}
+		if ( flag === 2 ) {
+			if ( id === state.localMemberId ) {
+				return {
+					key: "UIIT_MSG_TC_EXPULSION_RESULT_ANNOUNCE",
+					value: 0,
+					notificationBanner: true,
+					bannerOnly: true
+				};
+			}
+			return member ? { key: "UIIT_MSG_TC_EXPULSION_RESULT", value: 0, arguments: [ member.name ] } : null;
+		}
+		return null;
+	}
+	// 774622: subtype 4 is voluntary (0) or compulsory (1) graduation.
+	if ( p[0] === 4 ) {
+		const id = new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint32( 1, true );
+		const flag = p[5]!;
+		if ( flag !== 0 && flag !== 1 ) return null;
+		const member = state.members?.find( m => m.id === id );
+		if ( id === state.localMemberId ) {
+			return {
+				key: "UIIT_STT_TC_GRADUATION_CONGRATULATIONS",
+				value: 0,
+				notificationBanner: true,
+				bannerOnly: true
+			};
+		}
+		return member ? { key: "UIIT_STT_TC_GRADUATION_ANNOUNCE", value: 0, arguments: [ member.name ] } : null;
+	}
+	// 5C54F0 state kind 1: the flag-1 byte is stored (record +0x74)
+	// either way; the prints follow the announced latch (+0x4d8,
+	// sibling roster copy +0x4b8), NOT the stored byte. A disconnect
+	// byte clears the latch and prints UIIT_MSG_TC_DISCONNECT
+	// (67A600 type 0) every time; a connect byte prints
+	// UIIT_MSG_TC_CONNECT only while the latch is clear, and
+	// academyPacket sets it with the leg. So a member the seed
+	// already showed online still announces their first connect
+	// byte, and a repeated disconnect byte prints again. The member
+	// must be in the roster (academyPacket throws otherwise), as
+	// the native lookup fails there too. Live: the server emits
+	// flag 1 from the mentor lane's world-bound / session-closed
+	// hooks.
+	if ( p[0] === 5 && p[5] === 1 ) {
+		const id = new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint32( 1, true );
+		const member = state.members?.find( m => m.id === id );
+		const after = next.members?.find( m => m.id === id );
+		if ( !member || !after ) return null;
+		if ( after.offline ) {
+			return { key: "UIIT_MSG_TC_DISCONNECT", value: 0, nativeType: 0, arguments: [ member.name ] };
+		}
+		if ( member.announced ) return null;
+		return { key: "UIIT_MSG_TC_CONNECT", value: 0, nativeType: 0, arguments: [ member.name ] };
+	}
+	// 774C64/69: an authoritative notice update also shows child 23.
+	if ( p[0] === 7 ) {
+		return {
+			key: "UIIT_MSG_TC_COMMON_KNOW_REMIND_UPDATE",
+			value: 0,
+			notificationBanner: true,
+			bannerOnly: true
+		};
+	}
+	// 774D6E: membership-seed refusal uses the category-0x1D dispatcher.
+	if ( p[0] === 10 && p[1] === 2 ) {
+		return constantNativeNotice( 0x1d, p[2]! );
+	}
+	return null;
+}
+
+/*
+================
+academyBuffNotices
+
+The cumulated-buff prints (67A600 type 0, system chat): 770E70 state
+7's time-over line, 770970 mode 2's pass refusal, and one received
+line per mode-0 row. The received line names the row's donor and is
+skipped when the donor is out of the roster or is the camp master
+(81AFB0 compares the donor's name with the master's name).
+================
+*/
+export function academyBuffNotices(
+	state: AcademyState,
+	frame: WireFrame
+): readonly SystemNotice[] {
+	const p = frame.payload;
+	if ( frame.opcode === 0x3cc1 ) {
+		return p[0] === 7 ? [ { key: "UIIT_CTL_TC_SAVE_BUFF_TIME_OVER", value: 0, nativeType: 0 } ] : [];
+	}
+	if ( frame.opcode !== 0xb00c || p.length < 1 ) return [];
+	if ( p[0] === 2 ) return [ { key: "UIIT_MSG_TC_PASS_ERROR", value: 0, nativeType: 0 } ];
+	if ( p[0] !== 0 || p.length < 2 ) return [];
+	const count = p[1]! << 24 >> 24;
+	if ( count <= 0 || 2 + count * 12 > p.length ) return [];
+	const view = new DataView( p.buffer, p.byteOffset, p.byteLength ), notices: SystemNotice[] = [];
+	for ( let i = 0; i < count; i++ ) {
+		const donor = state.members?.find( m => m.id === view.getUint32( 2 + i * 12 + 4, true ) );
+		if ( donor && donor.kind !== 0 ) {
+			notices.push( {
+				key: "UIIT_MSG_TC_RECIEVE_BUFF",
+				value: 0,
+				nativeType: 0,
+				arguments: [ donor.name ]
+			} );
+		}
+	}
+	return notices;
+}

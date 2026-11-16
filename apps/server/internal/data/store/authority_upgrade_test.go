@@ -1,0 +1,619 @@
+/*
+===========================================================================
+
+authority_upgrade_test.go - preserving upgrades, writer exclusion and recovery
+
+===========================================================================
+*/
+package store
+
+import (
+	"database/sql"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/testsupport/tier"
+)
+
+/*
+================
+TestTradeUpgradePreservesExistingFortressTablesAndRecords
+================
+*/
+func TestTradeUpgradePreservesExistingFortressTablesAndRecords(t *testing.T) {
+	tier.Long(t, "the trade upgrade preserves existing fortress tables and records")
+
+	dir := t.TempDir()
+	s := openTest(t, dir, newTestClock())
+	c := seededCharacter()
+	if err := s.CreateCharacter(testDivision, "trader-account", c); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Fortresses().SaveFortress(testDivision, domain.FortressRecord{FortressID: 1, GuildID: 71}); err != nil {
+		t.Fatal(err)
+	}
+	var before string
+	if err := s.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division = ? AND id = ?", testDivision, c.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	downgradeToLayout7(t, dir)
+	rewriteDatabaseMeta(t, dir, metaKeySchemaVersion, preTradeRewardVersion)
+	backup, err := UpgradeAuthority(dir, true)
+	if err != nil || backup == "" {
+		t.Fatalf("upgrade %q: %v", backup, err)
+	}
+	old, err := connectDB(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	if _, err := loadDB(old, preTradeRewardVersion, preItemForgeLayoutVersion, 0); err != nil {
+		t.Fatal(err)
+	}
+	s = openTest(t, dir, newTestClock())
+	var after string
+	if err := s.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division = ? AND id = ?", testDivision, c.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("schema-only upgrade rewrote the character")
+	}
+	fortresses, _, err := s.Fortresses().FortressState(testDivision)
+	if err != nil || len(fortresses) != 1 || fortresses[0].GuildID != 71 {
+		t.Fatalf("fortress records %+v: %v", fortresses, err)
+	}
+}
+
+/*
+================
+dropFortressTables
+
+Removes the fortress, union, guild-war, production and unique-kill tables
+(layouts 6 through 9) from a current test authority.
+================
+*/
+func dropFortressTables(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec("DROP TABLE fortresses; DROP TABLE fortress_requests; DROP TABLE fortress_structures; DROP TABLE alliances; DROP TABLE guild_wars; DROP TABLE fortress_item_forges; DROP TABLE unique_kills; DROP TABLE economy_ledger"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+/*
+================
+downgradeToLayout9
+
+Turns a closed current test authority into the layout 9 a schema 24 (and
+22 or 23) server ran: layout 10's economy ledger is gone.
+================
+*/
+func downgradeToLayout9(t *testing.T, dir string) {
+	t.Helper()
+	db, err := connectDB(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DROP TABLE economy_ledger"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rewriteDatabaseMeta(t, dir, metaKeyLayoutVersion, preLedgerLayoutVersion)
+}
+
+/*
+================
+downgradeToLayout7
+
+Turns a closed current test authority into the layout 7 a schema 20 (and
+older) server ran: layout 8's production table and layout 9's unique-kill
+table are gone.
+================
+*/
+func downgradeToLayout7(t *testing.T, dir string) {
+	t.Helper()
+	db, err := connectDB(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DROP TABLE fortress_item_forges; DROP TABLE unique_kills; DROP TABLE economy_ledger"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rewriteDatabaseMeta(t, dir, metaKeyLayoutVersion, preItemForgeLayoutVersion)
+}
+
+/*
+================
+downgradeToLayout5
+
+A current test authority as layout 5 left it.
+================
+*/
+func downgradeToLayout5(t *testing.T, db *sql.DB) {
+	t.Helper()
+	dropFortressTables(t, db)
+	if _, err := db.Exec("UPDATE meta SET value = ? WHERE key = ?", preFortressLayoutVersion, metaKeyLayoutVersion); err != nil {
+		t.Fatal(err)
+	}
+}
+
+/*
+================
+makePreMallAuthority
+================
+*/
+func makePreMallAuthority(t *testing.T, dir string) {
+	t.Helper()
+	s := openTest(t, dir, newTestClock())
+	if err := s.CreateCharacter(testDivision, "account'; --", seededCharacter()); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	db, err := connectDB(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("DROP TABLE mall_accounts; DROP TABLE account_storage"); err != nil {
+		t.Fatal(err)
+	}
+	dropFortressTables(t, db)
+	if _, err := db.Exec("UPDATE meta SET value = ? WHERE key = ?", preMallLayoutVersion, metaKeyLayoutVersion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE meta SET value = ? WHERE key = ?", UpgradeFromVersion, metaKeySchemaVersion); err != nil {
+		t.Fatal(err)
+	}
+}
+
+/*
+================
+TestMallUpgradePreservesAuthorityAndBackup
+================
+*/
+func TestMallUpgradePreservesAuthorityAndBackup(t *testing.T) {
+	tier.Long(t, "the mall upgrade preserves authority contents and its backup")
+	dir := filepath.Join(t.TempDir(), "quoted' authority")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	makePreMallAuthority(t, dir)
+	before, err := os.ReadFile(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backup, err := UpgradeAuthority(dir, false); err != nil || backup != "" {
+		t.Fatalf("dry run: %q %v", backup, err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, DBFileName))
+	if err != nil || string(before) != string(after) {
+		t.Fatal("dry run changed database bytes", err)
+	}
+	backup, err := UpgradeAuthority(dir, true)
+	if err != nil || backup == "" {
+		t.Fatalf("upgrade: %q %v", backup, err)
+	}
+	old, err := connectDB(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	oldGraph, err := loadDB(old, UpgradeFromVersion, preMallLayoutVersion, 0)
+	if err != nil || len(oldGraph.characters[testDivision]) != 1 {
+		t.Fatal("backup does not restore the pre-upgrade graph", err)
+	}
+	s := openTest(t, dir, newTestClock())
+	characters := s.Characters().CharactersForDivision(testDivision)
+	if len(characters) != 1 || characters[0].AccountID != "account'; --" || len(characters[0].MissionInventory) == 0 {
+		t.Fatalf("upgrade lost character or inventory: %+v", characters)
+	}
+	balance, err := s.MallBalance(characters[0])
+	if err != nil || balance.Silk != 0 || balance.GiftSilk != 0 || balance.Points != 0 {
+		t.Fatalf("unexpected initial currency: %+v %v", balance, err)
+	}
+	if _, err := UpgradeAuthority(dir, true); err == nil {
+		t.Fatal("upgrade admitted a live authority")
+	}
+	s.Close()
+	// A retried release finds the upgrade done and changes nothing.
+	if backup, err := UpgradeAuthority(dir, true); !errors.Is(err, ErrAuthorityCurrent) || backup != "" {
+		t.Fatalf("already upgraded authority: %q %v", backup, err)
+	}
+}
+
+/*
+================
+TestMallUpgradeRefusesInvalidSource
+================
+*/
+func TestMallUpgradeRefusesInvalidSource(t *testing.T) {
+	tier.Long(t, "the mall upgrade refuses an invalid source")
+	dir := t.TempDir()
+	makePreMallAuthority(t, dir)
+	db, err := connectDB(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE characters SET name_lower = ?", "mismatched index"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if backup, err := UpgradeAuthority(dir, true); err == nil || backup != "" {
+		t.Fatalf("invalid graph reached mutation: %q %v", backup, err)
+	}
+}
+
+/*
+================
+TestMallUpgradeRollsBackSchemaOnCommitFailure
+================
+*/
+func TestMallUpgradeRollsBackSchemaOnCommitFailure(t *testing.T) {
+	tier.Long(t, "the mall upgrade rolls the schema back when its commit fails")
+	dir := t.TempDir()
+	makePreMallAuthority(t, dir)
+	db, err := connectDB(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER refuse_layout_upgrade BEFORE UPDATE ON meta
+WHEN NEW.key = 'layoutVersion' BEGIN SELECT RAISE(ABORT, 'injected failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := UpgradeAuthority(dir, true)
+	if err == nil || backup == "" {
+		t.Fatalf("did not preserve recovery after failure: %q %v", backup, err)
+	}
+	db, err = connectDB(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := loadDB(db, UpgradeFromVersion, preMallLayoutVersion, 0); err != nil {
+		t.Fatal("failed upgrade changed the original authority", err)
+	}
+	for _, table := range []string{"mall_accounts", "account_storage"} {
+		var tables int
+		if err := db.QueryRow("SELECT count(*) FROM sqlite_schema WHERE name = ?", table).Scan(&tables); err != nil || tables != 0 {
+			t.Fatalf("failed upgrade retained a partial %s table: %d %v", table, tables, err)
+		}
+	}
+}
+
+/*
+================
+TestCompanionUpgradePreservesExistingWarehouseAndBackup
+
+Schema 14 already owns the account tables. The upgrade must preserve their
+contents, validate the existing graph, and only advance the record version.
+================
+*/
+func TestCompanionUpgradePreservesExistingWarehouseAndBackup(t *testing.T) {
+	tier.Long(t, "a schema-14 upgrade preserves the account tables, validates the graph and only advances the record version")
+	dir := t.TempDir()
+	s := openTest(t, dir, newTestClock())
+	c := seededCharacter()
+	if err := s.CreateCharacter(testDivision, "account'; --", c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TransactStorage(c, func(next *domain.Character, storage *domain.AccountStorage) error {
+		row := next.MissionInventory[0]
+		row.Slot = 0
+		storage.Rows = []domain.InventoryRow{row}
+		next.MissionInventory = next.MissionInventory[1:]
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	db, err := connectDB(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE meta SET value = ? WHERE key = ?", preCompanionVersion, metaKeySchemaVersion); err != nil {
+		t.Fatal(err)
+	}
+	downgradeToLayout5(t, db)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backup, err := UpgradeAuthority(dir, false); err != nil || backup != "" {
+		t.Fatal("dry run", backup, err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, DBFileName))
+	if err != nil || string(before) != string(after) {
+		t.Fatal("dry run rewrote schema 14", err)
+	}
+	backup, err := UpgradeAuthority(dir, true)
+	if err != nil || backup == "" {
+		t.Fatal("upgrade", backup, err)
+	}
+	old, err := connectDB(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	if _, err := loadDB(old, preCompanionVersion, preFortressLayoutVersion, 0); err != nil {
+		t.Fatal("backup invalid", err)
+	}
+	reopened := openTest(t, dir, newTestClock())
+	characters := reopened.Characters().CharactersForDivision(testDivision)
+	if len(characters) != 1 {
+		t.Fatal("character missing")
+	}
+	storage, err := reopened.AccountStorage(characters[0])
+	if err != nil || len(storage.Rows) != 1 || storage.Rows[0].Slot != 0 {
+		t.Fatal("warehouse lost", storage, err)
+	}
+}
+
+/*
+================
+TestWorldPointUpgradeKeepsSchema15Records
+
+Schema 15 records have no point worlds. The upgrade leaves them byte-for-byte
+in place and the upgraded store then keeps a fortress death point's world.
+================
+*/
+func TestWorldPointUpgradeKeepsSchema15Records(t *testing.T) {
+	tier.Long(t, "schema-15 records stay byte-for-byte through the world-point upgrade")
+	dir := t.TempDir()
+	s := openTest(t, dir, newTestClock())
+	if err := s.CreateCharacter(testDivision, "account", seededCharacter()); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	db, err := connectDB(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record string
+	if err := db.QueryRow("SELECT record FROM characters").Scan(&record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE meta SET value = ? WHERE key = ?", preWorldPointVersion, metaKeySchemaVersion); err != nil {
+		t.Fatal(err)
+	}
+	downgradeToLayout5(t, db)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if backup, err := UpgradeAuthority(dir, true); err != nil || backup == "" {
+		t.Fatal("upgrade", backup, err)
+	}
+	db, err = connectDB(filepath.Join(dir, DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upgraded string
+	if err := db.QueryRow("SELECT record FROM characters").Scan(&upgraded); err != nil || upgraded != record {
+		t.Fatal("schema 15 record was rewritten", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := openTest(t, dir, newTestClock())
+	c := reopened.Characters().CharactersForDivision(testDivision)[0]
+	region, x := int64(17221), 812.0
+	if !reopened.UpdateCharacter(c, "death-point", func() bool {
+		if c.World == nil {
+			c.World = &domain.CharacterWorld{}
+		}
+		c.World.LastDeathPoint = &domain.WorldPoint{WorldSpawn: domain.WorldSpawn{RegionID: &region, X: &x}, World: 2}
+		return true
+	}) {
+		t.Fatal("death point not committed")
+	}
+	reopened.Close()
+	again := openTest(t, dir, newTestClock())
+	point := again.Characters().CharactersForDivision(testDivision)[0].World.LastDeathPoint
+	if point == nil || point.World != 2 || *point.RegionID != region {
+		t.Fatalf("death point world lost: %+v", point)
+	}
+}
+
+/*
+================
+TestGuildWarUpgradePreservesLayoutSixAuthority
+================
+*/
+func TestGuildWarUpgradePreservesLayoutSixAuthority(t *testing.T) {
+	tier.Long(t, "the guild-war upgrade preserves a layout-six authority")
+	dir := t.TempDir()
+	s := openTest(t, dir, newTestClock())
+	c := seededCharacter()
+	if err := s.CreateCharacter(testDivision, "existing-account", c); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Fortresses().SaveFortress(testDivision, domain.FortressRecord{FortressID: 1, GuildID: 71, StaffFlags: 7}); err != nil {
+		t.Fatal(err)
+	}
+	var before string
+	if err := s.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division=? AND id=?", testDivision, c.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.syncDBLocked().Exec("DROP TABLE guild_wars; DROP TABLE fortress_item_forges; DROP TABLE unique_kills; DROP TABLE economy_ledger"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.syncDBLocked().Exec("UPDATE meta SET value=? WHERE key=?", preGuildWarLayoutVersion, metaKeyLayoutVersion); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	backup, err := UpgradeAuthority(dir, true)
+	if err != nil || backup == "" {
+		t.Fatalf("upgrade %q %v", backup, err)
+	}
+	s = openTest(t, dir, newTestClock())
+	var after string
+	if err := s.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division=? AND id=?", testDivision, c.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("layout migration rewrote character record")
+	}
+	forts, _, err := s.Fortresses().FortressState(testDivision)
+	if err != nil || len(forts) != 1 || forts[0].GuildID != 71 || forts[0].StaffFlags != 7 {
+		t.Fatalf("fortress lost %+v %v", forts, err)
+	}
+	wars, err := s.GuildWars().GuildWars(testDivision)
+	if err != nil || len(wars) != 0 {
+		t.Fatalf("new war owner %+v %v", wars, err)
+	}
+}
+
+/*
+================
+TestEndedQuestUpgradeKeepsSchema17Records
+
+The schema 17 server 491cc962 already wrote endedQuestIds. Its authority
+upgrades to 18 with that record byte-for-byte in place, the backup still
+validates as schema 17, and the upgraded store reads the ended quests.
+================
+*/
+func TestEndedQuestUpgradeKeepsSchema17Records(t *testing.T) {
+	tier.Long(t, "schema-17 records survive the ended-quest upgrade byte-for-byte")
+	dir := t.TempDir()
+	s := openTest(t, dir, newTestClock())
+	c := seededCharacter()
+	c.EndedQuestIds = []uint32{231, 232}
+	if err := s.CreateCharacter(testDivision, "account", c); err != nil {
+		t.Fatal(err)
+	}
+	var before string
+	if err := s.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division = ? AND id = ?", testDivision, c.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	downgradeToLayout7(t, dir)
+	rewriteDatabaseMeta(t, dir, metaKeySchemaVersion, preEndedQuestVersion)
+	backup, err := UpgradeAuthority(dir, true)
+	if err != nil || backup == "" {
+		t.Fatalf("upgrade %q: %v", backup, err)
+	}
+	old, err := connectDB(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	if _, err := loadDB(old, preEndedQuestVersion, preItemForgeLayoutVersion, 0); err != nil {
+		t.Fatalf("schema 17 backup no longer validates: %v", err)
+	}
+	reopened := openTest(t, dir, newTestClock())
+	var after string
+	if err := reopened.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division = ? AND id = ?", testDivision, c.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("schema-only upgrade rewrote the character")
+	}
+	loaded := reopened.Characters().CharactersForDivision(testDivision)[0]
+	if len(loaded.EndedQuestIds) != 2 || loaded.EndedQuestIds[0] != 231 || loaded.EndedQuestIds[1] != 232 {
+		t.Fatalf("ended quests lost: %v", loaded.EndedQuestIds)
+	}
+	reopened.Close()
+	if _, err := UpgradeAuthority(dir, true); !errors.Is(err, ErrAuthorityCurrent) {
+		t.Fatalf("second upgrade = %v, want ErrAuthorityCurrent", err)
+	}
+}
+
+/*
+================
+TestJobRewardUpgradeKeepsSchema18Records
+
+Schema 18 has no job reward or ranking snapshot: its authority upgrades to
+19 with every record in place and opens at week 0.
+================
+*/
+func TestJobRewardUpgradeKeepsSchema18Records(t *testing.T) {
+	tier.Long(t, "a schema-18 authority upgrades to 19 with every record in place")
+	dir := t.TempDir()
+	s := openTest(t, dir, newTestClock())
+	c := seededCharacter()
+	c.Job = domain.CharacterJob{Type: domain.JobHunter, Grade: 2, Exp: 40, Alias: "Watch", WeeklyReward: 9}
+	if err := s.CreateCharacter(testDivision, "account", c); err != nil {
+		t.Fatal(err)
+	}
+	var before string
+	if err := s.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division = ? AND id = ?", testDivision, c.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	downgradeToLayout7(t, dir)
+	rewriteDatabaseMeta(t, dir, metaKeySchemaVersion, preJobRewardVersion)
+	if backup, err := UpgradeAuthority(dir, true); err != nil || backup == "" {
+		t.Fatalf("upgrade %q: %v", backup, err)
+	}
+	reopened := openTest(t, dir, newTestClock())
+	var after string
+	if err := reopened.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division = ? AND id = ?", testDivision, c.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("schema-only upgrade rewrote the character")
+	}
+	if week := reopened.JobRankings(testDivision).Week; week != 0 {
+		t.Fatalf("an upgraded shard starts at week %d", week)
+	}
+}
+
+/*
+================
+TestStallDecorationUpgradeKeepsSchema19Records
+
+Schema 19 has no stall decoration: its authority upgrades to 20 with
+every record in place, and a decoration written afterwards persists.
+================
+*/
+func TestStallDecorationUpgradeKeepsSchema19Records(t *testing.T) {
+	tier.Long(t, "a schema-19 authority upgrades to 20 with every record in place")
+	dir := t.TempDir()
+	s := openTest(t, dir, newTestClock())
+	c := seededCharacter()
+	if err := s.CreateCharacter(testDivision, "account", c); err != nil {
+		t.Fatal(err)
+	}
+	var before string
+	if err := s.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division = ? AND id = ?", testDivision, c.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	downgradeToLayout7(t, dir)
+	rewriteDatabaseMeta(t, dir, metaKeySchemaVersion, preStallDecorationVersion)
+	if backup, err := UpgradeAuthority(dir, true); err != nil || backup == "" {
+		t.Fatalf("upgrade %q: %v", backup, err)
+	}
+	reopened := openTest(t, dir, newTestClock())
+	var after string
+	if err := reopened.syncDBLocked().QueryRow("SELECT record FROM characters WHERE division = ? AND id = ?", testDivision, c.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("schema-only upgrade rewrote the character")
+	}
+	member := reopened.Characters().CharactersForDivision(testDivision)[0]
+	if !reopened.UpdateCharacter(member, "booth", func() bool { member.StallDecoration = 3848; return true }) {
+		t.Fatal("decoration refused")
+	}
+	reopened.Close()
+	again := openTest(t, dir, newTestClock())
+	if got := again.Characters().CharactersForDivision(testDivision)[0].StallDecoration; got != 3848 {
+		t.Fatalf("decoration after reopen %d", got)
+	}
+}

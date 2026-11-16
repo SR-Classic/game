@@ -1,0 +1,639 @@
+package transport
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// hubMetrics owns every transport counter. Keeping observability state behind
+// one component prevents the live-session registry from becoming a catch-all
+// for unrelated synchronization.
+type hubMetrics struct {
+	wtOK      atomic.Uint64
+	wsOK      atomic.Uint64
+	rlDropped atomic.Uint64
+
+	handshakeBusy             atomic.Uint64
+	accountSessionEvictions   atomic.Uint64
+	clientSessionRefusals     atomic.Uint64
+	handshakeHelloTimeout     atomic.Uint64
+	handshakeReadFailed       atomic.Uint64
+	handshakeProtocolRejected atomic.Uint64
+	resumeAttempted           atomic.Uint64
+	resumeAccepted            atomic.Uint64
+	resumeFresh               atomic.Uint64
+	// resumeEnded counts resumes of evicted sessions, answered with their
+	// BYE (#2146): a newer login won, so they are not refused resumes.
+	resumeEnded atomic.Uint64
+	// resumeNoPosition and resumeGap count resumes refused into a fresh
+	// session (#1466, #1519): a HELLO with no stream position, and a
+	// position the resume ring cannot serve (dropped past its floor,
+	// beyond what was written, or too large for the outbound queue).
+	resumeNoPosition       atomic.Uint64
+	resumeGap              atomic.Uint64
+	helloAdmissionAccepted atomic.Uint64
+	helloAdmissionRefused  atomic.Uint64
+	detaches               atomic.Uint64
+	detachesIdle           atomic.Uint64
+	detachesRingPark       atomic.Uint64
+	detachesOther          atomic.Uint64
+
+	sessOpened            atomic.Uint64
+	sessClosed            atomic.Uint64
+	closedClean           atomic.Uint64
+	closedGrace           atomic.Uint64
+	closedSlow            atomic.Uint64
+	closedPanic           atomic.Uint64
+	closedOther           atomic.Uint64
+	framesIn              atomic.Uint64
+	bytesIn               atomic.Uint64
+	framesOut             atomic.Uint64
+	bytesOut              atomic.Uint64
+	writesOut             atomic.Uint64
+	datagramsOut          atomic.Uint64
+	datagramBytesOut      atomic.Uint64
+	datagramsDropped      atomic.Uint64
+	writeErrors           atomic.Uint64
+	enterWorldAuthRefused atomic.Uint64
+	unhandledFrames       atomic.Uint64
+	emptyFramesRefused    atomic.Uint64
+	queueHighWater        atomic.Uint64
+	queueByteHighWater    atomic.Uint64
+	byeNormal             atomic.Uint64
+	byeShutdown           atomic.Uint64
+	byeReplaced           atomic.Uint64
+	byeOther              atomic.Uint64
+
+	handshakes durationStats
+	ticks      tickStats
+	timing     timingStats // timing.go
+
+	// spikes is the tick-overrun spike journal (tick_spikes.go); nil
+	// until Hub.EnableTickSpikeJournal installs one.
+	spikes *tickSpikeJournal
+	// traces is the slow-tick Perfetto trace writer (tick_trace.go);
+	// nil until Hub.EnableTickTrace installs one.
+	traces *tickTraceWriter
+}
+
+// Metrics is a point-in-time snapshot of the hub's transport counters.
+// The first four keys predate the rest and their names and meanings are
+// frozen: dashboards and out-of-process tooling read them.
+type Metrics struct {
+	// WTOk counts completed handshakes (fresh or resumed) on WebTransport.
+	WTOk uint64 `json:"wt_ok"`
+	// WSOK counts completed handshakes on the WebSocket transport.
+	WSOK uint64 `json:"ws_ok"`
+	// LiveSessions is the current session count.
+	LiveSessions int `json:"live_sessions"`
+	// RateLimitedFrames counts inbound frames dropped by the per-session
+	// rate limiter since boot.
+	RateLimitedFrames      uint64 `json:"rate_limited_frames"`
+	AttachedSessions       int    `json:"attached_sessions"`
+	DetachedSessions       int    `json:"detached_sessions"`
+	BoundSessions          int    `json:"bound_sessions"`
+	OutboundQueueDepth     int    `json:"outbound_queue_depth"`
+	OutboundQueueHighWater uint64 `json:"outbound_queue_high_water"`
+
+	HandshakeRejectedBusy     uint64  `json:"handshake_rejected_busy"`
+	AccountSessionEvictions   uint64  `json:"account_session_evictions"`
+	ClientSessionRefusals     uint64  `json:"client_session_refusals"`
+	HandshakeHelloTimeout     uint64  `json:"handshake_hello_timeout"`
+	HandshakeReadFailed       uint64  `json:"handshake_read_failed"`
+	HandshakeProtocolRejected uint64  `json:"handshake_protocol_rejected"`
+	HandshakeCount            uint64  `json:"handshake_count"`
+	HandshakeLastMs           float64 `json:"handshake_last_ms"`
+	HandshakeMeanMs           float64 `json:"handshake_mean_ms"`
+	HandshakeMaxMs            float64 `json:"handshake_max_ms"`
+	ResumeAttempted           uint64  `json:"resume_attempted"`
+	ResumeAccepted            uint64  `json:"resume_accepted"`
+	ResumeFresh               uint64  `json:"resume_fresh"`
+	ResumeEnded               uint64  `json:"resume_ended"`
+	ResumeNoPosition          uint64  `json:"resume_no_position"`
+	ResumeGap                 uint64  `json:"resume_gap"`
+	HelloAdmissionAccepted    uint64  `json:"hello_admission_accepted"`
+	HelloAdmissionRefused     uint64  `json:"hello_admission_refused"`
+	Detaches                  uint64  `json:"detaches"`
+	DetachesIdle              uint64  `json:"detaches_idle"`
+	DetachesRingPark          uint64  `json:"detaches_ring_park"`
+	DetachesOther             uint64  `json:"detaches_other"`
+
+	// Session lifecycle since boot. The closed breakdown is deliberately
+	// coarse: "other" includes transport errors, protocol violations, and
+	// shutdown-deadline kills.
+	SessionsOpened             uint64 `json:"sessions_opened"`
+	SessionsClosed             uint64 `json:"sessions_closed"`
+	SessionsClosedClean        uint64 `json:"sessions_closed_clean"`
+	SessionsClosedGraceExpired uint64 `json:"sessions_closed_grace_expired"`
+	SessionsClosedSlowConsumer uint64 `json:"sessions_closed_slow_consumer"`
+	SessionsClosedHandlerPanic uint64 `json:"sessions_closed_handler_panic"`
+	SessionsClosedOther        uint64 `json:"sessions_closed_other"`
+
+	// FramesIn counts every inbound frame accepted by a session read loop,
+	// including frames later dropped by rate limiting.
+	FramesIn  uint64 `json:"frames_in"`
+	BytesIn   uint64 `json:"bytes_in"`
+	FramesOut uint64 `json:"frames_out"`
+	BytesOut  uint64 `json:"bytes_out"`
+	// WritesOut counts the transport writes that carried FramesOut
+	// (session_write.go): frames_out / writes_out is the frames one
+	// write carries, about one tick's output per session in a crowd.
+	WritesOut        uint64 `json:"writes_out"`
+	DatagramsOut     uint64 `json:"datagrams_out"`
+	DatagramBytesOut uint64 `json:"datagram_bytes_out"`
+	// DatagramsDropped counts loss-tolerant frames dropped at a full
+	// per-connection datagram queue (#2142); DatagramsOut counts the
+	// frames the datagram lane accepted.
+	DatagramsDropped uint64 `json:"datagrams_dropped"`
+	// DatagramsSendFailed counts, over the live connections, the
+	// datagram sends a peer refused after its frame was accepted
+	// (the drain in conn_wt.go): loss the drop counter cannot see.
+	DatagramsSendFailed   uint64 `json:"datagrams_send_failed"`
+	WriteErrors           uint64 `json:"write_errors"`
+	EnterWorldAuthRefused uint64 `json:"enter_world_auth_refused"`
+	UnhandledOpcodeFrames uint64 `json:"unhandled_opcode_frames"`
+	// EmptyFramesRefused counts outbound opcode-0 frames the queue refused
+	// (emptyframe.go); any non-zero value is a producer bug to fix.
+	EmptyFramesRefused         uint64 `json:"empty_frames_refused"`
+	OutboundQueueBytes         int    `json:"outbound_queue_bytes"`
+	OutboundQueueByteHighWater uint64 `json:"outbound_queue_byte_high_water"`
+	ByeNormal                  uint64 `json:"bye_normal"`
+	ByeShutdown                uint64 `json:"bye_shutdown"`
+	ByeReplaced                uint64 `json:"bye_replaced"`
+	ByeOther                   uint64 `json:"bye_other"`
+
+	TickCount    uint64  `json:"tick_count"`
+	TickLastMs   float64 `json:"tick_last_ms"`
+	TickMeanMs   float64 `json:"tick_mean_ms"`
+	TickMaxMs    float64 `json:"tick_max_ms"`
+	TickOverruns uint64  `json:"tick_overruns"`
+	// TickHistogram is the whole-tick distribution (tick_histogram.go).
+	TickHistogram TickHistogram `json:"tick_ms_histogram"`
+	// TickSpikes mirrors the spike journal's last bursts, oldest first
+	// (tick_spikes.go); absent while the journal is disabled, with the
+	// drop and write-error counters beside it.
+	TickSpikes           []TickSpike `json:"tick_spikes,omitempty"`
+	TickSpikeDropped     uint64      `json:"tick_spike_dropped"`
+	TickSpikeWriteErrors uint64      `json:"tick_spike_write_errors"`
+	// TickTraces mirrors the slow-tick trace writer's counters
+	// (tick_trace.go, #2301); zero while the capture is off.
+	TickTracesWritten    uint64 `json:"tick_traces_written"`
+	TickTraceDropped     uint64 `json:"tick_trace_dropped"`
+	TickTraceWriteErrors uint64 `json:"tick_trace_write_errors"`
+	// Request handler and tick phase histograms (timing.go).
+	HandlerMs map[string]Histogram `json:"handler_ms"`
+	// UnhandledOpcodes splits unhandled_opcode_frames by opcode, up to
+	// maxUnhandledOpcodes distinct values (timing.go, #2147).
+	UnhandledOpcodes map[string]uint64        `json:"unhandled_opcodes"`
+	TickPhaseMs      map[string]Histogram     `json:"tick_phase_ms"`
+	SlowHooks        map[string]SlowHookStats `json:"slow_hooks"`
+	// Divisions whose own work in a tick ran >= 100 ms, by division ID.
+	SlowDivisions map[string]SlowHookStats `json:"slow_divisions"`
+	// PublicationHolds is each labelled publication-gate holder's slow
+	// holds (>= 100 ms, timing.go): who kept the gate longest, beside the
+	// slow steps that only waited on it.
+	PublicationHolds map[string]SlowHookStats `json:"publication_holds"`
+	// TickCommit counts the ticks' batched authority commits (timing.go);
+	// tick_phase_ms.commit is their flush time.
+	TickCommit TickCommitStats `json:"tick_commit"`
+	// MonsterNavigation is the world's route-plan and path-clip counters
+	// (simulation.NavigationMetrics), when the GameWorld installed them.
+	MonsterNavigation map[string]uint64 `json:"monster_navigation,omitempty"`
+	// MonsterLeg is the monster leg's census - legs, actors, steps by
+	// mover mode, rest guards (simulation.NavigationMetrics.LegSnapshot,
+	// #3119) - when the GameWorld installed it.
+	MonsterLeg map[string]uint64 `json:"monster_leg,omitempty"`
+	// Economy is the gold committed since start, per ledger reason and
+	// direction ("gold.<reason>.gain" / ".loss"; store/economy_ledger.go).
+	Economy map[string]uint64 `json:"economy,omitempty"`
+	// PetCombat counts attack pet orders and fights that ended on a dead or
+	// departed target, which the pet log no longer reports
+	// (action/petdiagnostics.go).
+	PetCombat map[string]uint64 `json:"pet_combat,omitempty"`
+	// PlacementInsideObject counts players a non-walk path placed inside an
+	// object no walk can enter, by the path (action/placementguard.go).
+	PlacementInsideObject map[string]uint64 `json:"placement_inside_object,omitempty"`
+	// StoreLock is the authority store's lock waits, write holds and commit
+	// phases (store/lock_timing.go), when the GameWorld installed them.
+	StoreLock any `json:"store_lock,omitempty"`
+	// TickZones is every tick zone's exact cumulative count and time
+	// since boot, keyed "<kind>:<name>" (simulation/zone_ledger.go,
+	// #2824): two snapshots give each zone's milliseconds per tick.
+	TickZones map[string]TickZone `json:"tick_zones,omitempty"`
+	// Runtime is the Go runtime's GC pauses, scheduling latency, heap and
+	// goroutines since start (runtime_stats.go).
+	Runtime RuntimeStats `json:"runtime"`
+}
+
+/*
+==================
+metricsProviders
+
+Who supplies each published metrics block: one provider per block,
+installed by its Set*Metrics call below and read by Metrics(). It
+lives here, with the setters and the document, instead of widening
+the Hub struct in hub.go; the Hub embeds it, so accesses keep the
+provider's name. A nil provider publishes no block.
+==================
+*/
+type metricsProviders struct {
+	// navigationMetrics reads the world's monster navigation counters
+	// (SetNavigationMetrics).
+	navigationMetrics atomic.Pointer[func() map[string]uint64]
+	// monsterLegMetrics reads the world's monster leg census
+	// (SetMonsterLegMetrics, #3119).
+	monsterLegMetrics atomic.Pointer[func() map[string]uint64]
+	// economyMetrics reads the store's committed gold per reason
+	// (SetEconomyMetrics).
+	economyMetrics atomic.Pointer[func() map[string]uint64]
+	// petCombatMetrics reads the attack pets' ended-target counters
+	// (SetPetCombatMetrics).
+	petCombatMetrics atomic.Pointer[func() map[string]uint64]
+	// placementMetrics reads the placement guard's counters
+	// (SetPlacementMetrics).
+	placementMetrics atomic.Pointer[func() map[string]uint64]
+	// storeLockMetrics reads the authority lock's waits, holds and commit
+	// phases (SetStoreLockMetrics).
+	storeLockMetrics atomic.Pointer[func() any]
+	// tickZoneMetrics reads the simulation's exact per-zone tick totals
+	// (SetTickZoneMetrics, #2824).
+	tickZoneMetrics atomic.Pointer[func() map[string]TickZone]
+}
+
+/*
+==================
+SetNavigationMetrics
+
+Installs the provider of the monster_navigation block. The transport only
+reads its counters; it never imports the world that counts them.
+==================
+*/
+func (h *Hub) SetNavigationMetrics(read func() map[string]uint64) {
+	h.navigationMetrics.Store(&read)
+}
+
+/*
+==================
+SetMonsterLegMetrics
+
+Installs the provider of the monster_leg block, as SetNavigationMetrics
+does for its own: the transport never imports the world that counts.
+==================
+*/
+func (h *Hub) SetMonsterLegMetrics(read func() map[string]uint64) {
+	h.monsterLegMetrics.Store(&read)
+}
+
+/*
+==================
+SetEconomyMetrics
+
+Installs the provider of the economy block, as SetNavigationMetrics does:
+the transport never imports the store that counts.
+==================
+*/
+func (h *Hub) SetEconomyMetrics(read func() map[string]uint64) {
+	h.economyMetrics.Store(&read)
+}
+
+/*
+==================
+TickZone
+
+One tick zone's totals in tick_zones: how many times it ran and its
+summed wall time, both cumulative since boot.
+==================
+*/
+type TickZone struct {
+	Count   uint64  `json:"count"`
+	TotalMs float64 `json:"total_ms"`
+}
+
+/*
+==================
+SetTickZoneMetrics
+
+Installs the provider of the tick_zones block, as SetNavigationMetrics
+does: the transport never imports the simulation that times the zones.
+==================
+*/
+func (h *Hub) SetTickZoneMetrics(read func() map[string]TickZone) {
+	h.tickZoneMetrics.Store(&read)
+}
+
+/*
+==================
+SetStoreLockMetrics
+
+Installs the provider of the store_lock block, as SetEconomyMetrics does:
+the transport never imports the store that times its lock.
+==================
+*/
+func (h *Hub) SetStoreLockMetrics(read func() any) {
+	h.storeLockMetrics.Store(&read)
+}
+
+/*
+==================
+SetPetCombatMetrics
+
+Installs the provider of the pet_combat block, as SetNavigationMetrics
+does: the transport never imports the action runtime that counts.
+==================
+*/
+func (h *Hub) SetPetCombatMetrics(read func() map[string]uint64) {
+	h.petCombatMetrics.Store(&read)
+}
+
+/*
+==================
+SetPlacementMetrics
+
+Installs the provider of the placement_inside_object block, as
+SetNavigationMetrics does.
+==================
+*/
+func (h *Hub) SetPlacementMetrics(read func() map[string]uint64) {
+	h.placementMetrics.Store(&read)
+}
+
+// Metrics snapshots the counters and the current live-session count.
+func (h *Hub) Metrics() Metrics {
+	h.mu.RLock()
+	live := len(h.sessions)
+	bound := len(h.bindings)
+	sessions := make([]*Session, 0, live)
+	for _, session := range h.sessions {
+		sessions = append(sessions, session)
+	}
+	h.mu.RUnlock()
+	attached := 0
+	detached := 0
+	queueDepth := 0
+	queueBytes := 0
+	datagramSendFailures := uint64(0)
+	for _, session := range sessions {
+		isAttached, depth, bytes, failures := session.metricsSnapshot()
+		if isAttached {
+			attached++
+		} else {
+			detached++
+		}
+		queueDepth += depth
+		queueBytes += bytes
+		datagramSendFailures += failures
+	}
+	metrics := Metrics{
+		WTOk:                   h.metrics.wtOK.Load(),
+		WSOK:                   h.metrics.wsOK.Load(),
+		LiveSessions:           live,
+		RateLimitedFrames:      h.metrics.rlDropped.Load(),
+		AttachedSessions:       attached,
+		DetachedSessions:       detached,
+		BoundSessions:          bound,
+		OutboundQueueDepth:     queueDepth,
+		OutboundQueueHighWater: h.metrics.queueHighWater.Load(),
+
+		HandshakeRejectedBusy:     h.metrics.handshakeBusy.Load(),
+		AccountSessionEvictions:   h.metrics.accountSessionEvictions.Load(),
+		ClientSessionRefusals:     h.metrics.clientSessionRefusals.Load(),
+		HandshakeHelloTimeout:     h.metrics.handshakeHelloTimeout.Load(),
+		HandshakeReadFailed:       h.metrics.handshakeReadFailed.Load(),
+		HandshakeProtocolRejected: h.metrics.handshakeProtocolRejected.Load(),
+		ResumeAttempted:           h.metrics.resumeAttempted.Load(),
+		ResumeAccepted:            h.metrics.resumeAccepted.Load(),
+		ResumeFresh:               h.metrics.resumeFresh.Load(),
+		ResumeEnded:               h.metrics.resumeEnded.Load(),
+		ResumeNoPosition:          h.metrics.resumeNoPosition.Load(),
+		ResumeGap:                 h.metrics.resumeGap.Load(),
+		HelloAdmissionAccepted:    h.metrics.helloAdmissionAccepted.Load(),
+		HelloAdmissionRefused:     h.metrics.helloAdmissionRefused.Load(),
+		Detaches:                  h.metrics.detaches.Load(),
+		DetachesIdle:              h.metrics.detachesIdle.Load(),
+		DetachesRingPark:          h.metrics.detachesRingPark.Load(),
+		DetachesOther:             h.metrics.detachesOther.Load(),
+
+		SessionsOpened:             h.metrics.sessOpened.Load(),
+		SessionsClosed:             h.metrics.sessClosed.Load(),
+		SessionsClosedClean:        h.metrics.closedClean.Load(),
+		SessionsClosedGraceExpired: h.metrics.closedGrace.Load(),
+		SessionsClosedSlowConsumer: h.metrics.closedSlow.Load(),
+		SessionsClosedHandlerPanic: h.metrics.closedPanic.Load(),
+		SessionsClosedOther:        h.metrics.closedOther.Load(),
+
+		FramesIn:                   h.metrics.framesIn.Load(),
+		BytesIn:                    h.metrics.bytesIn.Load(),
+		FramesOut:                  h.metrics.framesOut.Load(),
+		BytesOut:                   h.metrics.bytesOut.Load(),
+		WritesOut:                  h.metrics.writesOut.Load(),
+		DatagramsOut:               h.metrics.datagramsOut.Load(),
+		DatagramBytesOut:           h.metrics.datagramBytesOut.Load(),
+		DatagramsDropped:           h.metrics.datagramsDropped.Load(),
+		DatagramsSendFailed:        datagramSendFailures,
+		WriteErrors:                h.metrics.writeErrors.Load(),
+		EnterWorldAuthRefused:      h.metrics.enterWorldAuthRefused.Load(),
+		UnhandledOpcodeFrames:      h.metrics.unhandledFrames.Load(),
+		EmptyFramesRefused:         h.metrics.emptyFramesRefused.Load(),
+		OutboundQueueBytes:         queueBytes,
+		OutboundQueueByteHighWater: h.metrics.queueByteHighWater.Load(),
+		ByeNormal:                  h.metrics.byeNormal.Load(),
+		ByeShutdown:                h.metrics.byeShutdown.Load(),
+		ByeReplaced:                h.metrics.byeReplaced.Load(),
+		ByeOther:                   h.metrics.byeOther.Load(),
+	}
+	h.metrics.handshakes.snapshotHandshakeInto(&metrics)
+	h.metrics.ticks.snapshotInto(&metrics)
+	h.metrics.timing.snapshotInto(&metrics)
+	if journal := h.metrics.spikes; journal != nil {
+		metrics.TickSpikes, metrics.TickSpikeDropped, metrics.TickSpikeWriteErrors = journal.snapshot()
+	}
+	if writer := h.metrics.traces; writer != nil {
+		metrics.TickTracesWritten, metrics.TickTraceDropped, metrics.TickTraceWriteErrors = writer.snapshot()
+	}
+	if read := h.navigationMetrics.Load(); read != nil && *read != nil {
+		metrics.MonsterNavigation = (*read)()
+	}
+	if read := h.monsterLegMetrics.Load(); read != nil && *read != nil {
+		metrics.MonsterLeg = (*read)()
+	}
+	if read := h.economyMetrics.Load(); read != nil && *read != nil {
+		metrics.Economy = (*read)()
+	}
+	if read := h.petCombatMetrics.Load(); read != nil && *read != nil {
+		metrics.PetCombat = (*read)()
+	}
+	if read := h.storeLockMetrics.Load(); read != nil && *read != nil {
+		metrics.StoreLock = (*read)()
+	}
+	if read := h.tickZoneMetrics.Load(); read != nil && *read != nil {
+		metrics.TickZones = (*read)()
+	}
+	if read := h.placementMetrics.Load(); read != nil && *read != nil {
+		if counts := (*read)(); len(counts) > 0 {
+			metrics.PlacementInsideObject = counts
+		}
+	}
+	metrics.Runtime = runtimeStats()
+	return metrics
+}
+
+// observeQueueDepth raises the process-lifetime high-water mark without
+// taking a lock on the transport hot path.
+func (h *Hub) observeQueueDepth(depth, bytes int) {
+	if depth <= 0 {
+		depth = 0
+	}
+	if depth > 0 {
+		wanted := uint64(depth)
+		for {
+			current := h.metrics.queueHighWater.Load()
+			if current >= wanted || h.metrics.queueHighWater.CompareAndSwap(current, wanted) {
+				break
+			}
+		}
+	}
+	if bytes <= 0 {
+		return
+	}
+	wanted := uint64(bytes)
+	for {
+		current := h.metrics.queueByteHighWater.Load()
+		if current >= wanted || h.metrics.queueByteHighWater.CompareAndSwap(current, wanted) {
+			return
+		}
+	}
+}
+
+// recordFrameOut accounts only frames the active connection accepted. A
+// queued frame is intentionally not counted until its write succeeds.
+func (h *Hub) recordFrameOut(frame Frame) {
+	h.metrics.framesOut.Add(1)
+	h.metrics.bytesOut.Add(uint64(frame.EncodedLen()))
+	if frame.Opcode != OpBye || len(frame.Payload) == 0 {
+		return
+	}
+	switch frame.Payload[0] {
+	case ByeReasonNormal:
+		h.metrics.byeNormal.Add(1)
+	case ByeReasonShutdown:
+		h.metrics.byeShutdown.Add(1)
+	case ByeReasonReplaced:
+		h.metrics.byeReplaced.Add(1)
+	default:
+		h.metrics.byeOther.Add(1)
+	}
+}
+
+// countAttach records one completed handshake by transport kind.
+func (h *Hub) countAttach(kind string) {
+	switch kind {
+	case "webtransport":
+		h.metrics.wtOK.Add(1)
+	case "websocket":
+		h.metrics.wsOK.Add(1)
+	}
+}
+
+// The simulation-tick duration seam. The 100ms tick itself lives in
+// internal/game/world/simulation and must stay transport-free, so the RECORDING side lives
+// here: whoever runs the tick calls Hub.RecordTickDuration once per tick
+// and the numbers surface on /transport/metrics. Unwired, everything here
+// is a no-op and the tick keys just read zero.
+//
+// worldsession.NewTicker wires it automatically (a TickHook appended
+// after the caller's hooks measures the tick and calls this seam), so the
+// production composition in main needs nothing extra. A tick owner that
+// composes simulation.NewTicker directly instead should time RunTick itself:
+//
+//	start := time.Now()
+//	ticker.RunTick(nowMs)
+//	hub.RecordTickDuration(time.Since(start), ticker.Interval)
+
+// tickStats aggregates tick durations under one small mutex — recorded at
+// 10Hz and snapshotted on metrics scrapes, so contention is irrelevant and
+// a mutex beats juggling torn atomic float pairs.
+type tickStats struct {
+	mu       sync.Mutex
+	count    uint64
+	last     time.Duration
+	sum      time.Duration
+	max      time.Duration
+	overruns uint64
+	buckets  [tickHistogramBuckets]uint64
+}
+
+// durationStats is shared by low-frequency lifecycle duration aggregates.
+// A mutex keeps each count/sum/max snapshot coherent.
+type durationStats struct {
+	mu    sync.Mutex
+	count uint64
+	last  time.Duration
+	sum   time.Duration
+	max   time.Duration
+}
+
+func (stats *durationStats) record(elapsed time.Duration) {
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	stats.mu.Lock()
+	stats.count++
+	stats.last = elapsed
+	stats.sum += elapsed
+	if elapsed > stats.max {
+		stats.max = elapsed
+	}
+	stats.mu.Unlock()
+}
+
+func (stats *durationStats) snapshotHandshakeInto(metrics *Metrics) {
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	metrics.HandshakeCount = stats.count
+	metrics.HandshakeLastMs = float64(stats.last) / float64(time.Millisecond)
+	metrics.HandshakeMaxMs = float64(stats.max) / float64(time.Millisecond)
+	if stats.count > 0 {
+		metrics.HandshakeMeanMs = float64(stats.sum) / float64(time.Millisecond) / float64(stats.count)
+	}
+}
+
+// RecordTickDuration records one simulation tick that took elapsed against a
+// budget of interval (the tick cadence); elapsed > interval counts as an
+// overrun, interval <= 0 disables overrun accounting for that sample.
+// Safe for concurrent use; cheap enough for any per-tick cadence.
+func (h *Hub) RecordTickDuration(elapsed, interval time.Duration) {
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	t := &h.metrics.ticks
+	t.mu.Lock()
+	t.count++
+	t.last = elapsed
+	t.sum += elapsed
+	if elapsed > t.max {
+		t.max = elapsed
+	}
+	if interval > 0 && elapsed > interval {
+		t.overruns++
+	}
+	t.buckets[tickBucket(elapsed)]++
+	t.mu.Unlock()
+	if journal := h.metrics.spikes; journal != nil {
+		journal.observeTick(elapsed, interval)
+	}
+}
+
+// snapshotInto copies the tick aggregates into a Metrics snapshot.
+func (t *tickStats) snapshotInto(m *Metrics) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	m.TickCount = t.count
+	m.TickLastMs = float64(t.last) / float64(time.Millisecond)
+	m.TickMaxMs = float64(t.max) / float64(time.Millisecond)
+	m.TickOverruns = t.overruns
+	m.TickHistogram = tickHistogramSnapshot(&t.buckets, t.count, t.max)
+	if t.count > 0 {
+		m.TickMeanMs = float64(t.sum) / float64(time.Millisecond) / float64(t.count)
+	}
+}

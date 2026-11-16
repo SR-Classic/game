@@ -1,0 +1,146 @@
+/*
+===========================================================================
+
+fortress.go - the persisted fortress state
+
+The shard rows a fortress war leaves behind: who occupies each fortress
+and who holds it during a war (_SiegeFortress GuildID and TempGuildID),
+its signed tax rate and accumulated tax gold,
+the guilds registered for the coming war (_SiegeFortressRequest), and the
+structures standing on its event zones with their hit points and state
+(_SiegeFortressStruct). They are cross-character state, so they live in
+the authority store's fortresses, fortress_requests and
+fortress_structures tables, reached through FortressStore.
+
+===========================================================================
+*/
+package domain
+
+/*
+================
+FortressRecord
+
+One _SiegeFortress row.
+================
+*/
+type FortressRecord struct {
+	StaffFlags    uint8                  `json:"staffFlags,omitempty"`
+	FortressID    uint32                 `json:"fortressId"`
+	GuildID       int64                  `json:"guildId,omitempty"`
+	TempGuildID   int64                  `json:"tempGuildId,omitempty"`
+	TaxRate       int16                  `json:"taxRate,omitempty"`
+	TaxGold       int64                  `json:"taxGold,omitempty"`
+	BattleRecords []FortressBattleRecord `json:"battleRecords,omitempty"`
+}
+
+/*
+================
+FortressRequestRecord
+
+One _SiegeFortressRequest row: a guild's application and its kind (0 to
+attack, 1 to ally with the occupier).
+================
+*/
+type FortressRequestRecord struct {
+	FortressID uint32
+	GuildID    int64
+	Kind       uint8
+}
+
+/*
+================
+FortressStructureRecord
+
+One _SiegeFortressStruct row: the structure installed on an event zone,
+its owner, hit points and state word.
+================
+*/
+type FortressStructureRecord struct {
+	FortressID    uint32 `json:"fortressId"`
+	EventStructID uint32 `json:"eventStructId"`
+	RefObjID      uint32 `json:"refObjId"`
+	OwnerGuildID  int64  `json:"ownerGuildId,omitempty"`
+	HP            uint32 `json:"hp"`
+	State         uint16 `json:"state,omitempty"`
+	// MadeAtMs is when the structure on the zone was made by an upgrade (or
+	// a construction), so its build minutes hold across a restart. Zero is
+	// a structure never raised, made long ago.
+	MadeAtMs int64 `json:"madeAtMs,omitempty"`
+}
+
+/*
+================
+FortressStore
+
+The authority store's fortress door. Each save commits before it
+returns; a failed save is an error, never a silent loss.
+================
+*/
+type FortressStore interface {
+	// FortressState returns a division's stored fortresses and requests in
+	// fortress order.
+	FortressState(divisionID string) ([]FortressRecord, []FortressRequestRecord, error)
+	// SaveFortress writes one fortress row.
+	SaveFortress(divisionID string, record FortressRecord) error
+	// SaveFortressRequest writes (present) or removes one request.
+	SaveFortressRequest(divisionID string, request FortressRequestRecord, present bool) error
+	// FortressStructures returns a division's stored structures in
+	// fortress and event-zone order.
+	FortressStructures(divisionID string) ([]FortressStructureRecord, error)
+	// SaveFortressStructure writes (present) or removes one zone's structure.
+	SaveFortressStructure(divisionID string, structure FortressStructureRecord, present bool) error
+}
+
+/*
+================
+FortressBattleRecord
+
+_SiegeFortressBattleRecord: the fortress is the containing row; rank and
+its last promotion time survive reconnect independently of a live buff.
+================
+*/
+type FortressBattleRecord struct {
+	CharacterID int64  `json:"characterId"`
+	Kills       uint32 `json:"kills"`
+	Deaths      uint32 `json:"deaths"`
+	Rank        uint8  `json:"rank"`
+	RankAtMs    int64  `json:"rankAtMs"`
+}
+
+/*
+================
+FortressStaffStore
+
+The hire commit owns the fortress flags, guild points and master's gold in
+one transaction. Refusals are the v1.150 fortress notice's low byte.
+================
+*/
+type FortressStaffStore interface {
+	HireFortressStaff(divisionID string, record FortressRecord, actorID int64, requested uint8) (uint8, error)
+}
+
+/*
+================
+FortressTaxStore
+
+Collection commits the treasury debit and master's credit together. The
+authority holds its lock until the returned amount is applied in memory.
+================
+*/
+type FortressTaxStore interface {
+	CollectFortressTax(divisionID string, record FortressRecord, actorID int64, requested int64) (int64, uint8, error)
+}
+
+const (
+	FortressStaffGold int64  = 30000
+	FortressStaffGP   uint32 = 3000
+)
+
+// v1.150 754A40 reads the low byte of the v1.188 fortress refusal.
+const (
+	FortressTaxErrFailure uint8 = 2
+	FortressTaxErrUnknown uint8 = 3
+	FortressTaxErrOwner   uint8 = 6
+	FortressTaxErrMaster  uint8 = 7
+	FortressTaxErrPeriod  uint8 = 8
+)

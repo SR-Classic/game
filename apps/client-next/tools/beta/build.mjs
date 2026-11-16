@@ -1,0 +1,460 @@
+/*
+===========================================================================
+
+build.mjs - verified browser release assembly
+
+Freezes application inputs and projects public assets before creating the
+release archive. Private maps remain outside the deployable package.
+
+Assets are served as packs: the client reads every asset through its verified
+pack reader. Only the few files the browser loads by URL itself
+(foundation/assets/native-assets.ts) also get a URL of their own.
+
+===========================================================================
+*/
+import { CLIENT_PUBLIC_ROOT } from "../../../../scripts/lib/generatedRoot.mjs";
+import { requireRuntimeTextAssets } from "../../../../scripts/build/assetPackOwnership.mjs";
+import { verifyIndexClaims } from "../../../../scripts/build/shared/publicationLedger.mjs";
+import {
+	decodeStoredMember,
+	parsePackHeader,
+	sameStoredForm,
+	storedMemberBytes
+} from "../../../../scripts/build/shared/packFormat.mjs";
+import { clientBuildDefinitions } from "../build-metadata.mjs";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { build } from "vite";
+import { files, inspect, publicIndex, safeName, sha, releaseIdentity, verifyDirectory } from "./policy.mjs";
+import { ASSET_SCHEMA, RELEASE_PROTOCOL } from "../../src/engine/foundation/release/protocol.ts";
+import { nativeAssetUrls } from "../../src/engine/foundation/assets/native-assets.ts";
+import { archiveRelease } from "./archive.mjs";
+import { compressRoutes } from "./compression.mjs";
+import { projectPack } from "./public-data.mjs";
+import {
+	backgroundInstallDocument,
+	BACKGROUND_INSTALL_PUBLIC_PATH
+} from "../../../../scripts/build/data/buildBackgroundInstallAsset.mjs";
+const root = path.resolve( import.meta.dirname, "../.." );
+/*
+================
+write
+================
+*/
+const write = async ( p, b ) => {
+	await mkdir( path.dirname( p ), { recursive: true } );
+	await writeFile( p, b, { flag: "wx" } );
+};
+// The application's pages: the game, and the embeddable 3D viewer
+// (docs/guides/VIEWER.md) served beside it at /play/viewer.html.
+const APPLICATION_PAGES = [ "index.html", "viewer.html" ];
+
+/*
+================
+freezeSource
+================
+*/
+export async function freezeSource( base = root ) {
+	const source = {};
+	for ( const f of await files( path.join( base, "src" ) ) ) {
+		source["src/" + f] = await readFile( path.join( base, "src", f ), "utf8" );
+	}
+	for ( const page of APPLICATION_PAGES ) source[page] = await readFile( path.join( base, page ), "utf8" );
+	return source;
+}
+/*
+================
+buildApplication
+================
+*/
+export async function buildApplication( { base = root, directory, source, mode = "beta" } ) {
+	/*
+	================
+	normal
+	================
+	*/
+	const normal = p => p.replaceAll( "\\", "/" ),
+		inputs = new Map( Object.entries( source ).map( ( [n, s] ) => [ normal( path.join( base, n ) ), s ] ) );
+	const maps = new Map();
+	/*
+	================
+	plugin
+	================
+	*/
+	const plugin = () => ({
+		name: "beta-frozen-inputs",
+		enforce: "pre",
+		/*
+		================
+		resolveId
+		================
+		*/
+		resolveId( id, importer ) {
+			const p = id.startsWith( "/src/" ) ?
+				path.join( base, id.slice( 1 ) ) :
+				id.startsWith( "@/" ) ?
+				path.join( base, "src", id.slice( 2 ) ) :
+				id.startsWith( "." ) && importer ?
+				path.resolve( path.dirname( importer.split( "?" )[0] ), id ) :
+				id;
+			if ( !path.isAbsolute( p ) ) return;
+			for (
+				const suffix of [ "", ".ts", ".tsx", ".js", "/index.ts" ]
+			) if ( inputs.has( normal( p + suffix ) ) ) return normal( p + suffix );
+		},
+		/*
+		================
+		load
+		================
+		*/
+		load( id ) {
+			if ( id.includes( "?" ) ) return;
+			const p = normal( id );
+			if ( p.startsWith( normal( path.join( base, "src" ) ) + "/" ) && !inputs.has( p ) ) {
+				throw Error(
+					"Unfrozen source dependency " + p
+				);
+			}
+			return inputs.get( p );
+		},
+		transformIndexHtml: {
+			order: "pre",
+			// Each page builds from its own frozen copy, never the game's.
+			handler: ( _html, context ) => {
+				const page = normal( path.relative( base, context.filename ) );
+				if ( source[page] === undefined ) throw Error( "Unfrozen application page " + page );
+				return source[page];
+			}
+		},
+		/*
+		================
+		generateBundle
+		================
+		*/
+		generateBundle( _options, bundle ) {
+			for ( const [name, entry] of Object.entries( bundle ) ) {
+				if ( name.endsWith( ".map" ) ) {
+					safeName( name );
+					maps.set( name, entry.source );
+					delete bundle[name];
+				}
+			}
+		}
+	});
+	const staging = path.resolve( directory, "../../private/compiled-" + mode );
+	await mkdir( staging, { recursive: true } );
+	await build( {
+		root: base,
+		configFile: false,
+		define: clientBuildDefinitions( base ),
+		envDir: false,
+		envPrefix: [],
+		mode,
+		publicDir: false,
+		logLevel: "warn",
+		plugins: [ plugin() ],
+		resolve: { alias: { "@": path.join( base, "src" ) } },
+		worker: { plugins: () => [ plugin() ] },
+		build: {
+			outDir: staging,
+			emptyOutDir: false,
+			sourcemap: "hidden",
+			minify: "esbuild",
+			rollupOptions: {
+				// The frozen pages (freezeSource holds every APPLICATION_PAGES entry).
+				input: Object.fromEntries(
+					APPLICATION_PAGES.filter( page => source[page] !== undefined ).map( page => [
+						page.replace( /\.html$/, "" ),
+						path.join( base, page )
+					] )
+				),
+				output: {}
+			}
+		},
+		// frame-probes.ts folds its probe lookup away outside development, so
+		// no diagnostic global name reaches the release (policy.mjs checks it).
+		esbuild: { legalComments: "eof" }
+	} );
+	// Vite may emit worker maps after generateBundle. Final filesystem outputs
+	// are the authority; intermediate compiler output never enters the web root.
+	for ( const name of await files( staging ) ) {
+		const bytes = await readFile( path.join( staging, name ) );
+		if ( name.endsWith( ".map" ) ) maps.set( name, bytes );
+		else await write( path.join( directory, name ), bytes );
+	}
+	for ( const name of await files( directory ) ) {
+		inspect( name, await readFile( path.join( directory, name ) ), { application: true } );
+	}
+	return maps;
+}
+/*
+================
+documentAssetUrls
+
+The asset URLs a built page or stylesheet makes the browser load itself.
+Script literals are not listed: scripts read assets through the pack reader.
+================
+*/
+export function documentAssetUrls( name, text ) {
+	if ( !name.endsWith( ".html" ) && !name.endsWith( ".css" ) ) return [];
+	return [ ...text.matchAll( /\/assets\/[A-Za-z0-9_.\/-]+/g ) ].map( match => match[0] );
+}
+/*
+================
+requireNativeAssets
+
+Every asset URL the built application loads by itself must be declared
+native, and every declared native asset must be a published member.
+================
+*/
+export function requireNativeAssets( applicationFiles, native, members ) {
+	for ( const [name, text] of applicationFiles ) {
+		for ( const url of documentAssetUrls( name, text ) ) {
+			if ( applicationFiles.has( url.slice( 1 ) ) ) continue;
+			if ( !native.has( url ) ) {
+				throw Error( `${name} loads ${url} by URL; declare it in foundation/assets/native-assets.ts` );
+			}
+		}
+	}
+	for ( const url of native ) {
+		if ( !members.has( url ) ) throw Error( "Native asset is not a published member: " + url );
+	}
+}
+/*
+================
+buildBeta
+================
+*/
+/** @param {{ destination?: string, assetRoot?: string, makeArchive?: boolean, sourceSnapshot?: string }} [options] */
+export async function buildBeta(
+	{
+		destination = path.join( root, "temp/artifacts", "beta", new Date().toISOString().replace( /[:.]/g, "-" ) ),
+		assetRoot = CLIENT_PUBLIC_ROOT,
+		makeArchive = true,
+		sourceSnapshot
+	} = {}
+) {
+	// A fresh generation only: never delete or reuse a directory that could hold
+	// someone else's artifacts. Private maps are a sibling of the deployable package.
+	await mkdir( destination, { recursive: false } );
+	const packageRoot = path.join( destination, "package" ), privateRoot = path.join( destination, "private" );
+	const source = sourceSnapshot ? JSON.parse( await readFile( sourceSnapshot, "utf8" ) ) : await freezeSource(),
+		inputHash = sha( JSON.stringify( source ) );
+	await write( path.join( privateRoot, "source.json" ), JSON.stringify( source ) );
+	// The asset base is refused before the application is compiled: a
+	// release ships only what the current pipeline produced (every packed
+	// asset has a build owner) and everything the pipeline claims (no
+	// claimed asset missing), so an index that quietly lost claimed
+	// paths is never packaged thinner (2026-11-10;
+	// scripts/build/shared/publicationLedger.mjs).
+	const authority = await readFile( path.join( assetRoot, "assets/packs/manifest.json" ) );
+	const original = JSON.parse( authority ), index = publicIndex( original );
+	requireRuntimeTextAssets( index.assets.map( asset => asset.path ) );
+	// The client reads one data format; packaging any other would ship a
+	// release whose code and data disagree.
+	if ( original.assetSchema !== ASSET_SCHEMA ) {
+		throw Error( `Asset data is schema ${original.assetSchema}; this client reads ${ASSET_SCHEMA}` );
+	}
+	const ledger = await verifyIndexClaims( original );
+	if ( ledger.length > 0 ) {
+		throw Error(
+			`The published pack index disagrees with the publication ledger: ${ledger.join( "; " )}. ` +
+				"Run `pnpm assets build full`, then package again."
+		);
+	}
+	const applicationRoot = path.join( packageRoot, "application" ),
+		maps = await buildApplication( { directory: applicationRoot, source } );
+	for ( const [name, map] of maps ) await write( path.join( privateRoot, "maps", name ), map );
+	const manifest = {
+		format: "sro-beta-release-v1",
+		// The release protocol compiled into this build; release admission
+		// compares it with the declared one (the release's client bundler).
+		protocol: RELEASE_PROTOCOL,
+		assetSchema: ASSET_SCHEMA,
+		sourceHash: inputHash,
+		files: [],
+		routes: [],
+		excludedGroups: [],
+		privateMaps: maps.size
+	};
+	/*
+	================
+	add
+	================
+	*/
+	const add = async ( file, bytes, kind ) => {
+		safeName( file );
+		inspect( file, bytes, { application: kind === "application" } );
+		await write( path.join( packageRoot, file ), bytes );
+		manifest.files.push( { path: file, length: bytes.length, sha256: sha( bytes ), kind } );
+	};
+	/*
+	================
+	route
+	================
+	*/
+	const route = ( { url, file, length, mime, offset = 0, encoding } ) => {
+		safeName( url.slice( 1 ) );
+		manifest.routes.push( { url, file, offset, length, mime, ...(encoding ? { encoding } : {}) } );
+	};
+	const applicationFiles = new Map();
+	for ( const name of await files( applicationRoot ) ) {
+		const bytes = await readFile( path.join( applicationRoot, name ) );
+		applicationFiles.set( name, bytes.toString( "utf8" ) );
+		manifest.files.push( {
+			path: "application/" + name,
+			length: bytes.length,
+			sha256: sha( bytes ),
+			kind: "application"
+		} );
+		route( {
+			url: "/" + name,
+			file: "application/" + name,
+			length: bytes.length,
+			mime: name.endsWith( ".js" ) ? "text/javascript" : name.endsWith( ".css" ) ? "text/css" : "text/html"
+		} );
+	}
+	manifest.assetAuthorityHash = sha( authority );
+	manifest.excludedGroups = original.groups.filter( g => !index.groups.includes( g ) ).map( g => g.name );
+	const native = new Set( nativeAssetUrls() );
+	requireNativeAssets( applicationFiles, native, new Set( index.assets.map( a => a.path ) ) );
+	// Pack members are inspected even when no loose representation remains.
+	for ( const group of index.groups ) {
+		for ( const pack of group.packs ) {
+			console.log( "[beta] pack", group.name, pack.path );
+			/*
+			================
+			resolve
+			================
+			*/
+			const resolve = n => path.join( assetRoot, safeName( n.slice( 1 ) ) );
+			let bytes = await readFile( resolve( pack.path ) );
+			if ( bytes.length !== pack.bytes || sha( bytes ) !== pack.sha256 ) {
+				throw Error( "Publication pack drift " + pack.path );
+			}
+			const members = index.assets.filter( a => a.packPath === pack.path );
+			bytes = projectPack( pack, bytes, members );
+			const file = "payload/" + pack.sha256 + ".bin";
+			await add( file, bytes, "data" );
+			route( { url: pack.path, file, length: bytes.length, mime: "application/octet-stream" } );
+			const { header, dataStart: start } = parsePackHeader( bytes, pack.path );
+			if ( header.files.length !== members.length ) throw Error( "Pack membership drift" );
+			for ( const a of members ) {
+				const e = header.files.find( e => e.path === a.path );
+				if (
+					!e || e.offset !== a.offset || e.length !== a.length || e.sha256 !== a.sha256 ||
+					!sameStoredForm( e, a )
+				) {
+					throw Error( "Pack index drift " + a.path );
+				}
+				// Members are read from the pack; only browser-loaded files get a URL,
+				// and the browser needs their plain bytes: a compressed member is
+				// published decoded as its own file.
+				if ( !native.has( a.path ) ) continue;
+				if ( !a.stored ) {
+					route( { url: a.path, file, length: a.length, mime: a.mime, offset: start + a.offset } );
+					continue;
+				}
+				const plain = decodeStoredMember( storedMemberBytes( bytes, start, a, pack.path ), a );
+				const plainFile = "payload/" + a.sha256 + path.extname( a.path ).toLowerCase();
+				await add( plainFile, plain, "data" );
+				route( { url: a.path, file: plainFile, length: plain.length, mime: a.mime } );
+			}
+		}
+	}
+	for ( const group of index.groups ) {
+		const members = index.assets.filter( a => a.group === group.name );
+		group.totalBytes = members.reduce( ( n, a ) => n + a.length, 0 );
+		group.assetCount = members.length;
+	}
+	const indexBytes = Buffer.from( JSON.stringify( index ) );
+	await add( "publication.json", indexBytes, "data" );
+	route( {
+		url: "/assets/packs/manifest.json",
+		file: "publication.json",
+		length: indexBytes.length,
+		mime: "application/json"
+	} );
+	if (
+		sha( await readFile( path.join( assetRoot, "assets/packs/manifest.json" ) ) ) !== manifest.assetAuthorityHash
+	) throw Error( "Asset publication changed during freeze; package not accepted" );
+	// The HD set (#2061) ships behind its own index beside the default one,
+	// under the same audience classification (policy.mjs). A build without
+	// the set has no /hd routes and the client reads the missing index as
+	// an empty set. Members get no routes of their own: the client reads
+	// them through the pack reader, as with the ASTC variants.
+	const hdAuthority = await readFile( path.join( assetRoot, "hd/packs/manifest.json" ) ).catch( error => {
+		if ( error?.code === "ENOENT" ) return null;
+		throw error;
+	} );
+	if ( hdAuthority ) {
+		const hdIndex = publicIndex( JSON.parse( hdAuthority ) );
+		for ( const group of hdIndex.groups ) {
+			for ( const pack of group.packs ) {
+				console.log( "[beta] hd pack", group.name, pack.path );
+				const resolve = n => path.join( assetRoot, safeName( n.slice( 1 ) ) );
+				let bytes = await readFile( resolve( pack.path ) );
+				if ( bytes.length !== pack.bytes || sha( bytes ) !== pack.sha256 ) {
+					throw Error( "HD publication pack drift " + pack.path );
+				}
+				const members = hdIndex.assets.filter( a => a.packPath === pack.path );
+				bytes = projectPack( pack, bytes, members );
+				const file = "payload/" + pack.sha256 + ".bin";
+				await add( file, bytes, "data" );
+				route( { url: pack.path, file, length: bytes.length, mime: "application/octet-stream" } );
+			}
+		}
+		const hdIndexBytes = Buffer.from( JSON.stringify( hdIndex ) );
+		await add( "hd-publication.json", hdIndexBytes, "data" );
+		route( {
+			url: "/hd/packs/manifest.json",
+			file: "hd-publication.json",
+			length: hdIndexBytes.length,
+			mime: "application/json"
+		} );
+	}
+	// Required runtime metadata is derived from this release's published members.
+	// A loose development sidecar cannot be assumed to survive pack projection.
+	if ( !manifest.routes.some( row => row.url === BACKGROUND_INSTALL_PUBLIC_PATH ) ) {
+		const installBytes = Buffer.from(
+			JSON.stringify( backgroundInstallDocument( index.assets.map( a => a.path ) ) )
+		);
+		const installFile = "payload/" + sha( installBytes ) + ".json";
+		await add( installFile, installBytes, "data" );
+		route( {
+			url: BACKGROUND_INSTALL_PUBLIC_PATH,
+			file: installFile,
+			length: installBytes.length,
+			mime: "application/json"
+		} );
+	}
+	await compressRoutes( packageRoot, manifest );
+	manifest.files.sort( ( a, b ) => a.path.localeCompare( b.path ) );
+	manifest.routes.sort( ( a, b ) => a.url.localeCompare( b.url ) );
+	manifest.releaseId = releaseIdentity( manifest );
+	await write( path.join( packageRoot, "release.json" ), JSON.stringify( manifest, null, 2 ) );
+	await verifyDirectory( packageRoot );
+	if ( makeArchive ) await archiveRelease( packageRoot, path.join( destination, "client-beta.tar" ) );
+	await write( path.join( privateRoot, "release-id.txt" ), manifest.releaseId );
+	await write(
+		path.join( privateRoot, "debug.json" ),
+		JSON.stringify(
+			{
+				releaseId: manifest.releaseId,
+				maps: Object.fromEntries( [ ...maps ].map( ( [n, b] ) => [ n, sha( b ) ] ) )
+			},
+			null,
+			2
+		)
+	);
+	console.log( "[beta] verified", destination, manifest.releaseId );
+	return { destination, packageRoot, privateRoot, manifest };
+}
+if ( process.argv[1] && path.resolve( process.argv[1] ) === fileURLToPath( import.meta.url ) ) {
+	await mkdir( path.join( root, "temp/artifacts/beta" ), { recursive: true } );
+	await buildBeta( {
+		...(process.argv[2] ? { destination: path.resolve( process.argv[2] ) } : {}),
+		...(process.argv[3] === "--source" ? { sourceSnapshot: path.resolve( process.argv[4] ) } : {})
+	} );
+}

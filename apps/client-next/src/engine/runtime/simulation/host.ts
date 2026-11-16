@@ -1,0 +1,250 @@
+/*
+===========================================================================
+
+host.ts - the main thread's side of the simulation worker
+
+Owns the worker, the one retained world batch awaiting acknowledgement, the
+newest snapshot buffer and the input sequence checks. The runtime polls it
+once per frame; delivery() lets a hidden tab frame from worker messages.
+It also holds each character's last walking path: the worker's port sends a
+path that continues it as a change (walking-path-wire.ts), and the batch is
+whole again before it is retained.
+
+===========================================================================
+*/
+import type { SessionState } from "@/engine/contracts/session";
+import { PROTOCOL_VERSION, readSnapshot } from "@/engine/contracts/simulation";
+import { createWalkingPathMemory, restoreWalkingPaths } from "@/engine/foundation/gameplay/walking-path-wire";
+import type { WorkerMessage, HostMessage } from "@/engine/contracts/simulation";
+import type { SimulationHost, SimulationObservation } from "@/engine/contracts/runtime";
+import { NET_JOURNAL_FIELDS } from "@/engine/contracts/network";
+import { createInputSequence } from "@/engine/foundation/gameplay/movement-input";
+// The bug report's frame journal keeps at least this many recent frames.
+const NET_JOURNAL_KEPT = 8192;
+
+/*
+================
+createSimulationHost
+================
+*/
+export function createSimulationHost(): SimulationHost {
+	const worker = new Worker( new URL( "./worker/entry.ts", import.meta.url ), {
+		type: "module",
+		name: "sro-simulation"
+	} );
+	let disposed = false, failure: string | null = null, pending: ArrayBuffer | null = null, sequence = 0;
+	let worldBatch: import("@/engine/contracts/world").WorldBatch | null = null, worldSequence = 0;
+	// The walking paths as the worker's port last sent them, one per character.
+	const receivedWalkingPaths = createWalkingPathMemory();
+	let sessionState: SessionState | null = null;
+	let lastInputSent = 0, lastInputAccepted = 0;
+	// Gameplay inputs to the worker carry a sequence number (#1441a).
+	const inputs = createInputSequence();
+	let receivedAtMs = 0, clock: import("@/engine/contracts/runtime").ClockSample | undefined;
+	let deliveryWaiters: (() => void)[] = [];
+	// The transport's frame journal (network.ts), oldest first, for bug reports.
+	let journal: Float64Array[] = [], journalRecords = 0;
+	/*
+================
+wake
+Settles every delivery() waiter. Main-thread timers throttle in a hidden
+tab; worker messages do not.
+================
+	*/
+	const wake = () => {
+		const waiters = deliveryWaiters;
+		deliveryWaiters = [];
+		for ( const resolve of waiters ) resolve();
+	};
+	const send = ( message: HostMessage, transfer: Transferable[] = [] ) => worker.postMessage( message, transfer );
+	const recycle = ( buffer: ArrayBuffer ) => send( { kind: "recycle", buffer }, [ buffer ] );
+	worker.onmessage = ( event: MessageEvent<WorkerMessage> ) => {
+		if ( disposed ) {
+			return;
+		}
+		wake();
+		if ( event.data.kind === "world" ) {
+			if ( worldBatch || event.data.batch.sequence !== worldSequence + 1 ) {
+				failure = "World journal delivery sequence violation";
+				return;
+			}
+			// The port sent the walking paths that continue their last ones
+			// as changes; every reader of the batch gets them whole.
+			try {
+				restoreWalkingPaths( event.data.batch, event.data.walkingPaths, receivedWalkingPaths );
+			} catch ( error ) {
+				failure = String( error );
+				return;
+			}
+			worldBatch = event.data.batch;
+			return;
+		}
+		if ( event.data.kind === "failure" ) {
+			failure = event.data.message;
+			return;
+		}
+		if ( event.data.kind === "session" ) {
+			sessionState = event.data.state;
+			return;
+		}
+		if ( event.data.kind === "net-journal" ) {
+			journal.push( event.data.records );
+			journalRecords += event.data.records.length / NET_JOURNAL_FIELDS;
+			while (
+				journal.length > 1 && journalRecords - journal[0]!.length / NET_JOURNAL_FIELDS >= NET_JOURNAL_KEPT
+			) {
+				journalRecords -= journal.shift()!.length / NET_JOURNAL_FIELDS;
+			}
+			return;
+		}
+		if ( pending ) {
+			recycle( pending );
+		}
+		pending = event.data.buffer;
+		clock = event.data.clock;
+		receivedAtMs = performance.timeOrigin + performance.now();
+	};
+	worker.onerror = event => {
+		failure = event.message;
+	};
+	worker.onmessageerror = () => {
+		failure = "Simulation message could not be decoded";
+	};
+	send( { kind: "start", version: PROTOCOL_VERSION } );
+	return {
+		pollWorld: () => worldBatch,
+		/*
+================
+netJournal
+
+The frames journaled so far (at least the last NET_JOURNAL_KEPT), oldest
+first: epoch ms, direction, opcode and bytes per frame.
+================
+		*/
+		netJournal() {
+			const out = new Float64Array( journalRecords * NET_JOURNAL_FIELDS );
+			let at = 0;
+			for ( const chunk of journal ) {
+				out.set( chunk, at );
+				at += chunk.length;
+			}
+			return out;
+		},
+		/*
+================
+delivery
+Resolves on the next worker message, or at once after disposal.
+================
+		*/
+		delivery: () =>
+			disposed ? Promise.resolve() : new Promise<void>( resolve => {
+				deliveryWaiters.push( resolve );
+			} ),
+		/*
+================
+ackWorld
+================
+		*/
+		ackWorld( sequence ) {
+			if ( !worldBatch || worldBatch.sequence !== sequence ) {
+				throw new Error( "World journal acknowledgement mismatch" );
+			}
+			worldSequence = sequence;
+			worldBatch = null;
+			send( { kind: "world-ack", sequence } );
+		},
+		/*
+================
+session
+================
+		*/
+		session( command ) {
+			if ( disposed || failure ) return undefined;
+			if ( command.kind !== "gameplay" ) {
+				send( { kind: "session", command } );
+				return undefined;
+			}
+			const inputSeq = inputs.next();
+			send( { kind: "session", command: { ...command, inputSeq } } );
+			return inputSeq;
+		},
+		/*
+================
+pollSession
+================
+		*/
+		pollSession() {
+			const result = sessionState;
+			sessionState = null;
+			return result;
+		},
+		/*
+================
+sendInput
+================
+		*/
+		sendInput( batch ) {
+			if ( disposed || failure ) {
+				return;
+			}
+			if ( batch.first !== lastInputSent + 1 || batch.last - lastInputAccepted > 2048 ) {
+				failure = "Simulation input backlog or sequence violation";
+				return;
+			}
+			lastInputSent = batch.last;
+			send( { kind: "input", batch } );
+		},
+		/*
+================
+poll
+================
+		*/
+		poll(): SimulationObservation | null {
+			if ( !pending || disposed ) {
+				return null;
+			}
+			const buffer = pending;
+			pending = null;
+			try {
+				const data = readSnapshot( buffer );
+				if ( data.sequence <= sequence ) {
+					return null;
+				}
+				if ( data.acceptedInputSequence < lastInputAccepted || data.acceptedInputSequence > lastInputSent ) {
+					throw new Error( "Invalid input acknowledgement" );
+				}
+				lastInputAccepted = data.acceptedInputSequence;
+				sequence = data.sequence;
+				return {
+					...data,
+					...(clock ? { clock } : {}),
+					receivedAtMs,
+					appliedAtMs: performance.timeOrigin + performance.now()
+				};
+			} catch ( error ) {
+				failure = String( error );
+				return null;
+			} finally {
+				recycle( buffer );
+			}
+		},
+		error: () => failure,
+		/*
+================
+dispose
+================
+		*/
+		dispose() {
+			if ( disposed ) {
+				return;
+			}
+			disposed = true;
+			pending = null;
+			wake();
+			worker.onmessage = null;
+			worker.onerror = null;
+			worker.onmessageerror = null;
+			worker.terminate();
+		}
+	};
+}

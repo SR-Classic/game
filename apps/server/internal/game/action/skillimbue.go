@@ -1,0 +1,263 @@
+/*
+===========================================================================
+
+skillimbue.go - imbue and other zero-duration self skills
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"opensro.online/server/internal/game/abnormal"
+	"opensro.online/server/internal/game/combat"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/statuseffect"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/world/simulation"
+	"sync/atomic"
+)
+
+/*
+================
+instantActivitySkill
+
+A skill the press runs at once through acceptInstantSelfEffect, before the
+command queue (natively non-attack activity skills dispatch first): an
+instant self effect or a weapon imbue.
+================
+*/
+func instantActivitySkill(skill enterworld.SkillRow) bool {
+	return skill.InstantSelfEffectPinned || skill.Imbue.Pinned
+}
+
+// A zero-action-duration skill still owns admission, MP, cooldown, an accepted
+// action and an independently timed effect. Natively the persistent cast dispatches category 3.
+/*
+================
+acceptInstantSelfEffect
+================
+*/
+func (rt *Runtime) acceptInstantSelfEffect(division string, character, snapshot *enterworld.Character, cast wire.SkillAction, skill enterworld.SkillRow) OpResult {
+	instantShape := instantActivitySkill(skill) && !skill.ChainSub
+	selfOnly := !cast.HasTarget && !cast.HasGroundTarget
+	casterReady := enterworld.CharacterAlive(snapshot) && enterworld.SkillLearned(snapshot, skill.ID)
+	if !instantShape || !selfOnly || !casterReady {
+		return OpResult{DiagnosticRefusal: "instant-effect-admission-refused"}
+	}
+	// The arena decision gate contextSkillAdmission applies (skilladmit.go).
+	if rt.sookDecisionHolds(division, snapshot) {
+		return offensiveRefusal(0x3005)
+	}
+	// And its stall and exchange gate (#3433).
+	if rt.stallBusy(division, snapshot.Name) {
+		return offensiveRefusal(0x3009)
+	}
+	now := rt.Now().UnixMilli()
+	// Natively activity != 2 executes through events 0 and 2 immediately,
+	// before inspecting the ordinary command queue. An open attack is allowed.
+	if rt.skillCastPostureBlocked(division, snapshot, now) {
+		return OpResult{DiagnosticRefusal: "instant-effect-action-busy"}
+	}
+	if _, _, err := combat.PlayerStats(snapshot, rt.statCatalogs()); err != nil {
+		return OpResult{DiagnosticRefusal: "instant-effect-loadout-invalid"}
+	}
+	if _, code := rt.instantSelfEffectCost(division, snapshot, skill, now); code != 0 {
+		return offensiveRefusal(code)
+	}
+	rider, ok := rt.skillDurationRider(division, snapshot, skill)
+	if !ok {
+		return OpResult{DiagnosticRefusal: "instant-effect-stats-unavailable"}
+	}
+	token := atomic.AddUint32(&rt.castTokenCounter, 1)
+	effectToken := atomic.AddUint32(&rt.castTokenCounter, 1)
+	var effects []wire.Frame
+	var refusal uint16
+	label := "skill-instant-self-effect"
+	if skill.Imbue.Pinned {
+		label = "skill-weapon-imbue"
+	}
+	if !rt.deps.Update(character, label, func() bool {
+		if !enterworld.CharacterAlive(character) || !enterworld.SkillLearned(character, skill.ID) {
+			return false
+		}
+		cost, code := rt.instantSelfEffectCost(division, character, skill, now)
+		refusal = code
+		if code != 0 {
+			return false
+		}
+		rt.startSkillCast(division, character, skill, now)
+		if !rt.requestSelfEffectReplacement(division, character, skill) {
+			refusal = 0x300c
+			return false
+		}
+		var ok bool
+		effects, ok = rt.commitCharacterEffect(division, character, skill, effectToken, statuseffect.StateActive, false, EffectPresentation{Phase: 2, Rider: rider}, now)
+		if !ok {
+			return false
+		}
+		rt.commitOffensiveCost(division, character, skill, skillCharge{mp: cost, hp: rt.preparedExecutionHPCost(division, character, skill)}, now)
+		return true
+	}) {
+		if refusal != 0 {
+			return offensiveRefusal(refusal)
+		}
+		return OpResult{DiagnosticRefusal: "instant-effect-category-occupied"}
+	}
+	// Natively: open -> MP -> action release -> attach.
+	// The lasting effect has its own token; no animation-duration timer is invented.
+	gid := enterworld.ObjectIDForCharacter(snapshot)
+	open := wire.SkillCastSelfFrame(wire.SkillCastSuccess{SkillId: skill.ID, CasterGid: gid, InstanceToken: token})
+	vitals := wire.Frame{Opcode: simulation.OpVitalsUpdate, Payload: simulation.VitalsRefreshWithSourcePayload(gid, simulation.VitalsSourceCombatDamage, rt.publishedVitals(division, character))}
+	release := wire.SkillCastReleaseFrame(token, gid)
+	close := wire.SkillCastFinalizeFrame(token)
+	frames := append([]wire.Frame{open, vitals, release, close}, effects...)
+	broadcast := append([]wire.Frame{open, release, close}, effects...)
+	return OpResult{Frames: frames, Broadcast: broadcast, ActorPrivate: []wire.Frame{vitals}}
+}
+
+/*
+================
+instantSelfEffectCost
+
+The phases an instant self effect answers itself, in native bit
+order: cooldown (0x01 -> 0x3005), the weapon (0x04 -> the equipment check, e.g. 0x300D
+for Scud's dagger-only 13/255 without a dagger) and then MP (0x10). The
+dispatch in targetinteract.go reaches this owner before the command
+admission, so without this phase a weapon-restricted row would never be
+checked. Only the equipment phase is added, not the whole execution mask:
+its action-recovery phase (0x80) would refuse the open attack the native dispatch lets
+an instant effect run beside.
+
+The phase is the native equipment-requirement check whole: a row
+with reqi pairs walks them (+0x3A0), any other row its weapon bytes. Native
+runs it at the press for every skill command but an onff pulse
+(the reference server's command processing, mask 0x37), so the Rogue's
+poison coatings (reqi 6 12 / 6 13) are refused 0x300D without a crossbow or
+a dagger, and Scud (13/255) without a dagger. The Chinese imbue and
+movement rows and the SKILL_MALL_PET_SKILL rows are 0xFF/0xFF without reqi
+and pass it unchanged.
+================
+*/
+func (rt *Runtime) instantSelfEffectCost(division string, c *enterworld.Character, skill enterworld.SkillRow, now int64) (int64, uint16) {
+	cost, code := rt.offensiveCost(division, c, skill, now)
+	if code == 0x3003 || code == 0x3005 {
+		// An unparsed row or a cooling skill answers before the weapon.
+		return cost, code
+	}
+	if refusal := skillEquipmentRefusal(c, rt.statCatalogs().Items, skill); refusal != 0 {
+		return 0, refusal
+	}
+	return cost, code
+}
+
+/*
+================
+activeWeaponImbue
+================
+*/
+func (rt *Runtime) activeWeaponImbue(division, name string, nowMs int64) (enterworld.SkillImbue, abnormal.SkillParams) {
+	if rt.effects == nil || rt.deps.SkillData() == nil {
+		return enterworld.SkillImbue{}, abnormal.SkillParams{}
+	}
+	for _, effect := range rt.effects.Snapshot(division, name) {
+		if !effect.Imbue || effect.StopRequested || effect.Expired(nowMs) {
+			continue
+		}
+		if row, ok := rt.deps.SkillData().SkillByID(effect.SkillID); ok && row.Imbue.Pinned {
+			return row.Imbue, row.Abnormal
+		}
+	}
+	return enterworld.SkillImbue{}, abnormal.SkillParams{}
+}
+
+/*
+==================
+resolvePlayerImpact
+
+All player impact paths (including linked stages, areas and release-time
+projectiles) share the current effect snapshot. att value 5 scales the
+separately evaluated imbue damage, not the primary physical attack.
+
+A chained victim (target entry flag 1, pushed by an imbue's efr) loses the
+physical lane of both: it takes the magical lane and the
+imbue damage only.
+==================
+*/
+func (rt *Runtime) resolvePlayerImpact(division, name string, skill enterworld.SkillRow, attacker, defender combat.Stats, nowMs int64, chained bool) (combat.Result, error) {
+	out, err := rt.resolvePlayerImpactBehindWall(division, name, skill, attacker, defender, nowMs, chained, nil)
+	return out.Defender, err
+}
+
+/*
+==================
+resolvePlayerImpactBehindWall
+
+resolvePlayerImpact against a defender that may stand behind a wall
+(natively the attack's own lanes are split). The imbue share joins the
+defender's part afterwards, added after the split.
+==================
+*/
+func (rt *Runtime) resolvePlayerImpactBehindWall(division, name string, skill enterworld.SkillRow, attacker, defender combat.Stats, nowMs int64, chained bool, wall *enterworld.SkillWall) (outcome combat.WallOutcome, failure error) {
+	defer func() {
+		if failure == nil {
+			outcome.Defender = rt.sookDamageBoost(division, name, outcome.Defender, nowMs)
+		}
+	}()
+	// A status cast has no att block: its record is a successful zero-damage
+	// result with no critical, block or imbue roll (skillstatuscast.go).
+	if skill.StatusCast {
+		return combat.WallOutcome{Defender: combat.Result{ResultFlags: 1}}, nil
+	}
+	// A pdmg hit is its authored amount (skilltuning.go).
+	if skill.FixedDamage.Present {
+		return combat.WallOutcome{Defender: fixedDamageResult(skill.FixedDamage, attacker, defender)}, nil
+	}
+	actor := criticalActor{division: division, character: name}
+	lanes := skill.Attack.Flags & 0xc
+	if chained {
+		lanes &^= 4
+	}
+	var split combat.WallOutcome
+	var err error
+	if chained && lanes == 0 {
+		split.Defender = combat.Result{ResultFlags: 1}
+	} else {
+		split, err = rt.resolveCombatRequest(combatRequest{
+			actor: actor, skill: skill, attacker: attacker, defender: defender, wall: wall, lanes: lanes,
+		})
+	}
+	result := split.Defender
+	// A blocked impact takes no imbue share.
+	if err != nil || skill.Attack.Value5 == 0 || result.Blocked {
+		return split, err
+	}
+	imbue, imbueAbnormal := rt.activeWeaponImbue(division, name, nowMs)
+	if !imbue.Pinned {
+		return split, nil
+	}
+	imbueLanes := imbue.Attack.Flags & 0xc
+	if chained {
+		imbueLanes &^= 4
+	}
+	var extra combat.Result
+	if imbueLanes != 0 {
+		// The weapon-imbue lanes get the same 0x20 ignore-defense flag byte.
+		extra, err = combat.ResolveCalculation(attacker, defender, combat.AttackCalculation{
+			Attack: imbue.Attack, OriginalFlags: skill.Attack.Flags, Lanes: imbueLanes, Player: true,
+			IgnoreDefense: result.ResultFlags&combat.IgnoreDefenseResultFlag != 0,
+		}, rt.CombatRoll)
+	}
+	if err != nil {
+		return combat.WallOutcome{}, err
+	}
+	result.Damage = uint32(min(uint64(wire.MaxSkillActionDamage), uint64(result.Damage)+uint64(uint16(extra.Damage))*uint64(skill.Attack.Value5)/100))
+	// Natively the imbue's physical and magical words are added before
+	// scaling its damage share.
+	result.PhysicalDamage += uint32(uint16(extra.PhysicalDamage))
+	result.MagicalDamage += uint32(uint16(extra.MagicalDamage))
+	// The imbue's bu block is rolled with the hit's statuses in the native status roll.
+	result.Imbue = imbueAbnormal
+	split.Defender = result
+	return split, nil
+}

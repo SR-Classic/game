@@ -1,0 +1,373 @@
+/*
+===========================================================================
+
+system-notices.ts - server frames that become a notice or a banner
+
+Decodes the fortress announcements (0x3887), the server notification and
+the shard's job-kill and drop/plus notices (0x3667), and the command restriction notice
+(0x36EA) into SystemNotice rows the gameplay owner queues for the HUD.
+
+===========================================================================
+*/
+import { sealTier } from "./item-seal";
+import { decodeNoticeLinks } from "./notice-links";
+
+/*
+================
+SystemNotice
+================
+*/
+/*
+================
+NoticeDialogAnswers
+
+Port-only, not native: a notice dialog that answers the server. Each
+button sends its chat line (a server command such as "/contributor
+here"), so the answer needs no frame of its own. Without answers the
+dialog is the native one-button confirm.
+================
+*/
+export interface NoticeDialogAnswers {
+	readonly confirmLabel: string;
+	readonly confirmChat: string;
+	// A second button only when given; the confirm alone still answers.
+	readonly cancelLabel?: string;
+	readonly cancelChat?: string;
+}
+
+export interface SystemNotice {
+	readonly localizedArguments?: readonly (string | null)[];
+	readonly formatKinds?: readonly ("d" | "s")[];
+	readonly formatCapacity?: number;
+	readonly dialog?: {
+		readonly title: string;
+		readonly lines: readonly string[];
+		readonly answers?: NoticeDialogAnswers;
+	};
+	readonly nativeType?: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
+	readonly colorArgb?: number;
+	readonly sequence?: number;
+	readonly key: string;
+	readonly value: number;
+	readonly text?: string;
+	readonly arguments?: readonly string[];
+	readonly banner?: true;
+	readonly bannerUsesFormattedKey?: true;
+	readonly questBanner?: true;
+	readonly notificationBanner?: true;
+	readonly bannerOnly?: true;
+	readonly jobKill?: true;
+	readonly dropPlus?: true;
+	readonly plusSeven?: true;
+	readonly itemBreak?: true;
+	readonly sunDrop?: true;
+	readonly shardEvent?: true;
+}
+/*
+================
+fortressNotice
+
+76C870, registered as 3887 by 76E850. These six announcement arms read
+only their subtype byte; their minutes are constants in the client.
+================
+*/
+export function fortressNotice( opcode: number, p: Uint8Array ): SystemNotice | null {
+	if ( opcode !== 0x3887 || p[0] === undefined || p[0] < 1 || (p[0] > 6 && p[0] !== 9) ) return null;
+	if ( p.length !== 1 ) throw Error( "Trailing fortress announcement bytes" );
+	const subtype = p[0];
+	return {
+		key: subtype === 1 ?
+			"UIIT_MSG_FORT_WAR_BEFOREBEGIN" :
+			subtype === 2 ?
+			"UIIT_MSG_FORT_WAR_BEGIN" :
+			subtype === 6 ?
+			"UIIT_MSG_FORT_WAR_END" :
+			"UIIT_MSG_FORT_WAR_BEFOREEND",
+		value: subtype === 9 ? 1 : subtype === 1 || subtype === 3 ? 30 : subtype === 4 ? 20 : subtype === 5 ? 10 : 0
+	};
+}
+
+// Port-only, not native: the shard's job-kill announcement channel (server
+// wire.JobKillNoticeChannel). v1.150 (753760) sends any channel outside its
+// table, 0x80 included, to its named-sender arm (753D8A), so the channel is
+// safe only because the browser client is the only client. Here it shows as
+// channel 7 unless the Experimental "Job kill notices" row is off.
+export const JOB_KILL_NOTICE_CHANNEL = 0x80;
+
+// Port-only, not native: the shard's seal-drop and plus announcement
+// channel (server wire.DropPlusNoticeChannel), shown as channel 7 unless
+// one of the notice rows is off. The +7 announcements (owner decision
+// 2026-10-19) share this channel as their own bucket; announcedPlusSeven
+// picks which Experimental row gates a frame.
+export const DROP_PLUS_NOTICE_CHANNEL = 0x81;
+
+// Port-only, not native: the shard's item-break announcement channel
+// (server wire.BreakNoticeChannel; SRO_ALCHEMY_BREAK_NOTICE, #1738),
+// shown as channel 7 unless the Experimental "Item break notices" row
+// is off. A break notice links nothing; a failed-reinforcement notice
+// (#3260) may carry the drop/plus link section holding only its item's
+// body - never a player name - so the job alias it names never leads
+// to a character.
+export const BREAK_NOTICE_CHANNEL = 0x82;
+
+// Port-only, not native: the name-change notice channel (server
+// wire.RenameNoticeChannel, #1689). "X is now known as Y" reaches only
+// the renamed character's online friends and guild members, so it shows
+// as channel 7 with no Experimental row: it is the feature's own
+// feedback, not a broadcast a player opts out of.
+export const RENAME_NOTICE_CHANNEL = 0x83;
+
+// The announced item's plus rides its encoded body at a fixed byte (the
+// server's ItemBody.Encode header, ItemBodySize 18). A shorter or absent
+// body names no plus.
+const ITEM_BODY_HEADER_BYTES = 18;
+const ITEM_BODY_PLUS_BYTE = 4;
+
+/*
+================
+isServerNoticeChannel
+
+Channel 7 and the two port-only channels laid out like it.
+================
+*/
+export function isServerNoticeChannel( channel: number | undefined ): boolean {
+	return channel === 7 || channel === JOB_KILL_NOTICE_CHANNEL || channel === DROP_PLUS_NOTICE_CHANNEL ||
+		channel === BREAK_NOTICE_CHANNEL || channel === RENAME_NOTICE_CHANNEL;
+}
+
+/*
+================
+isSunDropNoticeText
+
+Whether a drop notice's text announces a Seal of Sun drop (#1640). The
+tiered wording leads with "SEAL OF SUN:"; a server without it writes
+the seal in parentheses, and the parenthesis alone also appears in
+plus notices, which stay unhighlighted - those never say "has dropped".
+================
+*/
+export function isSunDropNoticeText( text: string ): boolean {
+	return text.startsWith( "SEAL OF SUN: " ) ||
+		(text.includes( "(Seal Of Sun)" ) && text.includes( " has dropped " ));
+}
+
+/*
+================
+Seal notice colours
+
+Port-only, not native (#1640, owner decision 2026-10-26: "Colour by
+tier + Sun prefix"): a drop or plus notice line colours by the linked
+item's seal tier - the Star in the rare gold the item tooltip names it
+with (item-tooltip.ts), the Moon in pale silver-blue, the Sun in
+bright orange-red. Unsealed items keep the channel's own colour. The
+colours ride the "Drop & plus notices" Experimental row: row off, the
+channel never reaches the log at all.
+================
+*/
+export const SEAL_NOTICE_COLOR_STAR = 0xffffd953;
+export const SEAL_NOTICE_COLOR_MOON = 0xffc9d9f2;
+export const SEAL_NOTICE_COLOR_SUN = 0xffff4517;
+
+/*
+================
+EVENT_NOTICE_COLOR_ARGB
+
+Port-only, not native (#2727, owner ask 2026-11-06): a shard event
+notice (the shardEvent arm above) prints in this red in the bottom-right
+message log, so an event announcement stands out from ordinary lines.
+The native box has no event colour to adopt: CGInterface_ChatSystem-
+Message 0x67A600 (asm 67A624-67A633) colours only category 6 light blue
+(0xFFBACFF2) and every other category, 7 included, the default
+0xFFDBC99B; the one other appender, CGInterface_PrintColoredNotice
+0x67A6D0, is passed that same beige by every server-driven caller
+(0x75C001, 0x75C0E4, 0x75E298). The red is the client's house red
+(buff-tooltip.ts). It rides the "Highlight event notices" Experimental
+row, on by default at the owner's ask; off restores the native beige.
+================
+*/
+export const EVENT_NOTICE_COLOR_ARGB = 0xffff4a4a;
+
+/*
+================
+sealNoticeColorArgb
+
+The notice colour for an item's seal fields (a sealed rarity and the
+itemClass whose (itemClass - 1) % 3 is Star, Moon, Sun), or undefined
+when the item carries no seal.
+================
+*/
+export function sealNoticeColorArgb(
+	rarity: number | undefined,
+	itemClass: number | undefined
+): number | undefined {
+	const tier = sealTier( rarity, itemClass );
+	if ( tier === undefined ) return undefined;
+	return [ SEAL_NOTICE_COLOR_STAR, SEAL_NOTICE_COLOR_MOON, SEAL_NOTICE_COLOR_SUN ][tier];
+}
+
+/*
+================
+sealDropTierFromText
+
+The seal tier a drop line's text names (0 Star, 1 Moon, 2 Sun), or
+undefined when the line announces no seal drop. This is the chat
+colour's text fallback (chat-layout's sealNoticeChatColor) shared with
+the top-centre banner: only drop lines carry a tier, so a plus line's
+parenthesised seal names none.
+================
+*/
+export function sealDropTierFromText( text: string ): 0 | 1 | 2 | undefined {
+	if ( !text.includes( " has dropped " ) ) return undefined;
+	if ( isSunDropNoticeText( text ) ) return 2;
+	if ( text.includes( "(Seal Of Moon)" ) ) return 1;
+	if ( text.includes( "(Seal Of Star)" ) ) return 0;
+	return undefined;
+}
+
+/*
+================
+serverNotification
+
+753A6F -> 752ABD -> 67A140/6B3180: the native type-7 server notification,
+and the port-only job-kill, drop/plus and item-break channels laid out the same way
+(flagged jobKill, dropPlus, plusSeven or itemBreak, so the gameplay owner can hide them). The chat owner separately retains the
+(Notify): line in the main log.
+================
+*/
+export function serverNotification( opcode: number, p: Uint8Array ): SystemNotice | null {
+	if ( opcode !== 0x3667 ) return null;
+	// Port-only trainer receipts belong to the system log, never player chat.
+	const trainer = p[0] === 2 && p.length >= 14 && p[1] === 11 && p[2] === 0 &&
+		new TextDecoder( "utf-8", { fatal: true } ).decode( p.subarray( 3, 14 ) ) === "Pet trainer";
+	if ( trainer ) {
+		if ( p.length < 16 ) throw Error( "Truncated pet trainer receipt" );
+		const length = new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint16( 14, true );
+		if ( length > 100 || p.length !== 16 + length * 2 ) throw Error( "Invalid pet trainer receipt length" );
+		return {
+			key: "",
+			value: 0,
+			nativeType: 5,
+			text: new TextDecoder( "utf-16le", { fatal: true } ).decode( p.subarray( 16 ) )
+		};
+	}
+	if ( !isServerNoticeChannel( p[0] ) ) return null;
+	if ( p.length < 3 ) throw Error( "Truncated server notification" );
+	const n = new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint16( 1, true );
+	// Port-only: a drop/plus notice may carry its links after the text
+	// (notice-links.ts), and so may a failed-reinforcement notice on the
+	// break channel (#3260); the banner shows the text alone either way.
+	const links = (p[0] === DROP_PLUS_NOTICE_CHANNEL || p[0] === BREAK_NOTICE_CHANNEL) && p.length > 3 + 2 * n;
+	if ( n > 100 || !links && p.length !== 3 + 2 * n || p.length < 3 + 2 * n ) {
+		throw Error( "Invalid server notification length" );
+	}
+	const text = new TextDecoder( "utf-16le", { fatal: true } ).decode( p.subarray( 3, 3 + 2 * n ) );
+	const notice: SystemNotice = { key: "", text, value: 0, bannerOnly: true };
+	if ( p[0] === JOB_KILL_NOTICE_CHANNEL ) return { ...notice, notificationBanner: true, jobKill: true };
+	if ( p[0] === BREAK_NOTICE_CHANNEL ) return { ...notice, notificationBanner: true, itemBreak: true };
+	if ( p[0] === DROP_PLUS_NOTICE_CHANNEL ) {
+		if ( links && announcedPlusSeven( p, 3 + 2 * n ) ) {
+			return { ...notice, notificationBanner: true, plusSeven: true };
+		}
+		// Port-only, not native (owner 2026-11-05): a shard event notice
+		// (the Halloween waves) also prints in the bottom-right message log,
+		// under its game tab as a native type-7 line would sort, because a
+		// player who missed the banner has nowhere else to read it. It stays
+		// dropPlus: the drop/plus row has always hidden these too.
+		if ( links && announcedShardEvent( p, 3 + 2 * n ) ) {
+			return {
+				key: "",
+				text,
+				value: 0,
+				nativeType: 7,
+				notificationBanner: true,
+				dropPlus: true,
+				shardEvent: true
+			};
+		}
+		// Port-only, not native: Seal of Sun drop announcements highlight in
+		// gold on the top banner and chat log; Star/Moon and plus notices stay unchanged.
+		const sun = isSunDropNoticeText( text ) ? ({ sunDrop: true } as const) : {};
+		// Port-only, not native (owner decision 2026-11-01): a Seal of Star
+		// drop is too common for the top-centre banner, so its line keeps
+		// only the Event chat tab; Moon and Sun drops keep the banner.
+		const banner = sealDropTierFromText( text ) === 0 ? {} : { notificationBanner: true as const };
+		return { ...notice, ...banner, dropPlus: true, ...sun };
+	}
+	return { ...notice, notificationBanner: true };
+}
+
+/*
+================
+announcedPlusSeven
+
+Whether a drop/plus frame announces an item at exactly +7, read off the
+linked item body's plus byte: the +7 bucket shares the drop/plus
+channel (no new wire channel, so every client keeps rendering it), and
+this byte alone picks its row. Seal drops (+0), plus of +8 and above,
+and frames without a readable body stay with dropPlus.
+================
+*/
+function announcedPlusSeven( p: Uint8Array, linksOffset: number ): boolean {
+	const body = decodeNoticeLinks( p, linksOffset )?.body;
+	return body !== undefined && body.length >= ITEM_BODY_HEADER_BYTES && body[ITEM_BODY_PLUS_BYTE] === 7;
+}
+
+/*
+================
+announcedShardEvent
+
+Whether a drop/plus frame is a shard event notice: its link section is
+exactly the empty one, a zero name length and a zero body length.
+Every seal drop names its dropper and every plus notice its player and
+item (server announce.go), so only the event notices
+(halloween_waves.go, sent with an empty wire.NoticeLink) read this way.
+decodeNoticeLinks answers null for this section, as it does for a
+malformed one, so the four bytes are read here.
+================
+*/
+const EMPTY_NOTICE_LINKS_BYTES = 4;
+
+function announcedShardEvent( p: Uint8Array, linksOffset: number ): boolean {
+	if ( p.length !== linksOffset + EMPTY_NOTICE_LINKS_BYTES ) return false;
+	return p.subarray( linksOffset ).every( b => b === 0 );
+}
+
+/*
+================
+restrictionNotice
+
+74BFF0 -> 9C422E -> 67D030 / 67A600. Fields are bit slices, not a JS Date:
+zero/overflow calendar values remain numbers; noon is still Forenoon.
+================
+*/
+export function restrictionNotice( opcode: number, p: Uint8Array ): SystemNotice | null {
+	if ( opcode !== 0x36ea ) return null;
+	if ( p.length !== 5 ) throw Error( "Invalid command restriction notice" );
+	const kind = p[0]!;
+	if ( kind !== 0 && kind !== 1 ) return null;
+	const date = new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint32( 1, true );
+	const hour = (date >>> 15) & 31, afternoon = hour > 12;
+	return {
+		key: kind === 0 ? "UIIT_MSG_GM_PUNISHMENT_CHAT_BLOCK" : "UIIT_MSG_GM_PUNISHMENT_TRADE_BLOCK",
+		value: 0,
+		arguments: [
+			String( (date & 63) + 2000 ),
+			String( (date >>> 6) & 15 ),
+			String( (date >>> 10) & 31 ),
+			"",
+			String( afternoon ? hour - 12 : hour ),
+			String( (date >>> 20) & 63 )
+		],
+		localizedArguments: [
+			null,
+			null,
+			null,
+			afternoon ? "UIIT_STT_LETTER_AFTEMOON" : "UIIT_STT_LETTER_FORENOON",
+			null,
+			null
+		],
+		formatKinds: [ "d", "d", "d", "s", "d", "d" ],
+		formatCapacity: 511,
+		nativeType: 5,
+		notificationBanner: true
+	};
+}

@@ -1,0 +1,463 @@
+/*
+===========================================================================
+
+cos-container.test.mjs - tests for gameplay.ts, cos-transfer.ts
+
+Loads the TypeScript sources directly through the shared native loader
+(tests/helpers/native-source-loader.mjs), so the tests exercise the same
+modules the client ships, not a per-test bundle.
+
+===========================================================================
+*/
+import "../helpers/native-source-loader.mjs";
+import { pathToFileURL as sourceFileUrl } from "node:url";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+const { createGameplay } = await import(
+	sourceFileUrl( "src/engine/runtime/simulation/worker/session/world/gameplay/gameplay.ts" ).href
+);
+const u32 = n => [ n & 255, n >>> 8 & 255, n >>> 16 & 255, n >>> 24 & 255 ];
+const entity = { gid: 7, refObjId: 102, kind: "cos", ownerGid: 1 };
+
+test("COS ground requests and receipts keep the player bag isolated", () => {
+	const { owner } = fixture();
+	const drop = owner.command( { kind: "cos-drop", gid: 7, slot: 0 }, 0, entity );
+	assert.deepEqual( [ ...drop.payload ], [ 0x12, 7, 0, 0, 0, 0 ] );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...drop.payload ] ) }, 1 );
+	let s = owner.take();
+	assert.equal( s.cosRecords[0].inventory.length, 1 );
+	assert.deepEqual( s.inventory, [] );
+	const pickup = owner.command( { kind: "cos-pickup", gid: 7, target: 123 }, 2, entity );
+	assert.deepEqual( [ ...pickup.payload ], [ 0x11, 7, 0, 0, 0, 123, 0, 0, 0 ] );
+	const reply = { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x11, ...u32( 7 ), 0, ...u32( 8 ), 30, 0 ] ) };
+	owner.receive( reply, 3 );
+	s = owner.take();
+	assert.equal( s.cosRecords[0].inventory.length, 2 );
+	assert.equal( s.inventoryPending, false );
+	assert.deepEqual( s.inventory, [] );
+	// A pet pickup holds no lock: a repeated receipt re-states the same slot.
+	owner.receive( reply, 4 );
+	assert.equal( owner.take()?.cosRecords[0].inventory.length ?? 2, 2 );
+	owner.command( { kind: "cos-pickup", gid: 7, target: 124 }, 5, entity );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x11, ...u32( 7 ), 254, ...u32( 50 ) ] ) }, 6 );
+	assert.equal( owner.take().cosRecords[0].inventory.length, 2 );
+});
+test("a pet pickup the party hands to another member ends at the pet's scoop", () => {
+	// 525DC0 rewrites a shared pickup to type 6 for the recipient: the owner
+	// gets the pet's 0x35C7 scoop and the despawn, never a 0x11 receipt.
+	const { owner } = fixture();
+	owner.command( { kind: "cos-pickup", gid: 7, target: 123 }, 0, entity );
+	owner.receive( { opcode: 0x35c7, payload: Uint8Array.from( [ ...u32( 7 ), 64 ] ) }, 1 );
+	assert.equal( owner.take().inventoryPending, false );
+	assert.doesNotThrow( () => owner.step( 10002 ) );
+
+	// Another actor's scoop leaves the request waiting for its own answer.
+	const other = fixture().owner;
+	other.command( { kind: "cos-pickup", gid: 7, target: 123 }, 0, entity );
+	other.receive( { opcode: 0x35c7, payload: Uint8Array.from( [ ...u32( 1 ), 64 ] ) }, 1 );
+	// A pet pickup waits out the pet's approach (COS_PICKUP_ANSWER_MS).
+	assert.doesNotThrow( () => other.step( 10002 ) );
+	assert.throws( () => other.step( 15002 ), /reconnect/ );
+});
+test("a pet pickup's receipt still applies after an earlier scoop ended its request", () => {
+	// The pet's in-flight automatic scoop arrives first and ends the manual
+	// request; the manual pickup's own 0x11 receipt then follows unmatched.
+	const { owner, initial } = fixture();
+	const before = initial.cosRecords[0].inventory.length;
+	owner.command( { kind: "cos-pickup", gid: 7, target: 123 }, 0, entity );
+	owner.receive( { opcode: 0x35c7, payload: Uint8Array.from( [ ...u32( 7 ), 64 ] ) }, 1 );
+	const receipt = { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x11, ...u32( 7 ), 3, ...u32( 8 ), 5, 0 ] ) };
+	assert.doesNotThrow( () => owner.receive( receipt, 2 ) );
+	assert.equal( owner.take().cosRecords[0].inventory.length, before + 1 );
+	assert.doesNotThrow( () => owner.step( 10002 ) );
+});
+test("a pet's ground pickup prints the bag's item line, and its gold prints none", () => {
+	// 756CF0's pet branch (window 0x7A, ground source): a new stack names its
+	// whole count (757145), a merge names the gain (757007); no gold line.
+	const { owner } = fixture();
+	const last = () => owner.take()?.notices?.at( -1 );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x11, ...u32( 7 ), 3, ...u32( 8 ), 5, 0 ] ) }, 1 );
+	const added = last();
+	assert.deepEqual( [ added?.key, added?.value ], [ "UIIT_MSG_STATE_GET_ITEM_EXPENDABLE", 5 ] );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x11, ...u32( 7 ), 0, ...u32( 8 ), 35, 0 ] ) }, 2 );
+	const merged = last();
+	assert.deepEqual( [ merged?.key, merged?.value ], [ "UIIT_MSG_STATE_GET_ITEM_EXPENDABLE", 5 ] );
+	assert.notEqual( merged?.sequence, added?.sequence );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x11, ...u32( 7 ), 254, ...u32( 50 ) ] ) }, 3 );
+	assert.equal( owner.take()?.notices?.at( -1 )?.sequence ?? merged?.sequence, merged?.sequence );
+});
+test("a server grant into the pet bag prints a new row and keeps a merge silent (#2258)", () => {
+	// 756CF0's print case is shared by ground (0) and quest (3) sources
+	// (756EEC): a grant (0x15) names a new row, a merge stays silent, and
+	// the gold-shaped row has no line. It settles no client request.
+	const { owner, initial } = fixture();
+	assert.deepEqual( initial.cosRecords[0].inventory.map( x => [ x.slot, x.quantity ] ), [ [ 0, 30 ], [ 1, 40 ] ] );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x15, ...u32( 7 ), 3, ...u32( 8 ), 5, 0 ] ) }, 1 );
+	let s = owner.take();
+	assert.deepEqual( s.cosRecords[0].inventory.map( x => [ x.slot, x.quantity ] ), [ [ 0, 30 ], [ 1, 40 ], [
+		3,
+		5
+	] ] );
+	const grantedNotice = s.notices?.at( -1 );
+	assert.deepEqual( [ grantedNotice?.key, grantedNotice?.value ], [ "UIIT_MSG_STATE_GET_ITEM_EXPENDABLE", 5 ] );
+	assert.notEqual( grantedNotice?.sequence, initial.notices?.at( -1 )?.sequence );
+	// A merge into an open stack prints nothing for a grant.
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x15, ...u32( 7 ), 0, ...u32( 8 ), 45, 0 ] ) }, 2 );
+	s = owner.take();
+	assert.deepEqual( s.cosRecords[0].inventory.map( x => [ x.slot, x.quantity ] ), [ [ 0, 45 ], [ 1, 40 ], [
+		3,
+		5
+	] ] );
+	assert.equal( s.notices?.at( -1 )?.sequence, grantedNotice?.sequence );
+	// The gold-shaped grant (slot 254) carries an amount, never a row.
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x15, ...u32( 7 ), 254, ...u32( 50 ) ] ) }, 3 );
+	s = owner.take();
+	assert.equal( s.cosRecords[0].inventory.length, 3 );
+	assert.equal( s.notices?.at( -1 )?.sequence, grantedNotice?.sequence );
+	// A result for a pet with no record.
+	assert.throws(
+		() =>
+			owner.receive( {
+				opcode: 0xb06d,
+				payload: Uint8Array.from( [ 1, 0x15, ...u32( 9 ), 3, ...u32( 8 ), 5, 0 ] )
+			}, 5 ),
+		/Absent COS grant owner/
+	);
+});
+test("a quest removal takes the item out of the pet bag silently (#2258)", () => {
+	// 0x16 resolves the COS bag to the quest (74EF50); the quest sink
+	// (758C13) prints nothing.
+	const { owner, initial } = fixture();
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x16, ...u32( 7 ), 0 ] ) }, 1 );
+	const s = owner.take();
+	assert.deepEqual( s.cosRecords[0].inventory.map( x => x.slot ), [ 1 ] );
+	assert.equal( s.notices?.at( -1 )?.sequence, initial.notices?.at( -1 )?.sequence );
+	// A slot the pet no longer holds, and a pet with no record, both refuse.
+	assert.throws(
+		() => owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x16, ...u32( 7 ), 0 ] ) }, 2 ),
+		/Invalid COS removal source/
+	);
+	assert.throws(
+		() => owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, 0x16, ...u32( 9 ), 0 ] ) }, 3 ),
+		/Absent COS removal owner/
+	);
+});
+function fixture() {
+	const sent = [], owner = createGameplay( f => sent.push( f ) );
+	owner.bootstrap( {
+		inventorySlotCount: 45,
+		equipmentSlotCount: 13,
+		refObjSnapshot: [ { kind: "cos", refObjId: 102, tidWord: 0x21c6 } ],
+		refItemSnapshot: [ { refObjId: 8, typeFlags: 0x86c, nativeFields: { maxStack: 50 } } ]
+	} );
+	owner.seed( { gid: 1, regionId: 1, x: 0, y: 0, z: 0, heading: 0 } );
+	owner.receive( {
+		opcode: 0x3158,
+		payload: Uint8Array.from( [
+			...u32( 7 ),
+			...u32( 102 ),
+			...u32( 100 ),
+			...u32( 50 ),
+			...u32( 0x47 ),
+			0,
+			0,
+			4,
+			2,
+			0,
+			...u32( 8 ),
+			30,
+			0,
+			1,
+			...u32( 8 ),
+			40,
+			0,
+			...u32( 0 ),
+			14
+		] )
+	}, 0 );
+	const initial = owner.take();
+	return { owner, sent, initial };
+}
+function move( owner, source, destination, quantity ) {
+	const f = owner.command( { kind: "cos-inventory-move", gid: 7, source, destination, quantity }, 0, entity );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...f.payload ] ) }, 1 );
+	return f;
+}
+test("COS container uses native capped merges, splits and full-destination count swaps", () => {
+	const { owner } = fixture();
+	const f = move( owner, 0, 1, 1 );
+	assert.deepEqual( [ ...f.payload ], [ 16, 7, 0, 0, 0, 0, 1, 1, 0 ] );
+	assert.deepEqual( owner.take().cosRecords[0].inventory.map( x => [ x.slot, x.quantity ] ), [ [ 0, 20 ], [
+		1,
+		50
+	] ] );
+	move( owner, 0, 1, 1 );
+	assert.deepEqual( owner.take().cosRecords[0].inventory.map( x => [ x.slot, x.quantity ] ), [ [ 0, 50 ], [
+		1,
+		20
+	] ] );
+	move( owner, 0, 2, 5 );
+	assert.deepEqual( owner.take().cosRecords[0].inventory.map( x => [ x.slot, x.quantity ] ), [ [ 0, 45 ], [ 1, 20 ], [
+		2,
+		5
+	] ] );
+});
+test("COS operation shares inventory latch and cannot accept stale or mismatched receipts", () => {
+	const { owner, sent } = fixture();
+	assert.throws( () =>
+		owner.command( { kind: "cos-inventory-move", gid: 7, source: 0, destination: 4, quantity: 5 }, 0, entity )
+	);
+	assert.throws( () =>
+		owner.command( { kind: "cos-inventory-move", gid: 7, source: 0, destination: 2, quantity: 5 }, 0, {
+			...entity,
+			ownerGid: 2
+		} )
+	);
+	assert.equal( sent.length, 0 );
+	const f = owner.command(
+		{ kind: "cos-inventory-move", gid: 7, source: 0, destination: 2, quantity: 5 },
+		0,
+		entity
+	);
+	assert.equal( owner.take().inventoryPending, true );
+	assert.throws( () =>
+		owner.command( { kind: "cos-inventory-move", gid: 7, source: 0, destination: 3, quantity: 1 }, 0, entity )
+	);
+	const wrong = Uint8Array.from( [ 1, ...f.payload ] );
+	wrong[7] = 3;
+	assert.throws( () => owner.receive( { opcode: 0xb06d, payload: wrong }, 1 ) );
+	assert.equal( owner.take().cosRecords[0].inventory.length, 2 );
+	const reply = { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...f.payload ] ) };
+	owner.receive( reply, 1 );
+	assert.equal( owner.take().inventoryPending, false );
+	assert.throws( () => owner.receive( reply, 2 ) );
+});
+test("behavior commands preserve server-owned state until native acknowledgement", () => {
+	const { owner, sent } = fixture();
+	const f = owner.command( { kind: "cos-behavior", gid: 7, mode: 0xc7 }, 0, entity );
+	assert.equal( f.opcode, 0x705b );
+	assert.equal( sent.length, 1 );
+	assert.equal( owner.take().cosRecords[0].commandMode, 0x47 );
+	owner.receive( { opcode: 0xb05b, payload: Uint8Array.from( [ 1, ...f.payload ] ) }, 1 );
+	assert.equal( owner.take().cosRecords[0].commandMode, 0xc7 );
+	assert.throws( () => owner.command( { kind: "cos-behavior", gid: 7, mode: 0x100 }, 0, entity ) );
+});
+
+test("player/COS whole transfers await matching authority and preserve both containers", () => {
+	const { owner, initial } = fixture(), before = initial.cosRecords[0].inventory;
+	const f = owner.command( { kind: "cos-transfer", gid: 7, toCos: false, source: 0, destination: 13 }, 0, entity );
+	assert.deepEqual( [ ...f.payload ], [ 0x1a, 7, 0, 0, 0, 0, 13 ] );
+	assert.deepEqual( owner.take().inventory, [] );
+	const bad = Uint8Array.from( [ 1, ...f.payload ] );
+	bad[7] = 14;
+	assert.throws( () => owner.receive( { opcode: 0xb06d, payload: bad }, 1 ) );
+	assert.equal( owner.take(), null );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...f.payload ] ) }, 1 );
+	let state = owner.take();
+	assert.equal( state.inventory[0].quantity, 30 );
+	assert.equal( state.cosRecords[0].inventory.length, 1 );
+	assert.equal( state.inventoryPending, false );
+	// Occupied destination transfers are exercised separately below.
+	const back = owner.command( { kind: "cos-transfer", gid: 7, toCos: true, source: 13, destination: 0 }, 2, entity );
+	assert.deepEqual( [ ...back.payload ], [ 0x1b, 7, 0, 0, 0, 13, 0 ] );
+	assert.equal( owner.take().inventory.length, 1 );
+	const reply = { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...back.payload ] ) };
+	owner.receive( reply, 3 );
+	state = owner.take();
+	assert.deepEqual( state.inventory, [] );
+	assert.deepEqual( state.cosRecords[0].inventory, before );
+	// A replayed copy of the applied result is set aside, not fatal (#1977).
+	assert.doesNotThrow( () => owner.receive( reply, 4 ) );
+	state = owner.take();
+	assert.deepEqual( state.inventory, [] );
+	assert.deepEqual( state.cosRecords[0].inventory, before );
+	assert.equal( state.inventoryPending, false );
+});
+
+test("a replayed COS transfer result after re-entry does not end the session", () => {
+	const { owner } = fixture();
+	// The production frame (#1977): success, 0x1A, COS gid 0x02400143,
+	// source slot 0, destination slot 24. No record for that COS exists
+	// yet on re-entry: native drops it behind the FindCharData guard.
+	const production = {
+		opcode: 0xb06d,
+		payload: Uint8Array.of( 0x01, 0x1a, 0x43, 0x01, 0x40, 0x02, 0x00, 0x18 )
+	};
+	assert.doesNotThrow( () => owner.receive( production, 1 ) );
+	// The same shape against the live COS: applied once with its request,
+	// then replayed with no pending left. State must not move twice.
+	const f = owner.command( { kind: "cos-transfer", gid: 7, toCos: false, source: 0, destination: 24 }, 2, entity );
+	const reply = { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...f.payload ] ) };
+	owner.receive( reply, 3 );
+	let state = owner.take();
+	assert.equal( state.inventory.find( row => row.slot === 24 )?.quantity, 30 );
+	assert.equal( state.cosRecords[0].inventory.length, 1 );
+	assert.doesNotThrow( () => owner.receive( reply, 4 ) );
+	assert.doesNotThrow( () => owner.receive( production, 5 ) );
+	state = owner.take();
+	assert.equal( state.inventory.find( row => row.slot === 24 )?.quantity, 30 );
+	assert.equal( state.inventory.length, 1 );
+	assert.equal( state.cosRecords[0].inventory.length, 1 );
+	assert.equal( state.inventoryPending, false );
+});
+
+test("failed or timed out transfers cannot consume items or cross the inventory barrier", () => {
+	const { owner } = fixture();
+	owner.command( { kind: "cos-transfer", gid: 7, toCos: false, source: 0, destination: 13 }, 0, entity );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.of( 2, 1 ) }, 1 );
+	let state = owner.take();
+	assert.deepEqual( state.inventory, [] );
+	assert.equal( state.cosRecords[0].inventory[0].quantity, 30 );
+	assert.equal( state.inventoryPending, false );
+	const f = owner.command( { kind: "cos-transfer", gid: 7, toCos: false, source: 0, destination: 13 }, 2, entity );
+	assert.throws( () => owner.step( 10002 ), /reconnect/ );
+	// A late answer after the timeout is set aside until the resynchronizing
+	// bootstrap: it never moves the item out of the pet (inventory.ts
+	// cosTransferred), and the timeout still stands.
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...f.payload ] ) }, 10003 );
+	state = owner.take();
+	assert.deepEqual( state.inventory, [] );
+	assert.equal( state.cosRecords[0].inventory[0].quantity, 30 );
+	assert.throws( () => owner.step( 10004 ), /reconnect/ );
+});
+
+for (
+	const [label, destCount, wantSource, wantDest] of [ [ "merge", 10, 0, 40 ], [ "overflow", 40, 20, 50 ], [
+		"full destination",
+		50,
+		50,
+		30
+	] ]
+) {
+	test( "COS cross-container " + label, () => {
+		const { owner } = fixture();
+		const out = owner.command(
+			{ kind: "cos-transfer", gid: 7, toCos: false, source: 0, destination: 13 },
+			0,
+			entity
+		);
+		owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...out.payload ] ) }, 1 );
+		owner.take();
+		// Publish the destination through its existing ground-receipt owner.
+		owner.command( { kind: "cos-pickup", gid: 7, target: 99 }, 2, entity );
+		owner.receive( {
+			opcode: 0xb06d,
+			payload: Uint8Array.from( [ 1, 0x11, ...u32( 7 ), 1, ...u32( 8 ), destCount, 0 ] )
+		}, 3 );
+		owner.take();
+		const back = owner.command(
+			{ kind: "cos-transfer", gid: 7, toCos: true, source: 13, destination: 1 },
+			4,
+			entity
+		);
+		assert.equal( owner.take().inventory[0].quantity, 30 );
+		owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...back.payload ] ) }, 5 );
+		const state = owner.take();
+		assert.equal( state.cosRecords[0].inventory.find( r => r.slot === 1 ).quantity, wantDest );
+		assert.equal( state.inventory.find( r => r.slot === 13 )?.quantity ?? 0, wantSource );
+	} );
+}
+
+test("cross-container swaps preserve both bodies and missing caps cannot mutate input", async () => {
+	const { planCosTransfer } = await import( sourceFileUrl( "src/engine/foundation/gameplay/cos-transfer.ts" ).href );
+	const { initial } = fixture(), record = initial.cosRecords[0];
+	const player = [ { ...record.inventory[0], slot: 13, refObjId: 99, plus: 7, magic: [ "123" ] } ],
+		before = structuredClone( { record, player } );
+	const next = planCosTransfer( record, player, true, 13, 1, 45, 13, new Map( [ [ 8, 50 ] ] ) );
+	assert.equal( next.player[0].refObjId, 8 );
+	assert.equal( next.player[0].quantity, 40 );
+	assert.equal( next.cos.inventory.find( r => r.slot === 1 ).refObjId, 99 );
+	assert.deepEqual( next.cos.inventory.find( r => r.slot === 1 ).magic, [ "123" ] );
+	assert.deepEqual( { record, player }, before );
+	assert.throws(
+		() => planCosTransfer( record, [ { ...record.inventory[0], slot: 13 } ], true, 13, 1, 45, 13, new Map() ),
+		/stack limit/
+	);
+	assert.deepEqual( { record, player }, before );
+});
+
+/*
+================
+tradeOwnerContainerTransfers
+================
+*/
+test("trade cargo merges only stacks carrying the same original owner", async () => {
+	const { planContainerMove, planWholeTransfer } = await import(
+		"../../src/engine/foundation/gameplay/container-transfer.ts"
+	);
+	const a = {
+		slot: 0,
+		refObjId: 2151,
+		typeFlags: 0xc6c,
+		quantity: 3,
+		label: "A",
+		plus: 0,
+		durability: 0,
+		variance: "0",
+		magic: []
+	};
+	const b = { ...a, slot: 1, quantity: 4, label: "B" };
+	const caps = new Map( [ [ 2151, 40 ] ] );
+	const moved = planContainerMove( [ a, b ], { source: 0, destination: 1, quantity: 3 }, caps, "cargo" );
+	assert.deepEqual( moved.map( i => [ i.slot, i.quantity, i.label ] ), [ [ 0, 4, "B" ], [ 1, 3, "A" ] ] );
+	const merged = planContainerMove(
+		[ a, { ...b, label: "A" } ],
+		{ source: 0, destination: 1, quantity: 3 },
+		caps,
+		"cargo"
+	);
+	assert.deepEqual( merged.map( i => [ i.quantity, i.label ] ), [ [ 7, "A" ] ] );
+	const transferred = planWholeTransfer( [ a ], [ b ], 0, 1, caps );
+	assert.equal( transferred.to[0].label, "A" );
+	assert.equal( transferred.from[0].label, "B" );
+});
+
+/*
+================
+tradeOwnerNativeBody
+================
+*/
+test("server cargo body decodes its owner without consuming the next item", async () => {
+	const { decodeInventoryItem } = await import( "../../src/engine/foundation/gameplay/inventory-item.ts" );
+	const body = Uint8Array.of( 0x67, 8, 0, 0, 3, 0, 6, 0, 84, 114, 97, 100, 101, 114 );
+	const refs = new Map( [ [ 2151, 0xc6c ], [ 8, 0x86c ] ] );
+	const joined = Uint8Array.of( ...body, 8, 0, 0, 0, 4, 0 );
+	const first = decodeInventoryItem( joined, 0, refs );
+	assert.ok( first.item );
+	assert.equal( first.item.label, "Trader" );
+	assert.equal( first.item.quantity, 3 );
+	assert.equal( first.next, body.length );
+	const second = decodeInventoryItem( joined, first.next, refs );
+	assert.ok( second.item );
+	assert.equal( second.item.quantity, 4 );
+	assert.equal( second.next, joined.length );
+	for ( let n = 0; n < body.length; n++ ) assert.throws( () => decodeInventoryItem( body.slice( 0, n ), 0, refs ) );
+});
+
+test("a quick transfer fills a stack with room, else the first free slot", async () => {
+	const { cosQuickDestination } = await import(
+		sourceFileUrl( "src/engine/foundation/gameplay/cos-transfer.ts" ).href
+	);
+	const slots = { capacity: 16, equipment: 13 };
+	const record = { gid: 7, status: 4, inventory: [ { slot: 0, refObjId: 8, typeFlags: 0x86c, quantity: 1 } ] };
+	const bag = quantity => [ { slot: 13, refObjId: 8, typeFlags: 0x86c, quantity } ];
+	// An elixir's stack limit is 1: its twin in the bag is full, so the
+	// transfer takes a free slot instead of swapping the two.
+	assert.equal( cosQuickDestination( record, bag( 1 ), false, 0, slots, new Map( [ [ 8, 1 ] ] ) ), 14 );
+	assert.equal( cosQuickDestination( record, bag( 50 ), false, 0, slots, new Map( [ [ 8, 50 ] ] ) ), 14 );
+	assert.equal( cosQuickDestination( record, bag( 30 ), false, 0, slots, new Map( [ [ 8, 50 ] ] ) ), 13 );
+	const full = [ 13, 14, 15 ].map( slot => ({ slot, refObjId: 9, typeFlags: 0x86c, quantity: 1 }) );
+	assert.equal( cosQuickDestination( record, full, false, 0, slots, new Map( [ [ 8, 1 ] ] ) ), null );
+	assert.equal( cosQuickDestination( record, bag( 1 ), true, 13, slots, new Map( [ [ 8, 1 ] ] ) ), 1 );
+});
+
+test("a quick transfer without a destination is sent to the worker's slot", () => {
+	const { owner } = fixture();
+	const first = owner.command( { kind: "cos-transfer", gid: 7, toCos: false, source: 0 }, 0, entity );
+	assert.deepEqual( [ ...first.payload ], [ 0x1a, 7, 0, 0, 0, 0, 13 ] );
+	owner.receive( { opcode: 0xb06d, payload: Uint8Array.from( [ 1, ...first.payload ] ) }, 1 );
+	// The bag's 30 has room under the limit of 50: the 40 merges into it.
+	const second = owner.command( { kind: "cos-transfer", gid: 7, toCos: false, source: 1 }, 2, entity );
+	assert.deepEqual( [ ...second.payload ], [ 0x1a, 7, 0, 0, 0, 1, 13 ] );
+});

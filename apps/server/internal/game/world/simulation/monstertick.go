@@ -1,0 +1,1113 @@
+/*
+===========================================================================
+
+monstertick.go - the monster movement tick leg (wander and aggro)
+
+===========================================================================
+*/
+
+package simulation
+
+import (
+	"math"
+	"time"
+
+	"opensro.online/server/internal/domain"
+
+	log "github.com/sirupsen/logrus"
+	"opensro.online/server/internal/game/item/wire"
+	worldgeom "opensro.online/server/internal/game/world"
+	"opensro.online/server/internal/game/world/monster"
+)
+
+// Monster movement tick leg (Q4 wander + Q5 aggro, monster-live wave).
+//
+// ONE MOVER for both behaviours (coordinator seq247 risk #3): every
+// emitted segment funnels through commitSegment/emitSegmentFrames - the
+// wander planner and the aggro planner only choose the DESTINATION (and
+// the run/walk channel). A chase-specific packet builder is a design
+// violation (G-WHATIF A14, G-SRV seq263 #3); do not add one.
+//
+// Wire contract (all v1.150-pinned):
+//   - goal legs are 0xB738 via BuildMovementAckPayload - the SAME
+//     encoder the player ack path uses, byte-verified against RZ's
+//     binary widths (seq272 P2; board seq291 verification note);
+//   - in-flight glide re-syncs are 0x30E3 ObjectSourceMove (lenient
+//     re-seed, RZ seq159/seq272);
+//   - arrival settles once with 0xB2F5 (stop + face, REV seq116) -
+//     mirroring the player mover legs in tick.go.
+//
+// Per-nest behavior values resolve from each instance's evidence-backed
+// Nest/Tactics row. Unmatched v1.150 anchors remain passive, while mobile
+// RefObj rows retain the class-wide idle-wander primitive.
+
+/*
+==================
+MonsterMoverOps
+
+MonsterMoverOps is the tick leg's dependency set, wired in server.go
+whenever the monster population is enabled - which is the DEFAULT
+(MISSION_SPAWN_MONSTERS=0 is the kill switch; nil ops = leg skipped).
+==================
+*/
+type MonsterMoverOps struct {
+	divisionID string // set by the owning ticker shard; empty only in direct fixtures
+	// watch is the owning ticker's stall watch; the leg steps it every
+	// monsterLegStepActors actors. Nil in direct fixtures.
+	watch *tickWatch
+	// leg is the slow-leg attribution of the leg now running (#1820
+	// part C); nil outside RunMonsterLeg. The dispatch closure's ops
+	// copies share the pointer, so both advance paths accumulate into
+	// the one record.
+	leg *legStats
+	// lastLeg is the most recent leg's attribution, kept for tests and
+	// post-hoc inspection; replaced at the end of every leg.
+	lastLeg *legStats
+	// resumePending holds gids woken from dormancy whose first dispatch
+	// has not run yet (the resumed count, part C). Shard-owned like
+	// shownMonsters; nil until the first wake on this ops clone (ticker
+	// clones are made before any leg runs, so each owns its map).
+	resumePending map[populationKey]map[uint32]struct{}
+	// activityBlocks memoizes the activity gate's per-actor block
+	// resolution (monsteractivity.go); shard-owned like resumePending.
+	activityBlocks map[uint32]*activityBlockMemo
+	// legSessions groups the running leg's sessions by division, built
+	// at the top of RunMonsterLeg and cleared when it returns, so the
+	// per-actor publish path iterates one division's viewers instead of
+	// rescanning every session. Nil outside a leg.
+	legSessions map[string][]SessionSnapshot
+	// legViewers, legLive, legSessionBacking and legDivisionSet back
+	// the leg's viewer bookkeeping: one leg's worth of entries each,
+	// kept between legs and cleared at each leg's start (#3027).
+	// Shard-owned like resumePending: the ticker clones its ops
+	// before any leg runs, so each clone owns its maps. The
+	// legSessions index above points into legSessionBacking's
+	// buckets while a leg runs.
+	legViewers        map[string]worldgeom.RegionXZ
+	legLive           map[string]bool
+	legSessionBacking map[string][]SessionSnapshot
+	legDivisionSet    map[string]bool
+	// stepBaseGen is the commit generation the running step's actor
+	// was read at, armed by advanceAndPublish for the step's duration
+	// (#2137 slice 1): the generation-guarded commit helpers
+	// (monsterpublish.go) re-base it on each accepted commit, so a
+	// step's own commits chain while a slower lane's set in between
+	// drops the next one. Unarmed outside advanceAndPublish, where
+	// the helpers fall back to the plain commits of before.
+	stepBaseGen  uint64
+	stepGenArmed bool
+	// stepSlot and stepMonsterSlot are the running step actor's
+	// dense storage slots, armed and cleared with stepGenArmed
+	// (#2133): the step's door funnels (monsterpublish.go) read and
+	// commit through these gid-verified hints while armed.
+	stepSlot        uint32
+	stepMonsterSlot uint32
+	// stepQueueSlot is the running step actor's behaviour queue
+	// slot, armed with the storage slots above: the activity
+	// commit's re-arm lands on the queue row through it
+	// (setAtSlot) instead of resolving the gid through byGID
+	// again (#3027). Read only while stepGenArmed, like the
+	// storage slots.
+	stepQueueSlot uint32
+	// stepDrainedEvents is the running step's tactics-event drain
+	// count (monsterbehavior.go's applyTacticsEvents), reset at the
+	// step's head and read at its rest verdict: a settled candidate
+	// whose step drained events is the settled lane's
+	// drain-and-carry population (#3027 stage 1).
+	stepDrainedEvents int
+	// recheckScratch backs the pending re-check lane's candidate
+	// list (monsterpending_recheck.go), kept between batches so a
+	// leg allocates none. Shard-owned like resumePending.
+	recheckScratch []pendingRecheck
+	// stepPendingRechecks routes every due actor through the full
+	// step, the lane's reference: the equivalence tests run one
+	// world each way and compare them. Never set in production.
+	stepPendingRechecks bool
+	// LegWorkers is the monster leg's worker count (monsterlegpool.go,
+	// #2205): the zero value (everywhere but production wiring) runs
+	// the serial leg; >= 1 plans each batch on a pool - one worker
+	// included - and commits it in the serial order. Port-only
+	// concurrency, not native.
+	LegWorkers int
+	// plan is the running plan's sink while one batch actor is being
+	// planned on a pool worker (#2205): the commit funnels record
+	// into it instead of applying. Nil outside a pooled plan, where
+	// every funnel behaves exactly as before.
+	plan *legPlan
+	// Navigation counts route plans and path clips (navigation_metrics.go);
+	// nil counts nothing.
+	Navigation     *NavigationMetrics
+	MessageBlockAt func(Spawn) (worldgeom.MessageBlock, bool)
+	activity       *monsterActivitySnapshot
+	Monsters       *MonsterState
+	TacticsFor     monster.TacticsResolver
+	// GroundHeight resolves the walkable surface height at one pose on
+	// the mover's plane (Plane.HeightAt via wiring; #1695). The pose
+	// carries the caller height the plane's nearest-surface rule reads.
+	// Nil = keep the pose's own Y (the chord or anchor height), exactly
+	// the pre-wiring behaviour.
+	// Must be non-blocking: it reads preloaded region bundles.
+	GroundHeight func(pose monster.Pose) (float64, bool)
+	// Production supplies the same navigation owner for ALL monster legs.
+	// nil is reserved for geometry-free unit fixtures; an unavailable region
+	// is a nil RESULT and never authorizes a straight-line fallback.
+	PlanPath func(from, goal monster.Pose) *monster.NavigationPath
+	// PlanPathFrom is PlanPath from the monster's retained surface owner
+	// (native source pNavCell). Production wires it; when set, every leg that
+	// departs from the monster's own live pose uses it (planPath below).
+	PlanPathFrom func(from monster.Pose, fromOwner NavOwner, goal monster.Pose) *monster.NavigationPath
+	// AI route policy, separate from raw clipping used by sight/help probes.
+	PlanRoute func(from monster.Pose, fromOwner NavOwner, goal monster.Pose) *monster.NavigationRoute
+	// RouteMemo gates the failed-route memo (#1820 part B): may a failed
+	// search between these poses be answered from the mover's record
+	// instead of recomputed? Production wires it from the planes (same
+	// plane, PureRoutes). Nil, or false, means no memo: every retry
+	// searches, exactly as before.
+	RouteMemo func(from, goal monster.Pose) bool
+	// NavCacheMisses reads the movement layer's cold surface/object-nav
+	// resolutions (movement.WaterValidator.NavCacheMisses). A leg diffs
+	// it around itself: a nonzero delta is a first-use load the boot
+	// preload missed (#1820 part C). Nil reads zero.
+	NavCacheMisses func() uint64
+	// Rand returns a uniform [0,1) sample (seam for deterministic tests).
+	Rand func() float64
+	// AttackPlan resolves one of RefObjChar's ten default-skill ids against
+	// the shipped v1.150 skill table. requestedSkillID preserves a choice
+	// while the mover approaches; zero chooses from the valid authored set.
+	// Retained-ID resolution receives a zero pick and must not reselect based
+	// on changed health/damage. New selections alone consume choice entropy,
+	// and they carry the target the native conditional-then-weighted
+	// choice measures.
+	AttackPlan func(instance monster.Instance, requestedSkillID uint32, pick AttackPick) (MonsterAttackPlan, bool)
+	// BasicAttack commits one monster->player hit and returns the same B245
+	// action bracket the browser already uses for player attacks.
+	BasicAttack func(divisionID string, instance monster.Instance, targetGid, skillID uint32, nowMs int64) MonsterAttackResult
+	// RunAction keeps one actor's decision, damage and non-blocking publication
+	// in the action owner's division transaction. The supplied attack capability
+	// already owns that transaction and must not acquire it again. Production
+	// installs this; BasicAttack alone is the detached simulation test seam.
+	RunAction func(divisionID string, run func(MonsterAttackOperation))
+	// FirstAttackGuard reads a player's live first-attack protection (the
+	// Bard's Noise) from the effect owner. nil protects nobody.
+	FirstAttackGuard func(divisionID string, playerGID uint32, nowMs int64) monster.FirstAttackGuard
+	// Companions lists a player's summoned, living, unmounted companions in
+	// its owner's container order.
+	// nil means no companion is ever a target.
+	Companions func(divisionID string, ownerGID uint32, nowMs int64) []CompanionTarget
+
+	// scopeViewers is each viewer session's scope record: which
+	// monster gids it has been sent a spawn for (the peervis
+	// shownPeers pattern) and the memo of the pass its shown set
+	// last synced under. On first sight, the bootstrap object list
+	// already owns the create set and live pose; this plane
+	// publishes only any in-flight mover continuation. One record
+	// per session behind one map, so a leg reads a viewer's whole
+	// state with a single lookup (#2994). Only the owning division
+	// shard touches it.
+	scopeViewers map[string]*scopeViewerState
+	// scopeSlots is the leg's retained dense per-viewer slot row,
+	// regrown to the session count and rewritten every leg (#2994).
+	scopeSlots []scopeViewerSlot
+	// breachLogged keeps the A19-b budget-breach log to once per
+	// division (a per-tick log line would be its own flood).
+	breachLogged map[string]bool
+}
+
+/*
+==================
+mustMoverTransition
+
+mustMoverTransition turns a behavior bug into one causal failure at the
+mutation site. The simulation tick owns these events; an illegal edge is a
+programmer error, not a packet condition that should be silently ignored.
+==================
+*/
+func mustMoverTransition(mover *monster.MoverState, event monster.MoverEvent, targetGID uint32) {
+	if err := mover.Transition(event, targetGID); err != nil {
+		panic(err)
+	}
+}
+
+/*
+================
+logScopeBudgetBreach
+================
+*/
+func (ops *MonsterMoverOps) logScopeBudgetBreach(divisionID string, count int) {
+	if ops.breachLogged == nil {
+		ops.breachLogged = make(map[string]bool)
+	}
+	if ops.breachLogged[divisionID] {
+		return
+	}
+	ops.breachLogged[divisionID] = true
+	log.Warnf("simulation: monster scope ring holds %d instances in division %s, beyond the %d-instance operational soft limit", count, divisionID, monsterScopeSoftLimit)
+}
+
+const (
+	// monsterMovementSourceTurnThreshold is the retail server's optional
+	// source-block gate for an already-moving entity. The reference
+	// server's movement broadcast normalizes the old and new
+	// directions, converts their dot product to an angular delta, and
+	// writes the source only when the delta is GREATER than
+	// 0.785398185253143 radians.
+	//
+	// This is version-adjacent server evidence applied to the byte-identical
+	// v1.150 client source block. It replaces the incorrect player-plane
+	// "one source ever" policy that made sharp monster replans diverge.
+	monsterMovementSourceTurnThreshold = math.Pi / 4
+)
+
+// monsterScopeSoftLimit is operational detection, not a gameplay gate.
+// The deterministic per-frame audit over the evidence-backed population is
+// pinned below this value; exceeding it signals data or scope drift while
+// still serving the complete retail-derived population.
+const monsterScopeSoftLimit = 700
+
+// Object-list bracket opcodes (the bootstrap package owns the login-path
+// constants of the same values; mission cannot import bootstrap).
+const (
+	opObjectListStart    uint16 = 0x30CB
+	opObjectListFinalize uint16 = 0x330A
+)
+
+/*
+==================
+RegionScopeRing
+
+RegionScopeRing is the 3x3 sector ring around the viewer's region. It is
+the monster materialization and AI-activity candidate set (POLICY: native
+AI activity scoping is unpinned), not the visibility radius: what a viewer
+holds is the native 320-unit block neighbourhood (worldgeom.InterestVisible),
+which always lies inside this ring. DUNGEON regions (sector-bit ids) scope
+to exactly themselves: ring math over the dungeon bit is meaningless.
+==================
+*/
+func RegionScopeRing(regionID uint16) []uint16 {
+	return worldgeom.ScopeRing(regionID)
+}
+
+/*
+==================
+MonsterDespawnBracketFrames
+
+MonsterDespawnBracketFrames encodes a byListSub=2 object-list group:
+0x30CB {0x02, u16 count} begin, one 0x3417 chunk of 4-byte gids (the
+client CPSMission_OnEntityDespawn36AB despawn bodies the finalize loop consumes), empty 0x330A
+finalize. The native bulk-eviction shape (byListSub=2 pinned by
+RZ seq134/DUMP seq91; client-side handling sabotage-proven by WIP's
+ensureDespawn4cBinding chain, board seq359/373).
+==================
+*/
+func MonsterDespawnBracketFrames(gids []uint32) []Frame {
+	w := wire.NewWriter(len(gids) * 4)
+	changes := make([]domain.ObjectScopeChange, 0, len(gids))
+	for _, gid := range gids {
+		w.U32(gid)
+		changes = append(changes, domain.ObjectScopeChange{GID: gid})
+	}
+	return []Frame{
+		{Opcode: opObjectListStart, Payload: []byte{0x02, byte(len(gids) & 0xff), byte(len(gids) >> 8)}},
+		{Opcode: wire.OpObjectListChunk, Payload: w.Payload()},
+		{Opcode: opObjectListFinalize, Payload: []byte{}, Scope: changes},
+	}
+}
+
+/*
+================
+retainedLegMap
+
+One of the leg's viewer indexes, kept across legs: made on first
+use, cleared with its buckets kept at the next leg's start, so a
+leg pays no map growth for bookkeeping that lives exactly one leg
+(#3027). Legs on one ops are serial and the leg's readers are done
+before it returns, so the clear at the next start happens after
+the last read.
+================
+*/
+func retainedLegMap[K comparable, V any](held map[K]V, hint int) map[K]V {
+	if held == nil {
+		return make(map[K]V, hint)
+	}
+	clear(held)
+	return held
+}
+
+// RunMonsterLeg advances actors independently of observer interest.
+/*
+================
+RunMonsterLeg
+================
+*/
+func (ops *MonsterMoverOps) RunMonsterLeg(nowMs int64, sessions []SessionSnapshot, push Pusher) {
+	if ops == nil || ops.Monsters == nil {
+		return
+	}
+	// The scheduler mirrors the production tactics resolver; tell it
+	// when this ops resolves through a replacement instead, so its
+	// idle due stays conservative (idleBehaviorDue).
+	ops.Monsters.noteTacticsReplaced(ops.TacticsFor != nil)
+
+	// The activity gate's memo lives on the ops, but the dispatch below
+	// binds each actor to a value copy (owned := *ops): a memo map first
+	// made inside the gate lands on that discarded copy, so on the
+	// production path the memo survives no actor at all - every due gate
+	// allocates a fresh map and re-walks the actor's surface. Make the
+	// map on the leg's own ops before dispatch; every copy then shares
+	// the one map header, as the memo's shard-owned design intends. The
+	// gate keeps its lazy make for direct callers outside a leg.
+	if ops.activityBlocks == nil {
+		ops.activityBlocks = make(map[uint32]*activityBlockMemo)
+	}
+
+	// Slow-leg attribution (#1820 part C): one record per leg, filled
+	// below and by the planners through ops.leg; nothing reads it to
+	// decide behaviour.
+	legStarted := time.Now()
+	stats := &legStats{gcStart: readGCSample()}
+	if ops.NavCacheMisses != nil {
+		stats.navStart = ops.NavCacheMisses()
+	}
+	ops.leg = stats
+	defer func() { ops.leg = nil }()
+
+	ops.legViewers = retainedLegMap(ops.legViewers, len(sessions))
+	ops.legLive = retainedLegMap(ops.legLive, len(sessions))
+	ops.legSessionBacking = retainedLegMap(ops.legSessionBacking, len(sessions))
+	viewers := ops.legViewers
+	live := ops.legLive
+	legSessions := ops.legSessionBacking
+	for _, session := range sessions {
+		live[session.SessionID] = true
+		pose := session.World.LiveSpawnAt(nowMs)
+		viewers[session.SessionID] = worldgeom.RegionXZ{RegionID: pose.RegionID, X: pose.X, Z: pose.Z}
+		legSessions[session.DivisionID] = append(legSessions[session.DivisionID], session)
+	}
+	ops.legSessions = legSessions
+	defer func() { ops.legSessions = nil }()
+
+	// Scope visibility FIRST, mover frames SECOND: a viewer must have
+	// received a monster's spawn before any 0xB738/0xB2F5 for its gid
+	// (the movement handlers ResolveGidObjectOrAssert - an unknown gid
+	// ASSERTS in the native client, REV seq116 / WIP seq140 #3; only
+	// 0x30E3 is find-or-skip safe). Delivering mover frames per-session
+	// against the just-updated shown sets makes spawn-before-goal and
+	// never-goal-after-despawn true by construction.
+	phaseStarted := time.Now()
+	wokenSets := ops.Monsters.prepareDormancy(nowMs, ops.divisionID, sessions)
+	stats.dormancy = time.Since(phaseStarted)
+	ops.noteWoken(stats, wokenSets)
+	phaseStarted = time.Now()
+	ops.runScopeVisibility(nowMs, sessions, viewers, live, push)
+	stats.visibility = time.Since(phaseStarted)
+
+	ops.activity = ops.captureActivity(sessions, nowMs)
+	defer func() { ops.activity = nil }()
+	ops.legDivisionSet = retainedLegMap(ops.legDivisionSet, len(sessions))
+	divisionSet := ops.legDivisionSet
+	// One dispatch for the whole leg. A variable captured by the closure
+	// handed to RunAction escapes through that indirect call: captured per
+	// actor, every monster's Instance snapshot and the closure itself were a
+	// heap allocation per behaviour tick (1 GB a minute with one player
+	// online, which kept the collector busy on three cores). RunAction runs
+	// its closure before returning, so the slots are reused safely.
+	var dispatch struct {
+		division string
+		key      populationKey
+		index    int
+		players  []playerPose
+		view     *legSnapshot
+	}
+	act := func(attack MonsterAttackOperation) {
+		// Bind the capability to a value copy, not the shard's dependency
+		// set. Mutable actor state remains in MonsterState.
+		owned := *ops
+		owned.BasicAttack = attack
+		// The step starts from the leg-start snapshot (monsterlegsnapshot.go),
+		// not a resolve inside this lock: a mover set by a slower lane
+		// (an abnormal retime, a GM or impact set) while the leg waited
+		// for the lock has advanced the row's commit generation, so the
+		// step's whole-value commits drop instead of overwriting it -
+		// the #2047 overwrite hazard is now carried by the generation
+		// guard rather than by resolve-inside-the-lock timing.
+		actor, ok := dispatch.view.actorAt(dispatch.index)
+		if !ok {
+			return
+		}
+		owned.advanceAndPublish(dispatch.division, actor, dispatch.players, nowMs, sessions, push)
+	}
+	stepped := 0
+	phaseStarted = time.Now()
+	queueStarted := time.Now()
+	batches := ops.Monsters.behaviorBatchesForDivision(nowMs, ops.divisionID)
+	// The batches die with this leg: their refs backings return to
+	// the scratch pool once every batch below is dispatched (#2030).
+	defer ops.Monsters.releaseBehaviorBatches(batches)
+	// The build consumed the actors' dues without re-arming them
+	// (behaviorBatchesForDivision): the sweep after the dispatch
+	// arms the remainder, and this backstop runs the same sweep on
+	// the way out when a step panics mid-leg, so a popped actor is
+	// never left unscheduled. An actor a door re-armed meanwhile is
+	// skipped by the sweep either way.
+	remaindersArmed := false
+	defer func() {
+		if !remaindersArmed {
+			ops.Monsters.armBehaviorRemainders(batches, nowMs)
+		}
+	}()
+	stats.queue = time.Since(queueStarted)
+	for batchIndex, batch := range batches {
+		divisionID := batch.key.division
+		divisionSet[divisionID] = true
+		ops.activity.askWorld(activityWorld{divisionID, uint32(batch.key.lease.ID), batch.key.lease.Generation})
+		// The suspended actors' activity re-check is answered for the
+		// whole batch first (monsterpending_recheck.go); only the
+		// actors it leaves are snapshot and stepped. The batch keeps
+		// the shortened list: the settled ones hold the due their
+		// commit armed, and the remainder sweep has nothing to add.
+		batch.actors = ops.recheckPendingBatch(batch, nowMs, stats)
+		batches[batchIndex].actors = batch.actors
+		var players []playerPose
+		for _, session := range sessions {
+			if session.DivisionID != divisionID || session.Population != batch.key.lease || !session.CombatEligible {
+				continue
+			}
+			player := sessionPlayerPose(session, nowMs)
+			if ops.FirstAttackGuard != nil {
+				player.Guard = ops.FirstAttackGuard(divisionID, player.Gid, nowMs)
+			}
+			players = append(players, player)
+			players = appendCompanionTargets(players, ops.companionTargets(divisionID, player, nowMs))
+		}
+		view := ops.Monsters.legSnapshot(batch.key, batch.actors)
+		if ops.pooledLeg() && len(batch.actors) > 1 {
+			stepped = ops.runPooledBatch(batch, view, players, sessions, push, nowMs, stats, stepped)
+			ops.Monsters.releaseLegSnapshot(view)
+			continue
+		}
+		for index, ref := range batch.actors {
+			// The scheduler carries identities, not a second copy of the world.
+			// All dispatch decides is that the actor is still there: a
+			// despawn between scheduling and dispatch drops it here. Its
+			// instance and mover come from the batch's leg-start
+			// snapshot; a slower lane's set since then has advanced the
+			// mover's commit generation, so the step's whole-value
+			// commits drop instead of overwriting the newer value
+			// (#2047 review, carried by the generation since #2137
+			// slice 1). The direct path below reads the same view at
+			// the same adjacency it always had.
+			if !ops.Monsters.behaviorActorLiveAt(batch.key, ref) {
+				continue
+			}
+			if ops.noteResumed(batch.key, ref.gid) {
+				stats.resumed++
+			}
+			if stepped++; stepped%monsterLegStepActors == 0 {
+				ops.watch.step()
+			}
+			if ops.RunAction != nil {
+				dispatch.division, dispatch.key, dispatch.index, dispatch.players, dispatch.view = divisionID, batch.key, index, players, view
+				advanceBefore := stats.advance
+				laneStarted := time.Now()
+				ops.RunAction(divisionID, act)
+				// The lane wall outside the step: the per-actor
+				// division-lock entry plus the snapshot read act
+				// runs before advanceAndPublish.
+				if outside := time.Since(laneStarted) - (stats.advance - advanceBefore); outside > 0 {
+					stats.lane += outside
+				}
+				continue
+			}
+			actor, ok := view.actorAt(index)
+			if !ok {
+				continue
+			}
+			ops.advanceAndPublish(divisionID, actor, players, nowMs, sessions, push)
+		}
+		ops.Monsters.releaseLegSnapshot(view)
+	}
+	queueArmStarted := time.Now()
+	ops.Monsters.armBehaviorRemainders(batches, nowMs)
+	stats.queue += time.Since(queueArmStarted)
+	remaindersArmed = true
+	stats.batch = time.Since(phaseStarted)
+	stats.actors = stepped
+	for divisionID := range divisionSet {
+		if frames := ops.Monsters.DrainUniqueNotices(divisionID); len(frames) > 0 {
+			push.PushToDivision(divisionID, frames, "")
+		}
+	}
+	stats.total = time.Since(legStarted)
+	var navMissesEnd uint64
+	if ops.NavCacheMisses != nil {
+		navMissesEnd = ops.NavCacheMisses()
+	}
+	stats.finish(navMissesEnd, readGCSample())
+	ops.Navigation.leg(stats)
+	ops.lastLeg = stats
+	if stats.total >= SlowHookThreshold {
+		stats.logSlow(ops.divisionID)
+	}
+}
+
+/*
+==================
+monsterInFlightSnapshotFrames
+
+monsterInFlightSnapshotFrames is the single wire projection of an active
+mover segment. Bootstrap reconciliation supplies a live source because its
+create row and this first tick are separate snapshots; ordinary scope-enter
+creates at the same tick's live pose and therefore needs only the goal.
+==================
+*/
+func monsterInFlightSnapshotFrames(
+	instance monster.Instance,
+	mover monster.MoverState,
+	source *MovementSource,
+) []Frame {
+	frames := make([]Frame, 0, 2)
+	if currentChannel(mover.Channel) != wire.MoveStateWalk {
+		refresh := wire.ObjectStateRefresh{
+			Gid:       instance.Gid,
+			StateType: wire.StateChannelMove,
+			Value:     mover.Channel,
+		}
+		frames = append(frames, Frame{Opcode: wire.OpObjectStateRefresh, Payload: refresh.Encode()})
+	}
+	destination := mover.MovementGoal()
+	goal := BuildMovementAckPayload(instance.Gid, MovementRequest{
+		Mode:     MovementAckDestinationMode,
+		RegionID: destination.RegionID,
+		X:        destination.X,
+		Y:        destination.Y,
+		Z:        destination.Z,
+	}, source)
+	return append(frames, Frame{Opcode: OpMovementAck, Payload: goal})
+}
+
+// Scope and bootstrap use the same live-state projection.
+/*
+================
+monsterWireDefFromInstance
+================
+*/
+func monsterWireDefFromInstance(instance monster.Instance, nowMs int64) MonsterDef {
+	return MonsterWireDefFromInstance(instance, nowMs)
+}
+
+/*
+================
+resolveTactics
+================
+*/
+func (ops *MonsterMoverOps) resolveTactics(instance *monster.Instance) monster.Tactics {
+	if ops.TacticsFor != nil {
+		return ops.TacticsFor(instance)
+	}
+	return monster.ResolveTactics(instance)
+}
+
+// startWanderLeg probes the facing-relative direction, then requests the
+// independently sampled travel distance from the actor's current position.
+/*
+================
+startWanderLeg
+================
+*/
+func (ops *MonsterMoverOps) startWanderLeg(divisionID string, instance *monster.Instance, tactics monster.Tactics, mover monster.MoverState, nowMs int64) []Frame {
+	before := ops.stepNavigationAdmission(divisionID, instance.Gid)
+	if !monster.CanEnterWander(instance.Ref.TidWord, instance.Ref.RunSpeed) || instance.Ref.WalkSpeed <= 0 || tactics.WanderProbeDistance <= 0 {
+		// Zero-speed types never wander.
+		mustMoverTransition(&mover, monster.MoverEventEntryRefused, 0)
+		mover.BehaviorDeadlineMs = nowMs + ops.idleDelayMs()
+		mover, frames := ops.planIdleEntry(instance, mover, nowMs)
+		committed, _ := ops.commitSteppedNavigation(divisionID, before, mover, frames)
+		return committed
+	}
+	// Nest containment, probe origin and movement goal are separate inputs.
+	live := mover.LivePoseAt(nowMs, ops.GroundHeight)
+	motion := monster.NativeWanderMotion(live.Heading, func() uint32 { return monster.SummonRandomWord(ops.rand()) })
+	if mover.ControllerGID() != 0 {
+		if controller, ok := ops.Monsters.Mover(divisionID, mover.ControllerGID()); ok {
+			motion = motion.TowardController(live, controller.LivePoseAt(nowMs, ops.GroundHeight))
+		}
+	}
+	if ops.hasPlanner() {
+		probe := normalizeMonsterPose(motion.Destination(live, tactics.WanderProbeDistance))
+		path := ops.planPath(navWander, live, mover.LiveNavOwner(nowMs), probe)
+		if path == nil {
+			// Missing geometry cannot be interpreted as a successful probe.
+			mustMoverTransition(&mover, monster.MoverEventStartWander, 0)
+			mover, frames := ops.holdNavigation(instance.Gid, mover, live, nowMs)
+			committed, _ := ops.commitSteppedNavigation(divisionID, before, mover, frames)
+			return committed
+		}
+		motion = motion.AfterProbe(path.Result())
+	}
+	dest := normalizeMonsterPose(motion.Destination(live, motion.Distance))
+	mustMoverTransition(&mover, monster.MoverEventStartWander, 0)
+	mover.BehaviorDeadlineMs = nowMs + monster.NativeWanderDelayMs(func() uint32 { return monster.SummonRandomWord(ops.rand()) })
+	mover, frames := ops.planSegment(instance, mover, dest, instance.WalkSpeed(), wire.MoveStateWalk, nowMs)
+	committed, _ := ops.commitSteppedNavigation(divisionID, before, mover, frames)
+	return committed
+}
+
+/*
+==================
+commitSegment
+
+commitSegment is THE single emit seam: computes the timed segment from
+the live departure pose, commits the mover, and builds the frames -
+an optional 0x3122 MOVE channel push (only when the run/walk channel
+changes; client CPSMission_OnEntityStateUpdate0x3122 case 1 -> SetRunWalkMode, the pinned wire that
+keeps the client integrator at the server's segment speed - BUG-7
+speed-half fix) followed by the 0xB738 goal. The optional source follows
+the retail autonomous-entity turn gate, not the player ack's first-move
+lifecycle.
+==================
+*/
+func (ops *MonsterMoverOps) commitSegment(divisionID string, instance *monster.Instance, mover monster.MoverState, dest monster.Pose, speed float64, channel uint8, nowMs int64) []Frame {
+	before := ops.stepNavigationAdmission(divisionID, instance.Gid)
+	return ops.commitPreparedSegment(divisionID, before, instance, mover, dest, speed, channel, nowMs)
+}
+
+/*
+================
+stepNavigationAdmission
+
+The admission the step's navigation commits (commitSegment,
+startReturnLeg, startWanderLeg, commitIdleEntry) prepare against
+the stored row. A planning step (#2205) prepares none: its commit
+funnel records the navigation and the serial replay re-prepares
+against the row at commit (commitSteppedNavigation), so a
+plan-time admission is never read - and the read is not free:
+every worker would take the population lock and copy the instance
+and mover rows to build a value it throws away. The serial step
+prepares exactly as before.
+================
+*/
+func (ops *MonsterMoverOps) stepNavigationAdmission(divisionID string, gid uint32) navigationAdmission {
+	if ops.plan != nil {
+		return navigationAdmission{}
+	}
+	return ops.Monsters.prepareNavigation(divisionID, gid)
+}
+
+/*
+================
+commitSteppedNavigation
+
+The step's navigation-transaction commits (commitSegment,
+startReturnLeg, startWanderLeg, commitIdleEntry) funnel here: the
+transaction itself value-guards its commit exactly as before, and
+an accepted one re-bases the running step's commit generation on
+the row's new generation, so the step's later generation-guarded
+commits chain off it instead of dropping against their own leg
+(#2137 slice 1). The rebase spends no read: the transaction hands
+back the generation it just wrote. The second answer is the
+landing itself - a landed commit with no frames is otherwise
+indistinguishable from a dropped one - for the pooled replay.
+Unarmed callers pay nothing.
+================
+*/
+func (ops *MonsterMoverOps) commitSteppedNavigation(divisionID string, before navigationAdmission, next monster.MoverState, frames []Frame) ([]Frame, bool) {
+	if ops.plan != nil {
+		// Planning (#2205): record the transaction's result; the
+		// commit re-prepares the admission against the row then, the
+		// moment the serial call reads it, so the plan-time admission
+		// is deliberately not carried over.
+		ops.plan.recordNavigation(next, frames)
+		return frames, true
+	}
+	committed, gen, landed := ops.Monsters.commitNavigation(divisionID, before, next, frames)
+	if landed && ops.stepGenArmed {
+		ops.stepBaseGen = gen
+	}
+	return committed, landed
+}
+
+// Approach allocation and geometry must publish in the same navigation transaction.
+/*
+================
+commitPreparedSegment
+================
+*/
+func (ops *MonsterMoverOps) commitPreparedSegment(divisionID string, before navigationAdmission, instance *monster.Instance, mover monster.MoverState, dest monster.Pose, speed float64, channel uint8, nowMs int64) []Frame {
+	mover, frames := ops.planSegment(instance, mover, dest, speed, channel, nowMs)
+	committed, _ := ops.commitSteppedNavigation(divisionID, before, mover, frames)
+	return committed
+}
+
+// Plan only: terrain sampling may run concurrently with damage/lifecycle work.
+// The caller must admit the result before publishing any returned frame.
+/*
+================
+planDirectSegment
+================
+*/
+func (ops *MonsterMoverOps) planDirectSegment(instance *monster.Instance, mover monster.MoverState, dest monster.Pose, speed float64, channel uint8, nowMs int64) (monster.MoverState, []Frame) {
+	// Quantise the destination to the grid the WIRE can express, before
+	// anything derives from it. The 0xB738 goal is the only destination the
+	// client ever learns and it carries x/y/z as ROUNDED i16 words
+	// (BuildMovementAckPayload, move.go) - so the client can only ever walk
+	// to an INTEGER position. Keeping a fractional destination as server
+	// truth means the 0xB2F5 settle, which encodes f32, hands the client the
+	// UNROUNDED pose AFTER it has already stopped on the rounded one, and it
+	// slides the residual (up to 0.5u per axis) off after halting - BUG-12,
+	// "they always slide a 1cm after stop". Quantise the truth rather than
+	// widening the wire: the i16 destination is the native contract, and the
+	// deliberate precision split is visible in move.go, where the SOURCE
+	// block carries roundI16Word(x*10) for 0.1u while the DESTINATION is
+	// whole units.
+	//
+	// Y is deliberately NOT quantised. The client re-resolves ground height
+	// per integrated step, so its true arrival height is the surface under
+	// the arrival XZ rather than the goal's y; an integer y here would put
+	// the settle in a fight with that resolver. Re-sample at the quantised
+	// XZ instead - the ground under a rounded destination is not the ground
+	// under the fractional one the caller picked.
+	dest.X = math.Round(dest.X)
+	dest.Z = math.Round(dest.Z)
+	dest = normalizeMonsterPose(dest)
+	if !ops.hasPlanner() && ops.GroundHeight != nil {
+		if y, ok := ops.GroundHeight(dest); ok {
+			dest.Y = y
+		}
+	}
+
+	// Capture the old leg before replacing it. The reference server's
+	// movement writer includes the live source only for a >45-degree
+	// discontinuity.
+	// Shallow chase re-aims therefore preserve the client's PATH source cursor;
+	// reversals and hard cuts re-anchor that logical cursor at this live pose.
+	// This says nothing about animation playback: v1.150 CPSMission_OnSkillNavResponse0xB738 re-enters
+	// state 9 for every B738 destination, and the cyclic mixer reset clears its
+	// authored cursor. The browser presentation adapter separately retains the
+	// visible walk/run phase while that locomotion lane remains continuously live.
+	settledFrames, stuck := settleMaturedSegment(instance.Gid, &mover, nowMs)
+	if stuck {
+		return mover, settledFrames
+	}
+	wasInFlight := mover.InFlight(nowMs)
+
+	// Segment departure: `from` becomes mover.From - the interpolation BASE
+	// of the whole next segment - so a chord height here would propagate
+	// into every later scope-enter read (BUG-8 second injection path).
+	from := mover.LivePoseAt(nowMs, ops.GroundHeight)
+	goal := dest
+	moveIssued := planarDistance(from, goal) >= 0.01 && speed > 0
+	if moveIssued {
+		mover.NoteMoveIssued(from, wasInFlight)
+	}
+	var navigation *monster.NavigationPath
+	if ops.hasPlanner() {
+		// Walk from the cell under the monster (native source pNavCell).
+		navigation = ops.planPath(callerForMode(mover.Mode()), from, mover.LiveNavOwner(nowMs), goal)
+		if navigation == nil {
+			if moveIssued && mover.ArriveMs <= mover.DepartMs {
+				mover.NoteMoveStopped(from)
+			}
+			return ops.holdNavigation(instance.Gid, mover, from, nowMs)
+		}
+		dest = navigation.Rest()
+	}
+	distance := planarDistance(from, dest)
+	if distance < 0.01 || speed <= 0 {
+		mover.Pose = from
+		mover.From, mover.To = monster.Pose{}, monster.Pose{}
+		mover.DepartMs, mover.ArriveMs = 0, 0
+		if wasInFlight || moveIssued {
+			mover.NoteMoveStopped(from)
+		}
+		if !mover.Stuck() {
+			mustMoverTransition(&mover, monster.MoverEventSegmentArrived, 0)
+			if mover.IdleEntryPending() {
+				mover.BehaviorDeadlineMs = nowMs + ops.idleDelayMs()
+			}
+		}
+		if wasInFlight {
+			return mover, []Frame{correctionFrame(instance.Gid, from)}
+		}
+		return mover, settledFrames
+	}
+	sourceRequired := monsterMovementSourceRequired(mover, from, dest, wasInFlight)
+	headingWord := headingWordToward(from, dest)
+	dest.Heading = headingWord
+	mover.From = from
+	mover.To = dest
+	mover.DepartMs = nowMs
+	mover.ArriveMs = nowMs + int64(distance/speed*1000)
+	if mover.ArriveMs <= nowMs {
+		mover.ArriveMs = nowMs + 1
+	}
+	mover.AdoptNavigation(navigation)
+
+	var frames []Frame
+	if currentChannel(mover.Channel) != channel {
+		refresh := wire.ObjectStateRefresh{
+			Gid:       instance.Gid,
+			StateType: wire.StateChannelMove,
+			Value:     channel,
+		}
+		frames = append(frames, Frame{Opcode: wire.OpObjectStateRefresh, Payload: refresh.Encode()})
+	}
+	mover.Channel = channel
+
+	var source *MovementSource
+	if sourceRequired {
+		source = &MovementSource{RegionID: from.RegionID, X: from.X, Y: from.Y, Z: from.Z}
+	}
+	payload := BuildMovementAckPayload(instance.Gid, MovementRequest{
+		Mode:     MovementAckDestinationMode,
+		RegionID: goal.RegionID,
+		X:        goal.X,
+		Y:        goal.Y,
+		Z:        goal.Z,
+	}, source)
+	return mover, append(frames, Frame{Opcode: OpMovementAck, Payload: payload})
+}
+
+// A missing navigation result settles the old segment in the SAME admitted
+// transaction. Sending nothing would leave the client walking the old goal.
+/*
+================
+holdNavigation
+================
+*/
+func (ops *MonsterMoverOps) holdNavigation(gid uint32, mover monster.MoverState, live monster.Pose, now int64) (monster.MoverState, []Frame) {
+	if mover.ArriveMs > mover.DepartMs {
+		mover.NoteMoveStopped(live)
+	}
+	mover.Pose = live
+	mover.From, mover.To = monster.Pose{}, monster.Pose{}
+	mover.DepartMs, mover.ArriveMs = 0, 0
+	mover.AdoptNavigation(nil)
+	if !mover.Stuck() {
+		mustMoverTransition(&mover, monster.MoverEventSegmentArrived, 0)
+		if mover.IdleEntryPending() {
+			mover.BehaviorDeadlineMs = now + ops.idleDelayMs()
+		}
+	}
+	return mover, []Frame{correctionFrame(gid, live)}
+}
+
+/*
+==================
+monsterMovementSourceRequired
+
+monsterMovementSourceRequired mirrors the reference server's
+positional movement source gate. A settled entity's current
+facing is its last committed heading; an in-flight entity's facing is the
+old segment direction. Degenerate vectors source defensively because they
+cannot establish continuous steering.
+==================
+*/
+func monsterMovementSourceRequired(mover monster.MoverState, from, dest monster.Pose, wasInFlight bool) bool {
+	var oldFrom, oldTo monster.Pose
+	if wasInFlight {
+		oldFrom, oldTo = mover.From, mover.To
+	} else {
+		oldFrom = from
+		oldTo = poseOneUnitAlongHeading(from, mover.Pose.Heading)
+	}
+
+	oldDX, oldDZ := monsterPoseDelta(oldFrom, oldTo)
+	newDX, newDZ := monsterPoseDelta(from, dest)
+	oldLength := math.Hypot(oldDX, oldDZ)
+	newLength := math.Hypot(newDX, newDZ)
+	if oldLength <= 0 || newLength <= 0 {
+		return true
+	}
+
+	dot := (oldDX*newDX + oldDZ*newDZ) / (oldLength * newLength)
+	dot = clampFloat(dot, -1, 1)
+	return math.Acos(dot) > monsterMovementSourceTurnThreshold
+}
+
+// poseOneUnitAlongHeading reconstructs Math_YawToDirVec's planar convention
+// after client 8535A0 converts the wire bearing: heading 0 faces +X.
+/*
+================
+poseOneUnitAlongHeading
+================
+*/
+func poseOneUnitAlongHeading(from monster.Pose, heading uint16) monster.Pose {
+	yaw := float64(heading)/65535*2*math.Pi + math.Pi/2
+	to := from
+	to.X += math.Sin(yaw)
+	to.Z -= math.Cos(yaw)
+	return to
+}
+
+// currentChannel maps the zero value (fresh mover) to the walk channel
+// the create row ships (MonsterSpawnSpeedChannel).
+/*
+================
+currentChannel
+================
+*/
+func currentChannel(channel uint8) uint8 {
+	if channel == 0 {
+		return wire.MoveStateWalk
+	}
+	return channel
+}
+
+// hasPlanner reports whether a world-surface planner is wired.
+/*
+================
+hasPlanner
+================
+*/
+func (ops *MonsterMoverOps) hasPlanner() bool {
+	return ops.PlanPathFrom != nil || ops.PlanPath != nil
+}
+
+/*
+==================
+planPath
+
+planPath plans from `from` walking from fromOwner. Legs departing from the
+monster's live pose pass mover.LiveNavOwner; a leg from the nest anchor
+passes the zero owner (native teleport rule: the homing
+destination selection clips from HOME).
+==================
+*/
+func (ops *MonsterMoverOps) planPath(caller navCaller, from monster.Pose, fromOwner NavOwner, goal monster.Pose) *monster.NavigationPath {
+	ops.Navigation.clip(caller)
+	ops.leg.noteClip(caller)
+	if ops.PlanPathFrom != nil {
+		return ops.PlanPathFrom(from, fromOwner, goal)
+	}
+	return ops.PlanPath(from, goal)
+}
+
+/*
+================
+rand
+================
+*/
+func (ops *MonsterMoverOps) rand() float64 {
+	if ops.Rand == nil {
+		return 0.5
+	}
+	return ops.Rand()
+}
+
+// ---- pure helpers ----
+
+/*
+================
+anchorPose
+================
+*/
+func anchorPose(instance *monster.Instance) monster.Pose {
+	if instance.Nest.HasControls {
+		// The native home tests use the nest anchor, not the randomized
+		// spawn candidate.
+		// Using Spawn shifts the home boundary separately for every sibling.
+		return monster.Pose{RegionID: instance.Nest.RegionID, X: instance.Nest.X, Y: instance.Nest.Y, Z: instance.Nest.Z}
+	}
+	return monster.Pose{
+		RegionID: instance.Spawn.RegionID,
+		X:        instance.Spawn.X,
+		Y:        instance.Spawn.Y,
+		Z:        instance.Spawn.Z,
+	}
+}
+
+/*
+================
+poseToSpawn
+================
+*/
+func poseToSpawn(p monster.Pose) Spawn {
+	return Spawn{RegionID: p.RegionID, X: p.X, Y: p.Y, Z: p.Z, Angle: p.Heading}
+}
+
+/*
+================
+spawnToPose
+================
+*/
+func spawnToPose(p Spawn) monster.Pose {
+	return monster.Pose{RegionID: p.RegionID, X: p.X, Y: p.Y, Z: p.Z, Heading: p.Angle}
+}
+
+/*
+================
+planarDistance
+================
+*/
+func planarDistance(a, b monster.Pose) float64 {
+	return WorldDistance2D(poseToSpawn(a), poseToSpawn(b))
+}
+
+/*
+================
+planarDistanceSpawn
+================
+*/
+func planarDistanceSpawn(a Spawn, b Spawn) float64 {
+	return WorldDistance2D(a, b)
+}
+
+// All movement producers encode wire bearings through the shared inverse of
+// the client's 8535A0. Native model yaw and wire heading differ by pi/2.
+/*
+================
+headingWordToward
+================
+*/
+func headingWordToward(from, to monster.Pose) uint16 {
+	dx, dz := monsterPoseDelta(from, to)
+	return headingWordFromDelta(dx, dz)
+}
+
+/*
+================
+correctionFrame
+================
+*/
+func correctionFrame(gid uint32, pose monster.Pose) Frame {
+	correction := wire.ObjectSourceCorrection{
+		Gid: gid,
+		Position: wire.Position{
+			RegionID: pose.RegionID,
+			X:        float32(pose.X),
+			Y:        float32(pose.Y),
+			Z:        float32(pose.Z),
+			Heading:  pose.Heading,
+		},
+	}
+	return Frame{Opcode: wire.OpObjectSourceCorrection, Payload: correction.Encode()}
+}
+
+/*
+================
+idleDelayMs
+================
+*/
+func (ops *MonsterMoverOps) idleDelayMs() int64 {
+	return monster.NativeIdleDelayMs(func() uint32 { return monster.SummonRandomWord(ops.rand()) })
+}
+
+/*
+================
+sessionPlayerPose
+
+One combat-eligible session as the monster tick weighs it. Its job state
+is the native one (the job-state getter): the worn suit's job,
+else 4, the state the load-time job-state initializer sets
+first.
+================
+*/
+func sessionPlayerPose(session SessionSnapshot, nowMs int64) playerPose {
+	player := playerPose{Gid: PlayerObjectID(session.CharacterID), Pose: session.World.LiveSpawnAt(nowMs),
+		MovementIntent: capturePlayerMovementIntent(session.World, nowMs), BodyRadius: session.BodyRadius,
+		NativeBodyStatus: session.NativeBodyStatus, JobState: jobStateSpecial, Mounted: session.mountedOnCOS()}
+	if session.Appearance != nil && session.Appearance.JobType != 0 {
+		player.JobState = session.Appearance.JobType
+	}
+	return player
+}

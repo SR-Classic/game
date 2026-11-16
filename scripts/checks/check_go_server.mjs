@@ -1,0 +1,890 @@
+/*
+===========================================================================
+
+Go Server Verification Gate
+
+Module hygiene (`go mod tidy -diff` for the module and the lint tool module,
+gofmt, `go vet`, golangci-lint), every package's tests, the race detector on
+the concurrency-owning packages, and govulncheck (pinned in go.mod as a
+tool). golangci-lint is pinned in its own tool module,
+tools/golangci-lint/go.mod, so the repository's Go toolchain builds it.
+
+Speed. Each step declares the inputs it reads; a step whose inputs match
+a recorded pass (checkStamps.mjs) reports "up to date" without running, so
+an edit re-runs only the steps it can affect (a test-only edit never
+re-runs govulncheck). SRO_CHECK_FORCE=1 runs every step. The steps that do
+run are independent, so they all run concurrently: hygiene,
+the tests, the race run and govulncheck. Each step's output is captured;
+a failure prints one report block per failed step - its exit status, the
+packages its output names as failed, then the full output - and the thrown
+error names the same, so a log that keeps only the error line still says
+which step failed, how it ended and which packages failed. Tests run as one
+`go test ./...` with SRO_GO_TEST_PARALLELISM package workers (default: half
+the cores), so one slow package no longer stalls a whole shard (measured
+2026-09-27: 40s with 8 workers against 61s for eight-package shards at 2).
+
+Go's test cache is on. A cached result is valid only for the inputs it was
+produced from, so every input must be visible to Go:
+  - the server game-data projection lives inside the module
+    (apps/server/.generated), where Go validates the files a test opened;
+  - the game data outside the module (the retail textdata and the
+    published client assets) is named by SRO_GAME_DATA_IDENTITY, which
+    clientdata.RequireGameData reads, so it joins every game-data test's key.
+Measured 2026-09-29: the projection outside the module made a fully cached
+run cost 105s, because Go resolved symlinks for each of ~89k logged file
+operations per package; inside it, a cached run of every package takes 10s.
+SRO_GO_TEST_CACHE=off restores -count=1 (flake hunting).
+Tiers. The everyday gate runs the tests with -short: whole-catalogue and
+brute-force evidence sweeps (marked tier.Long, internal/testsupport/tier)
+skip there, and every package's tests must finish inside
+TEST_BUDGET_SECONDS; a package over it fails the gate unless the shrinking
+ledger scripts/checks/go-test-budget.txt names it. A green run that trips
+the budget first re-measures the offenders alone (one package worker, no
+test cache) and judges those times, so a busy box cannot fail an all-green
+run (#2582); the packages still over then get one more launch and are
+judged by their better time, because a freshly linked test binary's first
+launch can pay a one-off process-init toll that is the box, not the
+package (#3306). SRO_GO_BUDGET_REMEASURE=off restores judging the full run's
+wall times directly. `--long`
+(check:server:long, and every release freeze) runs only the test steps,
+without -short, so the sweeps run; neither tier needs a hosted CI.
+SRO_GO_GATES=label,label runs only the named steps (CI spreads the gate
+over parallel runners); an unknown label is an error, never a silent pass.
+Changed scope. `--changed` (check:server:changed) is the pre-push form: the
+Go packages the branch changes since its merge base with origin/main,
+committed or not. It runs gofmt, a whole-module `go build`, vet and
+golangci-lint on those packages, their tests plus internal/gates (the
+architecture boundaries any package change can break), the race detector on
+the ones in the race list, and tidy only when go.mod or go.sum changed. It
+leaves govulncheck and the release contract to the full gate, and never
+reads or writes a pass stamp: a scoped pass is no evidence for the full one.
+It is not a heavy run, so it needs no machine-wide slot.
+
+On Windows every Go command runs with the C compiler's own directory first
+on PATH. Git for Windows ships older copies of the MinGW runtime DLLs in
+Git\mingw64\bin, and a Git-launched shell (Git Bash, the pre-push hook) puts
+that directory first. gcc's cc1 then loads the wrong DLLs and dies silently,
+Go's probe of the external linker fails, and Go falls back to legacy link
+flags that leave ASLR on - which ThreadSanitizer cannot run under
+("failed to allocate ... error code: 87"). Pinning the compiler's directory
+makes the race step independent of how the gate was launched.
+
+===========================================================================
+*/
+
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { publicAssetsRoot, retailTextdataRoot } from "../build/world/paths.mjs";
+import { sharedCacheEnvironment } from "../lib/goEnvironment.mjs";
+import { findPass, fingerprintOf, recordPass, snapshotAsync } from "./checkStamps.mjs";
+import {
+	betterSoloTimes,
+	budgetOffenders,
+	isLintRunnerRefusal,
+	overBudgetPackages,
+	packageTestTimes,
+	soloVerdicts
+} from "./goTestBudget.mjs";
+import { failureSummary, persistFailureReports, printFailureReports } from "./failureReport.mjs";
+
+const scriptDirectory = path.dirname( fileURLToPath( import.meta.url ) );
+const rebuildRoot = path.resolve( scriptDirectory, "..", ".." );
+const serverRoot = path.join( rebuildRoot, "apps", "server" );
+const packageParallelism = positiveInteger(
+	process.env.SRO_GO_TEST_PARALLELISM,
+	Math.max( 2, Math.floor( os.availableParallelism() / 2 ) )
+);
+const testCache = process.env.SRO_GO_TEST_CACHE !== "off";
+// A green run that trips the test budget re-measures the offenders alone
+// before it may reject them (withinTestBudget); off judges the full run's
+// wall times directly.
+const budgetRemeasure = process.env.SRO_GO_BUDGET_REMEASURE !== "off";
+const startedAt = performance.now();
+const lintModfile = "tools/golangci-lint/go.mod";
+const STEP_ENVIRONMENT = [
+	"SRO_REQUIRE_GAME_DATA",
+	"SRO_SERVER_GAME_DATA_ROOT",
+	"SRO_SERVER_GAME_DATA_MANIFEST_DIGEST",
+	"SRO_SERVER_GAME_DATA_CACHE_ROOT",
+	"GOFLAGS",
+	"GOOS",
+	"GOARCH",
+	"CGO_ENABLED",
+	"GOEXPERIMENT"
+];
+// TEST_BUDGET_SECONDS is the most one package's everyday tests may take.
+const TEST_BUDGET_SECONDS = 30;
+// SOLO_RUN_ATTEMPTS is how often one budget re-measure launch may run
+// before it gives up: one retry, for a solo run killed by the box (#2971).
+const SOLO_RUN_ATTEMPTS = 2;
+// A golangci-lint parallel-runner refusal (another session holds the
+// tool's cache lock) is waited out and retried this many times before
+// the step may fail: peer lint runs are minutes, not seconds (#2971).
+const LINT_REFUSAL_RETRIES = 12;
+const LINT_REFUSAL_WAIT_SECONDS = 10;
+const VULNERABILITY_DATABASE_INDEX = "https://vuln.go.dev/index/db.json";
+// A database update is noticed within this long; govulncheck itself always
+// scans against the live database. The key is kept under .state.
+const VULNERABILITY_DATABASE_KEY_MS = 15 * 60 * 1000;
+const vulnerabilityDatabaseKeyPath = path.join( rebuildRoot, ".state", "check-stamps", "vulndb-index.json" );
+// Built on first use by goEnvironment().
+let goEnvironmentValue;
+const racePackages = [
+	"./internal/agent/api",
+	"./internal/agent/server",
+	"./internal/security/auth",
+	"./internal/transport/worldsession",
+	"./internal/cluster/shard",
+	"./internal/data/store",
+	"./internal/transport"
+];
+
+// Everything a step can read under the module, in one snapshot; each step
+// digests its share. The snapshot, the toolchain query and the database
+// key are independent and run concurrently.
+const [moduleFiles, goVersion, vulnerabilityDatabase] = await Promise.all( [
+	snapshotAsync( [ "apps/server" ] ),
+	commandOutput( "go", [ "version" ] ),
+	vulnerabilityDatabaseModified()
+] );
+const gameIdentity = gameDataIdentity();
+const toolchain = `=${goVersion}`;
+// Environment that changes what a step checks: a pass under one setting is
+// no evidence for another (SRO_REQUIRE_GAME_DATA=1 turns skips into failures).
+const stepEnvironment = "=env " +
+	JSON.stringify( STEP_ENVIRONMENT.map( ( name ) => [ name, process.env[name] ?? null ] ) );
+
+// Step file selections, as repository-relative paths.
+const isModuleGo = ( file ) => file.endsWith( ".go" ) || file === "apps/server/go.mod" || file === "apps/server/go.sum";
+const isLintTool = ( file ) => file.startsWith( "apps/server/tools/golangci-lint/" );
+const isFormatted = ( file ) =>
+	file.endsWith( ".go" ) && (file.startsWith( "apps/server/cmd/" ) || file.startsWith( "apps/server/internal/" ));
+const isScannedGo = ( file ) =>
+	(file.endsWith( ".go" ) && !file.endsWith( "_test.go" )) || file === "apps/server/go.mod" ||
+	file === "apps/server/go.sum";
+const testKeys = [
+	"!apps/server/.generated/game-data/1.150/server/manifest.json",
+	`=game-data ${gameIdentity}`,
+	`=cache ${testCache} p ${packageParallelism}`,
+	toolchain,
+	stepEnvironment
+];
+
+// The long tier runs the evidence sweeps the everyday -short run skips.
+const longTier = process.argv.includes( "--long" ) || process.env.SRO_GO_LONG_TESTS === "1";
+const tierArgs = longTier ? [] : [ "-short" ];
+testKeys.push( `=tier ${longTier ? "long" : "short"}` );
+const testArgs = [ "test", `-p=${packageParallelism}`, ...tierArgs, ...(testCache ? [] : [ "-count=1" ]), "./..." ];
+const budgetLedger = readBudgetLedger();
+const changedScope = process.argv.includes( "--changed" ) || process.env.SRO_GO_SCOPE === "changed";
+if ( changedScope && longTier ) throw new Error( "--changed and --long do not combine: the long tier is a full run" );
+const steps = selectSteps(
+	longTier ? "tests (long tier),race" : process.env.SRO_GO_GATES,
+	scopeSteps( [
+		{
+			label: "tidy",
+			command: "go",
+			args: [ "mod", "tidy", "-diff" ],
+			select: isModuleGo,
+			keys: [ toolchain, stepEnvironment ]
+		},
+		{
+			label: "tidy (lint tool)",
+			command: "go",
+			args: [ "-C", path.dirname( lintModfile ), "mod", "tidy", "-diff" ],
+			select: isLintTool,
+			keys: [ toolchain, stepEnvironment ]
+		},
+		{
+			label: "gofmt",
+			command: "gofmt",
+			args: [ "-l", "cmd", "internal" ],
+			accept: ( output ) => output.trim().length === 0,
+			select: isFormatted,
+			keys: [ toolchain, stepEnvironment ]
+		},
+		{
+			label: "vet",
+			command: "go",
+			args: [ "vet", "./..." ],
+			select: isModuleGo,
+			keys: [ toolchain, stepEnvironment ]
+		},
+		{
+			label: "golangci-lint",
+			command: "go",
+			// Serialized like the changed scope: another session's lint run
+			// holds the tool's cache lock, and the default refusal
+			// ("parallel golangci-lint is running", exit 3) is shared-box
+			// contention, not a finding (#2971). Serial runners wait on
+			// that lock instead of failing; runStep also retries a refusal
+			// that still slips through (a runner started without the flag).
+			args: [ "tool", `-modfile=${lintModfile}`, "golangci-lint", "run", "--allow-serial-runners", "./..." ],
+			select: ( file ) => isModuleGo( file ) || isLintTool( file ) || file === "apps/server/.golangci.yml",
+			keys: [ toolchain, stepEnvironment ]
+		},
+		{
+			label: longTier ? "tests (long tier)" : "tests",
+			command: "go",
+			args: testArgs,
+			accept: longTier ? undefined : withinTestBudget,
+			select: () => true,
+			keys: [
+				...testKeys,
+				`=budget ${TEST_BUDGET_SECONDS} ${budgetLedger.join( "," )} remeasure=${budgetRemeasure}`
+			]
+		},
+		{
+			label: "race",
+			command: "go",
+			args: [ "test", "-race", ...tierArgs, ...(testCache ? [] : [ "-count=1" ]), ...racePackages ],
+			select: () => true,
+			keys: testKeys
+		},
+		{
+			// Only production code is scanned; the result also moves with the
+			// vulnerability database, so its modification time is a key.
+			label: "govulncheck",
+			command: "go",
+			args: [ "tool", "govulncheck", "./..." ],
+			select: isScannedGo,
+			keys: [ `=vulndb ${vulnerabilityDatabase}`, toolchain, stepEnvironment ]
+		},
+		{
+			// The compiled release protocol and schema must be what
+			// compatibility.json declares; release preparation checks the same.
+			label: "release contract",
+			command: "go",
+			args: [ "run", "./cmd/operations/sro-release-contract" ],
+			accept: matchesDeclaredServerContract,
+			select: ( file ) => isModuleGo( file ) || file === "apps/server/config/compatibility.json",
+			keys: [ toolchain, stepEnvironment ]
+		}
+	] )
+);
+
+// The test step runs alone first: its per-package times are what the budget
+// measures, and racing it against the race step (most of the gate's time)
+// inflated them past the budget. Every wave still runs, so one failure never
+// hides another; the first failure is thrown at the end.
+const isTestStep = ( step ) => step.label.startsWith( "tests" );
+let firstFailure = null;
+for (
+	const [name, group] of [
+		[ "tests", steps.filter( isTestStep ) ],
+		[ longTier ? "long tier" : "all", steps.filter( ( step ) => !isTestStep( step ) ) ]
+	]
+) {
+	if ( group.length === 0 ) continue;
+	try {
+		await wave( name, group );
+	} catch ( error ) {
+		firstFailure ??= error;
+	}
+}
+if ( firstFailure ) throw firstFailure;
+
+console.log(
+	`server gates: PASS (${packageParallelism} package workers, test cache ${testCache ? "on" : "off"}, ` +
+		`${formatSeconds( performance.now() - startedAt )}s)`
+);
+
+/*
+================
+withinTestBudget
+
+Accepts the everyday test output when every package that ran finished
+inside TEST_BUDGET_SECONDS, or is still named in the budget ledger. Cached
+packages ("(cached)") cost nothing and are not timed. Prints every package
+over budget, ledger or not, so the ledger can only shrink.
+
+A green run that still trips the budget has usually measured the box, not
+the packages: parallel suites on one machine inflate every wall time
+together (#2582). The offenders are then re-measured alone
+(remeasureOffenders) and the budget judges those solo times instead; a
+package still over budget alone is rejected with its solo time as the
+evidence. SRO_GO_BUDGET_REMEASURE=off judges the full run's times
+directly, the original behaviour.
+================
+*/
+async function withinTestBudget( output ) {
+	for ( const { pkg, seconds } of overBudgetPackages( output, TEST_BUDGET_SECONDS ) ) {
+		const listed = budgetLedger.includes( pkg );
+		console.log(
+			`test budget: ${pkg} took ${seconds}s (budget ${TEST_BUDGET_SECONDS}s)${listed ? ", in ledger" : ""}`
+		);
+	}
+	const offenders = budgetOffenders( output, TEST_BUDGET_SECONDS, budgetLedger );
+	if ( offenders.length === 0 ) {
+		return true;
+	}
+	if ( budgetRemeasure ) {
+		const solo = await remeasureOffenders( offenders );
+		if ( solo !== null ) {
+			return solo;
+		}
+	}
+	console.log(
+		`test budget: ${offenders.length} package(s) over ${TEST_BUDGET_SECONDS}s; make them faster or move ` +
+			"evidence sweeps to tier.Long (internal/testsupport/tier)"
+	);
+	return false;
+}
+
+/*
+================
+remeasureOffenders
+
+Runs the offenders' packages alone - one package worker, no test cache -
+and judges their solo times against the budget. A package still over on
+its solo time gets one more launch and is judged by its better time: the
+first launch of a freshly linked test binary can pay a one-off toll
+(process init under Windows AV scanning; #3306) that the solo run exists
+to exclude, and a package genuinely over budget is over on both launches.
+Returns null when the re-measure itself produced no verdict (its run
+failed), leaving the full run's times to judge as before; the re-measure's
+output tail is printed either way it fails, so the evidence is never
+silent. Prints each offender's two times when it does judge.
+================
+*/
+/**
+ * @param {{ pkg: string, seconds: number }[]} offenders
+ * @returns {Promise<boolean | null>}
+ */
+async function remeasureOffenders( offenders ) {
+	const packages = offenders.map( ( { pkg } ) => pkg );
+	console.log(
+		`test budget: re-measuring ${packages.length} package(s) alone (-p=1, -count=1); ` +
+			"a busy box inflates the full run's wall times together"
+	);
+	const rerun = await soloRun( packages );
+	if ( !rerun?.ok ) {
+		console.log( "test budget: the re-measure run failed; judging the full run's times" );
+		console.log( (rerun?.output ?? "").split( "\n" ).slice( -40 ).join( "\n" ) );
+		return null;
+	}
+	const soloTimes = packageTestTimes( rerun.output );
+	const verdicts = soloVerdicts( offenders, soloTimes, TEST_BUDGET_SECONDS );
+	for ( const { pkg, seconds, solo } of verdicts ) {
+		console.log(
+			`test budget: ${pkg} took ${seconds}s in the full run, ${
+				solo === undefined ? "no solo time" : `${solo}s alone`
+			}`
+		);
+	}
+	const stillOver = verdicts.filter( ( { fits } ) => !fits );
+	if ( stillOver.length === 0 ) {
+		return true;
+	}
+	// One more launch for the packages still over, judged by the better
+	// time (betterSoloTimes): the first launch above may itself have paid
+	// the toll this re-measure exists to exclude (#3306). Only these
+	// packages pay the extra run, so a healthy gate never runs it.
+	console.log(
+		`test budget: ${stillOver.length} package(s) still over alone; one more launch each, ` +
+			"judged by the better time"
+	);
+	const second = await soloRun( stillOver.map( ( { pkg } ) => pkg ) );
+	if ( !second?.ok ) {
+		// The first launch's times are still over, so the verdict stands.
+		console.log( "test budget: the second solo run failed; judging the first launch's times" );
+		console.log( (second?.output ?? "").split( "\n" ).slice( -40 ).join( "\n" ) );
+		return false;
+	}
+	const judged = soloVerdicts(
+		offenders,
+		betterSoloTimes( soloTimes, packageTestTimes( second.output ) ),
+		TEST_BUDGET_SECONDS
+	);
+	for ( const { pkg, solo } of judged ) {
+		if ( stillOver.some( ( over ) => over.pkg === pkg ) ) {
+			console.log(
+				`test budget: ${pkg} judged by its better launch, ${
+					solo === undefined ? "no solo time" : `${solo}s alone`
+				}`
+			);
+		}
+	}
+	return judged.every( ( { fits } ) => fits );
+}
+
+/*
+================
+soloRun
+
+One solo test run of the given packages (one package worker, no test
+cache), with one retry: the solo run itself can die to the same loaded
+box (or to a peer's cache lock), and a single such death would reject a
+package the solo pass exists to clear (#2971). Both re-measure launches
+go through here, so the second launch (#3306) has the same retry as the
+first. Returns the last attempt's step result.
+================
+*/
+/**
+ * @param {string[]} packages
+ */
+async function soloRun( packages ) {
+	let run = null;
+	for ( let attempt = 1; attempt <= SOLO_RUN_ATTEMPTS; attempt++ ) {
+		run = await runStep(
+			"tests (budget re-measure)",
+			"go",
+			[ "test", "-p=1", ...tierArgs, "-count=1", ...packages ],
+			undefined
+		);
+		if ( run.ok ) {
+			break;
+		}
+		if ( attempt < SOLO_RUN_ATTEMPTS ) {
+			console.log( "test budget: the re-measure run failed; measuring once more" );
+		}
+	}
+	return run;
+}
+
+/*
+================
+readBudgetLedger
+
+The packages still allowed over the budget, one import path per line; the
+ledger only shrinks.
+================
+*/
+function readBudgetLedger() {
+	const file = path.join( rebuildRoot, "scripts", "checks", "go-test-budget.txt" );
+	let text = "";
+	try {
+		text = readFileSync( file, "utf8" );
+	} catch {
+		return [];
+	}
+	return text.split( "\n" ).map( ( line ) => line.replace( /#.*/, "" ).trim() ).filter( Boolean );
+}
+
+/*
+================
+changedGoPackages
+
+The module's packages (as ./dir) that hold a .go file changed since the
+merge base with origin/main, committed, staged, unstaged or untracked, and
+whether go.mod, go.sum or the lint tool module changed.
+================
+*/
+function changedGoPackages() {
+	const git = ( args ) => {
+		const result = spawnSync( "git", args, { cwd: rebuildRoot, encoding: "utf8" } );
+		if ( result.status !== 0 ) throw new Error( `git ${args.join( " " )}: ${result.stderr.trim()}` );
+		return result.stdout.split( "\n" ).map( ( line ) => line.trim() ).filter( Boolean );
+	};
+	const [base] = git( [ "merge-base", "HEAD", "origin/main" ] );
+	const files = new Set( [
+		...git( [ "diff", "--name-only", base, "--", "apps/server" ] ),
+		...git( [ "ls-files", "--others", "--exclude-standard", "--", "apps/server" ] )
+	] );
+	const packages = new Set();
+	for ( const file of files ) {
+		if ( !file.endsWith( ".go" ) ) continue;
+		try {
+			statSync( path.join( rebuildRoot, file ) );
+		} catch {
+			continue; // deleted: its package's other files still count if changed
+		}
+		packages.add( "./" + path.posix.dirname( file.slice( "apps/server/".length ) ) );
+	}
+	return {
+		base,
+		packages: [ ...packages ].sort(),
+		goMod: files.has( "apps/server/go.mod" ) || files.has( "apps/server/go.sum" ),
+		lintTool: [ ...files ].some( isLintTool )
+	};
+}
+
+/*
+================
+scopeSteps
+
+The full step list, or under --changed its pre-push form (see the header):
+the package-wide steps narrowed to the changed packages, a whole-module
+build added first, and the steps the scope leaves to the full gate dropped.
+================
+*/
+function scopeSteps( steps ) {
+	if ( !changedScope ) return steps;
+	const changed = changedGoPackages();
+	console.log(
+		`server gates: changed scope since ${changed.base.slice( 0, 9 )}: ${changed.packages.length} packages`
+	);
+	if ( changed.packages.length === 0 ) return [];
+	const testPackages = [ ...new Set( [ ...changed.packages, "./internal/gates" ] ) ];
+	const raced = racePackages.filter( ( pkg ) => changed.packages.includes( pkg ) );
+	const scoped = [ { label: "build", command: "go", args: [ "build", "./..." ], select: () => true, keys: [] } ];
+	for ( const step of steps ) {
+		switch ( step.label ) {
+			case "tidy":
+				if ( changed.goMod ) scoped.push( step );
+				break;
+			case "tidy (lint tool)":
+				if ( changed.lintTool ) scoped.push( step );
+				break;
+			case "vet":
+				scoped.push( { ...step, args: [ "vet", ...changed.packages ] } );
+				break;
+			case "golangci-lint":
+				// Serialized: another session's lint run holds the cache lock.
+				scoped.push( {
+					...step,
+					args: [ ...step.args.slice( 0, -1 ), "--allow-serial-runners", ...changed.packages ]
+				} );
+				break;
+			case "tests":
+				scoped.push( { ...step, args: [ ...step.args.slice( 0, -1 ), ...testPackages ] } );
+				break;
+			case "race":
+				if ( raced.length ) {
+					scoped.push( { ...step, args: [ ...step.args.slice( 0, -racePackages.length ), ...raced ] } );
+				}
+				break;
+			case "gofmt":
+				scoped.push( step );
+				break;
+			default:
+				break; // govulncheck and the release contract: the full gate's
+		}
+	}
+	return scoped;
+}
+
+/*
+================
+selectSteps
+
+The steps a comma-separated label list names, in gate order; every step
+when the list is empty. A label no step has is a configuration error.
+================
+*/
+function selectSteps( list, steps ) {
+	const wanted = (list ?? "").split( "," ).map( ( label ) => label.trim() ).filter( Boolean );
+	if ( !wanted.length ) return steps;
+	const unknown = wanted.filter( ( label ) => !steps.some( ( step ) => step.label === label ) );
+	if ( unknown.length ) throw new Error( `SRO_GO_GATES names unknown steps: ${unknown.join( ", " )}` );
+	return steps.filter( ( step ) => wanted.includes( step.label ) );
+}
+
+/*
+================
+wave
+
+Runs the steps concurrently. A step whose inputs match a recorded pass
+(checkStamps.mjs) reports "up to date" instead of running. Each step's
+output is captured, so concurrent steps never interleave; a failure prints
+one failureReport block per failed step. A step fails on a non-zero exit,
+or when its accept() predicate rejects the output; a pass records its
+stamp.
+================
+*/
+async function wave( name, steps ) {
+	const waveStarted = performance.now();
+	const results = await Promise.all( steps.map( async ( step ) => {
+		if ( changedScope ) return runStep( step.label, step.command, step.args, step.accept );
+		const stampName = `server-${step.label.replace( /[^a-z0-9]+/gi, "-" )}`;
+		const key = fingerprintOf( moduleFiles, step.select, step.keys );
+		if ( findPass( stampName, key ) ) {
+			return { label: step.label, ok: true, output: "", seconds: "up to date" };
+		}
+		const result = await runStep( step.label, step.command, step.args, step.accept );
+		if ( result.ok ) recordPass( stampName, key );
+		return result;
+	} ) );
+	const failed = results.filter( ( result ) => !result.ok );
+	if ( failed.length > 0 ) {
+		// Persisted before anything can lose them: a captured log that
+		// truncates keeps no step name to attribute, the artifact does.
+		const artifactDir = path.join( rebuildRoot, ".state", "gate-failures", name );
+		const written = await persistFailureReports( failed, artifactDir );
+		// Drained before the throw, or a pipe keeps only the report's head.
+		await printFailureReports( failed );
+		if ( written.length > 0 ) {
+			process.stderr.write( `failure reports also written to ${artifactDir}\n` );
+		}
+		throw new Error(
+			`server ${name}: ${failed.map( ( result ) => failureSummary( result ) ).join( ", " )}`
+		);
+	}
+	console.log(
+		`server ${name}: ${
+			results.map( ( result ) =>
+				`${result.label} ${result.seconds}${result.seconds === "up to date" ? "" : "s"}`
+			)
+				.join( ", " )
+		} ` +
+			`(wave ${formatSeconds( performance.now() - waveStarted )}s)`
+	);
+}
+
+/*
+================
+matchesDeclaredServerContract
+
+The sro-release-contract report equals the server declaration field for
+field; anything else (extra, missing or different) is a failed step.
+================
+*/
+function matchesDeclaredServerContract( output ) {
+	const declared = JSON.parse( readFileSync( path.join( serverRoot, "config/compatibility.json" ), "utf8" ) ).server;
+	// The step's output also carries Go's own progress ("go: downloading ..."
+	// on a cold module cache): the contract is the one JSON line it prints.
+	const line = output.split( /\r?\n/ ).reverse().find( ( row ) => row.trim().startsWith( "{" ) );
+	let compiled;
+	try {
+		compiled = JSON.parse( line ?? "" );
+	} catch {
+		return false;
+	}
+	const keys = Object.keys( declared ).sort();
+	return JSON.stringify( keys ) === JSON.stringify( Object.keys( compiled ).sort() ) &&
+		keys.every( ( key ) => compiled[key] === declared[key] );
+}
+
+/*
+================
+vulnerabilityDatabaseModified
+
+The Go vulnerability database's modification time, re-read from the index
+at most every VULNERABILITY_DATABASE_KEY_MS. When it cannot be read the key
+is unique, so govulncheck runs (and reports the network failure itself)
+rather than being skipped on a stale verdict.
+================
+*/
+async function vulnerabilityDatabaseModified() {
+	try {
+		const kept = JSON.parse( readFileSync( vulnerabilityDatabaseKeyPath, "utf8" ) );
+		if ( Date.now() - kept.readAt < VULNERABILITY_DATABASE_KEY_MS && typeof kept.modified === "string" ) {
+			return kept.modified;
+		}
+	} catch {
+		// No kept key yet: read the index.
+	}
+	try {
+		const response = await fetch( VULNERABILITY_DATABASE_INDEX, { signal: AbortSignal.timeout( 5000 ) } );
+		if ( !response.ok ) throw new Error( `HTTP ${response.status}` );
+		const index = await response.json();
+		if ( typeof index.modified !== "string" ) throw new Error( "no modified field" );
+		mkdirSync( path.dirname( vulnerabilityDatabaseKeyPath ), { recursive: true } );
+		writeFileSync(
+			vulnerabilityDatabaseKeyPath,
+			JSON.stringify( { modified: index.modified, readAt: Date.now() } )
+		);
+		return index.modified;
+	} catch ( error ) {
+		return `unavailable ${Date.now()} ${error}`;
+	}
+}
+
+/*
+================
+commandOutput
+
+A command's trimmed stdout, without blocking the event loop.
+================
+*/
+function commandOutput( command, args ) {
+	return new Promise( ( resolve ) => {
+		const child = spawn( command, args, { windowsHide: true, cwd: serverRoot } );
+		let output = "";
+		child.stdout.on( "data", ( chunk ) => {
+			output += chunk;
+		} );
+		child.on( "error", ( error ) => resolve( `error ${error}` ) );
+		child.on( "close", () => resolve( output.trim() ) );
+	} );
+}
+
+/*
+================
+goEnvironment
+
+The environment every Go step runs with, built on first use: when every
+step is up to date, no compiler or flag lookup runs. Every step compiles
+with -trimpath (goEnvironment.mjs), so this checkout reuses what any other
+checkout of the same sources already put in the build cache.
+================
+*/
+function goEnvironment() {
+	goEnvironmentValue ??= {
+		...sharedCacheEnvironment( compilerFirstEnvironment() ),
+		SRO_GAME_DATA_IDENTITY: gameIdentity
+	};
+	return goEnvironmentValue;
+}
+
+/*
+================
+runStep
+================
+*/
+/**
+ * @param {string} label
+ * @param {string} command
+ * @param {string[]} args
+ * @param {((output: string) => boolean | Promise<boolean>) | undefined} accept
+ * @returns {Promise<{ label: string, ok: boolean, code: number | null, signal: string | null, output: string, seconds: string }>}
+ */
+async function runStep( label, command, args, accept ) {
+	const stepStarted = performance.now();
+	let result = await runStepOnce( label, command, args, accept );
+	// A golangci-lint parallel-runner refusal is another session holding
+	// the tool's cache lock (#2971): contention, not a finding. The step
+	// now runs --allow-serial-runners, which waits on that lock, but a
+	// refusal can still arrive (a peer binary predating the flag, a lock
+	// released and retaken between attempts). Wait briefly and retry a
+	// bounded number of times; a refusal that outlives the retries is
+	// reported as the failure it then is.
+	for (
+		let attempt = 1;
+		!result.ok && isLintRunnerRefusal( result.output ) && attempt <= LINT_REFUSAL_RETRIES;
+		attempt++
+	) {
+		console.log(
+			`${label}: another golangci-lint instance is running; waiting ` +
+				`${LINT_REFUSAL_WAIT_SECONDS}s and retrying (${attempt}/${LINT_REFUSAL_RETRIES})`
+		);
+		await sleep( LINT_REFUSAL_WAIT_SECONDS * 1000 );
+		result = await runStepOnce( label, command, args, accept );
+	}
+	return { ...result, seconds: formatSeconds( performance.now() - stepStarted ) };
+}
+
+/*
+================
+sleep
+
+The lint-refusal wait, as a promise.
+================
+*/
+/** @param {number} ms */
+function sleep( ms ) {
+	return new Promise( ( resolve ) => setTimeout( resolve, ms ) );
+}
+
+/*
+================
+runStepOnce
+
+One spawn of a step's command, its output captured whole. ok is a zero
+exit that the step's accept() predicate (when it has one) also accepts.
+================
+*/
+/**
+ * @param {string} label
+ * @param {string} command
+ * @param {string[]} args
+ * @param {((output: string) => boolean | Promise<boolean>) | undefined} accept
+ * @returns {Promise<{ label: string, ok: boolean, code: number | null, signal: string | null, output: string, seconds: string }>}
+ */
+function runStepOnce( label, command, args, accept ) {
+	const stepStarted = performance.now();
+	return new Promise( ( resolve ) => {
+		const child = spawn( command, args, { windowsHide: true, cwd: serverRoot, env: goEnvironment() } );
+		let output = "";
+		child.stdout.on( "data", ( chunk ) => {
+			output += chunk;
+		} );
+		child.stderr.on( "data", ( chunk ) => {
+			output += chunk;
+		} );
+		child.on( "error", ( error ) => {
+			output += String( error );
+		} );
+		child.on( "close", async ( code, signal ) => {
+			const ok = code === 0 && (accept === undefined || await accept( output ));
+			resolve( { label, ok, code, signal, output, seconds: formatSeconds( performance.now() - stepStarted ) } );
+		} );
+	} );
+}
+
+/*
+================
+compilerFirstEnvironment
+
+Returns the process environment with the directory of Go's C compiler
+(`go env CC`, resolved on PATH) moved to the front of PATH on Windows, so
+the compiler loads its own runtime DLLs. Elsewhere, or when the compiler
+cannot be found, the environment is returned unchanged and Go reports the
+missing compiler itself.
+================
+*/
+function compilerFirstEnvironment() {
+	if ( process.platform !== "win32" ) {
+		return process.env;
+	}
+	const compiler =
+		spawnSync( "go", [ "env", "CC" ], { windowsHide: true, cwd: serverRoot, encoding: "utf8" } ).stdout?.trim() ||
+		"gcc";
+	const located = spawnSync( "where.exe", [ compiler ], { windowsHide: true, encoding: "utf8" } );
+	const compilerPath = located.status === 0 ? located.stdout.split( /\r?\n/ )[0].trim() : "";
+	if ( compilerPath.length === 0 ) {
+		return process.env;
+	}
+
+	const pathKey = Object.keys( process.env ).find( ( key ) => key.toUpperCase() === "PATH" ) ?? "PATH";
+	return {
+		...process.env,
+		[pathKey]: `${path.dirname( compilerPath )}${path.delimiter}${process.env[pathKey] ?? ""}`
+	};
+}
+
+/*
+================
+gameDataIdentity
+
+A digest of the game data the server's tests read from outside the
+module: the stat of every retail textdata file and the published pack
+manifest's bytes (which pin every packed asset by sha256). Absent data
+contributes its absence, so building it later changes the identity.
+================
+*/
+function gameDataIdentity() {
+	const hash = createHash( "sha256" );
+	try {
+		for ( const name of readdirSync( retailTextdataRoot ).sort() ) {
+			const info = statSync( path.join( retailTextdataRoot, name ) );
+			hash.update( `${name}|${info.size}|${info.mtimeMs}\n` );
+		}
+	} catch ( error ) {
+		hash.update( `textdata ${error.code ?? error}\n` );
+	}
+	try {
+		hash.update( readFileSync( path.join( publicAssetsRoot, "packs", "manifest.json" ) ) );
+	} catch ( error ) {
+		hash.update( `packs ${error.code ?? error}\n` );
+	}
+	return hash.digest( "hex" );
+}
+
+/*
+================
+positiveInteger
+================
+*/
+/**
+ * @param {string | undefined} value
+ * @param {number} fallback
+ */
+function positiveInteger( value, fallback ) {
+	const parsed = Number( value );
+	return Number.isInteger( parsed ) && parsed > 0 ? parsed : fallback;
+}
+
+/*
+================
+formatSeconds
+================
+*/
+/** @param {number} elapsedMs */
+function formatSeconds( elapsedMs ) {
+	return (elapsedMs / 1000).toFixed( 1 );
+}

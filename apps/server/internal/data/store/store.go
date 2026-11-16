@@ -1,0 +1,765 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/platform/jsonscratch"
+)
+
+// Env configuration (documented in the operator's deployment guide).
+const (
+	// EnvStateDir overrides the authority directory.
+	EnvStateDir = "SRO_AUTHORITY_STATE_DIR"
+	// EnvRequireStore, when "1", makes a missing store a refusal instead
+	// of an empty first boot. The presence expectation lives outside the
+	// directory it guards, because no in-directory marker survives deletion
+	// of that directory.
+	EnvRequireStore = "SRO_AUTHORITY_REQUIRE"
+)
+
+// DirFromEnv returns the explicitly configured authority directory. There is
+// no process-wide fallback: a multi-shard server must either name its owned
+// shard through DirForShardFromEnv or receive an explicit deployment mount.
+func DirFromEnv() string {
+	return strings.TrimSpace(os.Getenv(EnvStateDir))
+}
+
+// DirForShardFromEnv resolves one GameWorld process's authority directory.
+// The explicit environment override supports deployment-mounted volumes;
+// otherwise each shard receives a different path by construction.
+func DirForShardFromEnv(shardID string) string {
+	if dir := DirFromEnv(); dir != "" {
+		return dir
+	}
+	return filepath.Join(".state", "shards", shardID, "authority")
+}
+
+func resolveAuthorityDir(dir string) (string, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		dir = DirFromEnv()
+	}
+	if dir == "" {
+		return "", fmt.Errorf(
+			"authority directory is required: pass one explicitly or set %s",
+			EnvStateDir,
+		)
+	}
+	return dir, nil
+}
+
+// Options configures Open.
+type Options struct {
+	// RequireStore refuses a missing store (production posture; see
+	// EnvRequireStore).
+	RequireStore bool
+	// Now injects the clock (tests); nil = time.Now.
+	Now func() time.Time
+	// DefaultSkills resolves the required racial base-attack creation set.
+	// CreateCharacter refuses when the seeder is absent or cannot resolve a
+	// complete set; current-schema records may never be skill-less.
+	DefaultSkills SkillSeedFunc
+	// DefaultQuests resolves the racial creation quest seed (the retail
+	// _RefCharDefault_Quest mechanism - internal/game/quest/seed.go; production
+	// wires quest.DefaultQuestSeeder over the loaded definitions).
+	// It is optional because no active quest is valid character state. A
+	// wired seeder that fails still refuses creation rather than installing a
+	// partial set.
+	DefaultQuests QuestSeedFunc
+	// DefaultInventory grants the creation choice's starter items and the
+	// starting gold (the retail _AddNewChar item insert), so the character
+	// list shows a new character dressed before its first world entry. It is
+	// optional: without it the first enter-world bootstrap grants them.
+	DefaultInventory InventorySeedFunc
+	// InventoryPages stamps the port-only 2.5-page base on a new record
+	// (SRO_INVENTORY_PAGES, #2769); false is the native 45.
+	InventoryPages bool
+	// AsyncCommit applies commits on the asynchronous writer
+	// (commit_writer.go, SRO_STORE_ASYNC_COMMIT, #2802); false is the
+	// native-default synchronous door. Port-only, not native.
+	AsyncCommit bool
+	// Context cancels the open (#3186): a stopped boot must leave
+	// within a second from whatever long step it sits in, and a
+	// cancelled open must never fall into the quarantine or
+	// bak-recovery rungs on its way out. Nil means context.Background.
+	Context context.Context
+	// OpenProbe is the test seam that holds an open step open; nil in
+	// production. A returned error stops the open.
+	OpenProbe func(ctx context.Context, step string) error
+	// readHeadroom widens the read window past StoreReadHeadroom; only
+	// this package's tests set it (#3091), production reads the
+	// constant alone.
+	readHeadroom int
+}
+
+// InventorySeedFunc installs the starter inventory and gold on a character
+// that has none. It resolves item references only; it cannot fail.
+type InventorySeedFunc func(c *domain.Character)
+
+// QuestSeedFunc answers the racial creation active-quest records (the
+// retail _RefCharDefault_Quest shape, codename-resolved by internal/game/quest).
+type QuestSeedFunc func(raceKey string) ([]domain.ActiveQuestRecord, error)
+
+// OptionsFromEnv builds the production Options from the environment.
+func OptionsFromEnv() Options {
+	return Options{RequireStore: os.Getenv(EnvRequireStore) == "1", AsyncCommit: asyncCommitEnabled()}
+}
+
+// Health is the store's observable write condition: runtime
+// write failures fail open and LOUD; this is the loud part tests, probes
+// and the acceptance suite read).
+type Health struct {
+	LastError     string
+	FailingSince  time.Time
+	FailedWrites  int
+	LastCommitAt  time.Time
+	LoadedFromBak bool
+	// IntegrityError is the background full check's verdict when it is
+	// not "ok" (boot_verify.go); empty while the check runs and when it
+	// passed.
+	IntegrityError string
+	// Commits counts the successful transactions since Open.
+	Commits uint64
+}
+
+// MetaView is a copy of the counters for boot logs and tests.
+type MetaView struct {
+	GidCounter uint32
+	NextCharID map[string]int64
+}
+
+// changeSet is the store-owned unit-of-work state. It has no lock of its own:
+// callers hold Store.mu while marking or consuming it so one SQLite
+// transaction can persist changes across character and social planes.
+type changeSet struct {
+	all            bool
+	characters     map[*domain.Character]bool
+	nextCharID     map[string]bool
+	nextGuildID    map[string]bool
+	mailboxes      map[mailboxKey]bool
+	guilds         map[guildKey]bool
+	camps          map[campKey]bool
+	dissolvedGuild map[guildKey]bool
+	dissolvedCamp  map[campKey]bool
+	// The meta planes the commit rewrites whole: true when a door
+	// touched the plane since the last commit, so the commit
+	// re-derives only the planes that can have moved (#3164).
+	tradeRewards   bool
+	jobRankings    bool
+	halloweenBoxes bool
+	// sookArenaAccounts is the survival arena's account plane (#3322).
+	sookArenaAccounts bool
+}
+
+func newChangeSet() changeSet {
+	return changeSet{
+		characters:     map[*domain.Character]bool{},
+		nextCharID:     map[string]bool{},
+		nextGuildID:    map[string]bool{},
+		mailboxes:      map[mailboxKey]bool{},
+		guilds:         map[guildKey]bool{},
+		camps:          map[campKey]bool{},
+		dissolvedGuild: map[guildKey]bool{},
+		dissolvedCamp:  map[campKey]bool{},
+	}
+}
+
+func (changes changeSet) empty() bool {
+	return !changes.all &&
+		len(changes.characters) == 0 &&
+		len(changes.nextCharID) == 0 &&
+		len(changes.nextGuildID) == 0 &&
+		len(changes.mailboxes) == 0 &&
+		len(changes.guilds) == 0 &&
+		len(changes.camps) == 0 &&
+		len(changes.dissolvedGuild) == 0 &&
+		len(changes.dissolvedCamp) == 0 &&
+		!changes.tradeRewards &&
+		!changes.jobRankings &&
+		!changes.halloweenBoxes &&
+		!changes.sookArenaAccounts
+}
+
+// groundState owns the boundary between the live gameplay registry and its
+// last durable snapshot. The registry retains entity lifecycle; Store owns
+// revision observation and persistence.
+type groundState struct {
+	source           GroundSnapshotSource
+	loadedRecords    map[string][]domain.GroundItemRecord
+	loadedGidCounter uint32
+	committedRev     uint64
+	revisionRecorded bool
+}
+
+// Store is the single authority for persisted gameplay state. One
+// instance per process; guarded by the authority.lock liveness file.
+//
+// In-memory state is the runtime authority (the pointer-identity
+// contract); the database is its crash-consistent shadow, advanced one
+// transaction per committed operation.
+type Store struct {
+	// mu is the authority lock; it records its waits and holds, and
+	// commits their phases (lock_timing.go).
+	mu      timedRWMutex
+	commits commitTiming
+	// checkpoints is the WAL's background checkpointer
+	// (wal_checkpoint.go): started by adoptDB, stopped by Close, nil
+	// whenever no database was adopted.
+	checkpoints *walCheckpointer
+	// economyFold is the ledger history fold/delete lane
+	// (economy_fold.go, #3187): started by adoptDB, stopped by Close
+	// before the store lock is taken, nil whenever no database was
+	// adopted.
+	economyFold *economyFoldLane
+	// The boot verifier (boot_verify.go): the full integrity check and
+	// the spare copy, after the store is adopted. integrityError is its
+	// one result, read by Health without a lock.
+	verifier       *bootVerifier
+	integrityError atomic.Pointer[string]
+	// writer is the asynchronous SQLite writer (commit_writer.go,
+	// SRO_STORE_ASYNC_COMMIT, port-only): started by adoptDB when the
+	// flag is on, stopped by Close, nil whenever commits apply in place.
+	writer *commitWriter
+	// queuedSeq is the sequence number of the last batch queued on
+	// writer (persistence.go); a durable door waits for it after the
+	// unlock (durableTicket).
+	queuedSeq uint64
+	// asyncCommit is Options.AsyncCommit: whether adoptDB starts writer.
+	asyncCommit bool
+	// encodeScratch is the commit path's reusable JSON encode buffer
+	// (db_write.go). Every encode through it runs under mu, which is
+	// the scratch's ownership domain; its records are consumed by the
+	// statement that follows each encode.
+	encodeScratch jsonscratch.Scratch
+	// beforeSQLiteCommit, nil in production, runs inside a commit's sqlite
+	// phase: tests make a commit slow to watch what waits on it.
+	beforeSQLiteCommit func()
+
+	dir       string
+	dbPath    string
+	dbBakPath string
+
+	db *sql.DB
+
+	characters map[string][]*domain.Character
+	// writeEpochs counts character-door writes per record, and
+	// writeEpochAll counts roster-wide writes (creates, reaps and
+	// commits that carry character rows). CharacterWriteEpoch reads
+	// the pair: a copy of a record taken at one epoch is identical to
+	// a copy taken at any later moment reporting the same epoch,
+	// because every write to the record passes a door below and bumps
+	// its count under the write lock (character_access.go).
+	writeEpochs   map[*domain.Character]uint64
+	writeEpochAll uint64
+	// characterLookups is the published per-division index (character_lookup.go).
+	characterLookups atomic.Pointer[map[string]*characterLookupIndex]
+	deleted          map[string][]json.RawMessage
+	meta             Meta
+
+	// mailboxes is the letter-mailbox plane (the memos table): division
+	// -> character id -> the ordered letter list. Slice order is the
+	// wire order (domain.LetterStore contract); mutation is
+	// copy-then-swap through MutateMailbox only.
+	mailboxes map[string]map[int64][]domain.LetterRecord
+	// residues are the unknown top-level fields of the rows the
+	// commit rewrites from the store's own state, kept from the load so
+	// a write never drops a newer release's data (json.go, #3090).
+	residues recordResidues
+	// schemaStamp and layoutStamp are the meta version stamps every
+	// commit writes: the loaded store's, or this binary's when higher
+	// (adoptDB). A store opened inside the read window keeps its newer
+	// stamps (#3091).
+	schemaStamp int
+	layoutStamp int
+	// readHeadroom is the read window this store opens with
+	// (StoreReadHeadroom, or a test's wider one).
+	readHeadroom int
+
+	// guilds / guildMembers are the guild plane (the guilds and
+	// guild_members tables): division -> guild id -> the guild row and
+	// its ordered member list. Member slice order is the wire order
+	// (domain.GuildStore contract); commands are copy-then-swap through
+	// the actor-authorized guild door, and the dirty unit is the WHOLE guild.
+	guilds       map[string]map[int64]domain.GuildRecord
+	guildMembers map[string]map[int64][]domain.GuildMemberRecord
+	// guildRevisions counts committed writes per guild (runtime-only):
+	// the tick's kept guild appearance keys on it, so this door - the
+	// guild plane's owner - does the invalidation. Dissolving a guild
+	// deletes its entry, and a missing entry reads as no revision.
+	guildRevisions map[guildKey]uint64
+	// guildViews is the memoised member-view plane (guilds.go
+	// guildMemberViewsLocked, #3291): the last projected roster per
+	// guild, validated against the stored rows and live levels on
+	// every read and republished only when either moved. guildViewMu
+	// guards the map alone - reads hold mu in read mode, which admits
+	// concurrent readers - and a published view is never mutated,
+	// only replaced.
+	guildViewMu sync.Mutex
+	guildViews  map[guildKey][]domain.GuildMemberRecord
+
+	// camps / campMembers are the training-camp plane (the
+	// training_camps and training_camp_members tables): the guild
+	// plane's twin for the mentor/academy lane. Member slice order is
+	// the wire order (domain.TrainingCampStore contract); the dirty
+	// unit is the WHOLE camp.
+	camps       map[string]map[int64]domain.TrainingCampRecord
+	campMembers map[string]map[int64][]domain.TrainingCampMemberRecord
+
+	// nameReservations is the held-name plane (the name_reservations
+	// table): division -> lower-cased name -> the reservation row. The
+	// dirty unit is one row, written inside the rename transaction.
+	nameReservations map[string]map[string]NameReservation
+
+	charDivision map[*domain.Character]string
+	// committedDigests is the last committed record digest per
+	// character (division, id): a dirty character whose encoded bytes
+	// still hash to it is not rewritten (persistence.go). Entries are
+	// staged inside a commit and retained only once its transaction
+	// commits - the ground plane's loadedRecords discipline. A door's
+	// own transaction retains the rows it wrote the same way, through
+	// characterRowTx (db_write.go), so no writer can leave an entry
+	// describing bytes the disk no longer holds.
+	committedDigests map[committedCharacterKey][32]byte
+	// committedRows is the digests' twin: a detached copy of each
+	// character as last committed (domain.CloneCharacter), staged and
+	// retained under exactly the digests' discipline. The commit
+	// compares a dirty character's sections against it and skips the
+	// encode when they all still match (character_sections.go). A
+	// copy exists only beside its digest: both are staged at the same
+	// writes and dropped at the same deletes.
+	committedRows map[committedCharacterKey]*domain.Character
+	// committedMetaDigests is the character digests' discipline for
+	// the meta planes the commit rewrites whole (trade rewards, job
+	// rankings, the version stamps): the last committed digest per
+	// meta key, staged inside a commit and retained only once its
+	// transaction commits (persistence.go).
+	committedMetaDigests map[string][32]byte
+	changes              changeSet
+	ground               groundState
+	// batch is the simulation tick's deferred commit (tickbatch.go).
+	batch tickBatch
+	// ledger attributes every committed gold change (economy_ledger.go).
+	ledger economyLedger
+	// trades holds the trade rows noted by committed trades until the
+	// commit that writes them (trade_history.go).
+	trades tradeHistoryState
+
+	// defaultSkills is Options.DefaultSkills and serves current-schema
+	// character creation.
+	defaultSkills SkillSeedFunc
+	// defaultQuests is Options.DefaultQuests and is used only at creation.
+	defaultQuests QuestSeedFunc
+	// defaultInventory is Options.DefaultInventory, used only at creation.
+	defaultInventory InventorySeedFunc
+	// inventoryPages is Options.InventoryPages, used only at creation.
+	inventoryPages bool
+
+	// requireStore is Options.RequireStore (the production posture);
+	// CreateCharacter's unseeded-creation refusal keys off it.
+	requireStore bool
+	// openCtx and openProbe are Open's cancellation lane (#3186);
+	// openCtx is never nil once Open has built the store.
+	openCtx   context.Context
+	openProbe func(ctx context.Context, step string) error
+	// releaseClaim drops this instance's hold on the process-wide
+	// single-writer claim (claimAuthority); nil once released by Close.
+	releaseClaim func()
+
+	now       func() time.Time
+	writeFile func(path string, payload []byte) error // failpoint seam (tests)
+	// commitFail is a test failpoint: when non-nil every commit fails
+	// with it (the database is never touched), exercising the
+	// fail-open-loud path.
+	commitFail error
+
+	health        Health
+	lastFailLogAt time.Time
+	// healthView is health as last published (publishHealthLocked), read by
+	// Health without s.mu so a readiness probe never queues behind a writer.
+	healthView atomic.Pointer[Health]
+}
+
+// failureLogInterval rate-limits repeat write-failure logs (first failure
+// always logs at Error).
+const failureLogInterval = 30 * time.Second
+
+// Open runs the load ladder: lock -> stray cleanup -> current database
+// (quarantine + bak fallback on corruption). An error means the caller must
+// refuse to serve.
+func Open(dir string, opts Options) (*Store, error) {
+	var err error
+	dir, err = resolveAuthorityDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureAuthorityDirectory(dir); err != nil {
+		return nil, fmt.Errorf("authority dir: %w", err)
+	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	openCtx := opts.Context
+	if openCtx == nil {
+		openCtx = context.Background()
+	}
+
+	s := &Store{
+		dir:                  dir,
+		dbPath:               filepath.Join(dir, DBFileName),
+		dbBakPath:            filepath.Join(dir, DBBakFileName),
+		characters:           map[string][]*domain.Character{},
+		writeEpochs:          map[*domain.Character]uint64{},
+		deleted:              map[string][]json.RawMessage{},
+		mailboxes:            map[string]map[int64][]domain.LetterRecord{},
+		guilds:               map[string]map[int64]domain.GuildRecord{},
+		guildMembers:         map[string]map[int64][]domain.GuildMemberRecord{},
+		guildRevisions:       map[guildKey]uint64{},
+		camps:                map[string]map[int64]domain.TrainingCampRecord{},
+		campMembers:          map[string]map[int64][]domain.TrainingCampMemberRecord{},
+		meta:                 Meta{NextCharID: map[string]int64{}, NextGuildID: map[string]int64{}},
+		charDivision:         map[*domain.Character]string{},
+		committedDigests:     map[committedCharacterKey][32]byte{},
+		committedRows:        map[committedCharacterKey]*domain.Character{},
+		committedMetaDigests: map[string][32]byte{},
+		changes:              newChangeSet(),
+		ground: groundState{
+			loadedRecords: map[string][]domain.GroundItemRecord{},
+		},
+		defaultSkills:    opts.DefaultSkills,
+		defaultQuests:    opts.DefaultQuests,
+		defaultInventory: opts.DefaultInventory,
+		inventoryPages:   opts.InventoryPages,
+		requireStore:     opts.RequireStore,
+		asyncCommit:      opts.AsyncCommit,
+		openCtx:          openCtx,
+		openProbe:        opts.OpenProbe,
+		readHeadroom:     max(StoreReadHeadroom, opts.readHeadroom),
+		now:              now,
+		writeFile:        writeFileAtomic,
+	}
+
+	// The claim comes FIRST: everything after it mutates the directory
+	// (stray cleanup, quarantine renames, bak refresh), and two racing
+	// openers must never perform that surgery concurrently. The claim
+	// holds an OS advisory lock on authority.lock for the store's whole
+	// lifetime - released by Close, or by the OS at process death (the
+	// kill model's free stale-lock reclaim).
+	release, warning, err := claimAuthority(dir, now())
+	if err != nil {
+		return nil, err
+	}
+	if warning != "" {
+		log.Warnf("store: %s", warning)
+	}
+	s.releaseClaim = release
+
+	for _, target := range []string{s.dbPath, s.dbBakPath} {
+		for _, stray := range cleanStrayTemps(target) {
+			log.Infof("store: removed stranded temp file %s (a previous writer was killed mid-write; the target itself is whole by construction)", stray)
+		}
+	}
+
+	if err := s.loadLadder(opts); err != nil {
+		s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+/*
+================
+openStep
+
+One checkpoint of the cancellable open (#3186): the test probe runs
+first, then the context's word stands. A cancelled context returns its
+own error straight up the ladder - Open closes the store, the claim is
+released, and nothing on the cancellation path ever quarantines a
+database or recovers from a bak.
+================
+*/
+func (s *Store) openStep(step string) error {
+	if s.openProbe != nil {
+		if err := s.openProbe(s.openCtx, step); err != nil {
+			return err
+		}
+	}
+	return s.openCtx.Err()
+}
+
+// loadLadder picks the current database generation, its recovery copy, or a
+// clean first boot.
+func (s *Store) loadLadder(opts Options) error {
+	if err := s.openStep("load ladder"); err != nil {
+		return err
+	}
+	dbExists := fileExists(s.dbPath)
+	dbBakExists := fileExists(s.dbBakPath)
+
+	if dbExists || dbBakExists {
+		return s.loadDBLadder(dbExists)
+	}
+
+	if opts.RequireStore {
+		return fmt.Errorf("%s missing and %s=1: refusing to boot empty in a store-required environment", s.dbPath, EnvRequireStore)
+	}
+	log.Infof("store: no %s - atomically initializing an empty development authority (production sets %s=1 and runs sro-init explicitly)", DBFileName, EnvRequireStore)
+	if err := s.openStep("initialize empty authority"); err != nil {
+		return err
+	}
+	if err := createAuthorityDatabase(s.dbPath, emptyAuthoritySeed(s.now().UnixMilli())); err != nil {
+		return fmt.Errorf("initializing empty development authority: %w", err)
+	}
+	db, loaded, err := s.openAndLoadDB(s.dbPath)
+	if err != nil {
+		if cErr := s.openCtx.Err(); cErr != nil {
+			return cErr
+		}
+		return fmt.Errorf("opening initialized development authority: %w", err)
+	}
+	s.adoptDB(db, loaded)
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// loadDBLadder reads the database with the quarantine -> bak -> refuse
+// chain.
+func (s *Store) loadDBLadder(mainExists bool) error {
+	if err := s.openStep("open database"); err != nil {
+		return err
+	}
+	if !mainExists {
+		// A missing MAIN with a live bak is a deleted main or a reboot
+		// that landed between a bak recovery and its first commit -
+		// never a first boot. The bak rung answers.
+		return s.recoverFromDBBak(fmt.Errorf("%s missing while %s exists", DBFileName, DBBakFileName))
+	}
+
+	db, loaded, err := s.openAndLoadDB(s.dbPath)
+	if err == nil {
+		s.adoptDB(db, loaded)
+		// The state tables proved good above. The full check and the
+		// single bak generation follow off the serving path, once per
+		// boot (boot_verify.go). A stop that already arrived starts
+		// neither (#3186): the boot is leaving, and the previous bak is
+		// still a good generation.
+		if s.openCtx.Err() == nil {
+			s.startBootVerifier()
+		}
+		return nil
+	}
+	// A cancellation is not corruption: it returns before the
+	// quarantine and bak rungs, untouched database and all (#3186).
+	if cErr := s.openCtx.Err(); cErr != nil {
+		return cErr
+	}
+	if refusedInPlace(err) {
+		// A healthy database this binary cannot serve, or one whose boot
+		// layout write failed on the volume. Not corruption: the file
+		// stays exactly where it is, and the older bak generation must
+		// NOT load - that would be a silent rollback.
+		// Refuse; the operator swaps the binary.
+		return err
+	}
+	quarantined, qErr := quarantineDB(s.dbPath, s.now())
+	if qErr != nil {
+		return fmt.Errorf("database unreadable (%v) and quarantine failed (%v)", err, qErr)
+	}
+	log.Errorf("store: %s failed to load (%v); quarantined to %s", DBFileName, err, quarantined)
+	return s.recoverFromDBBak(err)
+}
+
+// openAndLoadDB opens one database file and loads it fully; the handle
+// is closed on any failure. The open context stands over the whole
+// load (#3186): a cancellation closes the handle, which aborts
+// whichever step is running. The check before serving covers the state
+// tables only (boot_verify.go), so no step here scales with the
+// database's history.
+func (s *Store) openAndLoadDB(path string) (*sql.DB, *loadedDB, error) {
+	db, err := connectDB(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	started := time.Now()
+	stopCancelWatch := context.AfterFunc(s.openCtx, func() { _ = db.Close() })
+	defer stopCancelWatch()
+	if err := quickCheckState(s.openCtx, db); err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	checked := time.Since(started)
+	if err := s.openStep("load database"); err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	// A layout behind this binary's by additive steps inside the read
+	// window gains its empty tables first (#3094); loadDB then sees the
+	// current layout. Outside the window nothing is written.
+	if err := createBootLayoutTables(db, layoutSteps, s.readHeadroom); err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	loaded, err := loadDB(db, CurrentVersion, CurrentLayoutVersion, s.readHeadroom)
+	if err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	if err := s.openStep("configure database"); err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	if err := configureDB(db); err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	// The economy bucket tables (#3187) are created at open: purely
+	// additive, so no schema stamp moves and an older binary on the
+	// same file ignores them (loadDB has already shape-checked them
+	// when they existed).
+	if err := ensureEconomyBuckets(db); err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	// The market tables (port-only, SRO_CONSIGNMENT): additive too.
+	if err := ensureMarket(db); err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	// The referral tables (#3518) are additive the same way.
+	if err := ensureReferrals(db); err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	// The shrink runs here too, once the fold has emptied the old
+	// ledger rows into the file's freelist. It is housekeeping: a
+	// shrink that fails leaves a large, healthy file and must never
+	// send the boot down the quarantine ladder, so it reports and
+	// the open goes on. Only a stop that arrived meanwhile ends it.
+	vacuumIfFreelistDominates(s.openCtx, db)
+	if err := s.openStep("serve database"); err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	log.Infof("store: %s opened: state tables checked in %s, loaded in %s", filepath.Base(path),
+		checked.Round(time.Millisecond), (time.Since(started) - checked).Round(time.Millisecond))
+	return db, loaded, nil
+}
+
+// recoverFromDBBak is the ladder's last rung before refusal: restore the
+// previous generation into place (so a reboot before the next commit does
+// not land on the missing-main rung again), load it, and flag the
+// recovery LOUD YELLOW in Health.
+func (s *Store) recoverFromDBBak(cause error) error {
+	// Recovery is real work on the database's bytes; a boot that is
+	// already stopping leaves instead (#3186).
+	if err := s.openCtx.Err(); err != nil {
+		return err
+	}
+	bakPayload, bakReadErr := os.ReadFile(s.dbBakPath)
+	if bakReadErr != nil {
+		if os.IsNotExist(bakReadErr) {
+			return fmt.Errorf("database unusable (%v) and no %s exists: refusing to fabricate state - restore from the quarantine artifacts", cause, DBBakFileName)
+		}
+		return fmt.Errorf("database unusable (%v) and %s unreadable: %w", cause, DBBakFileName, bakReadErr)
+	}
+	// The bak is a compact checkpointed image; stale sidecars of the old
+	// main generation must not replay into it.
+	removeDBSidecars(s.dbPath)
+	if writeErr := s.writeFile(s.dbPath, bakPayload); writeErr != nil {
+		return fmt.Errorf("database unusable (%v) and restoring %s failed: %w", cause, DBBakFileName, writeErr)
+	}
+	db, loaded, err := s.openAndLoadDB(s.dbPath)
+	if err != nil {
+		if cErr := s.openCtx.Err(); cErr != nil {
+			return cErr
+		}
+		if isVersionMismatch(err) {
+			return fmt.Errorf("%s is for a different binary version: %w", DBBakFileName, err)
+		}
+		if refusedInPlace(err) {
+			// The restored bak read cleanly; only the boot's layout write
+			// failed on the volume. Keep it in place for the next boot.
+			return fmt.Errorf("%s restored, but its boot layout write failed: %w", DBBakFileName, err)
+		}
+		if quarantined, qErr := quarantine(s.dbBakPath, s.now()); qErr == nil {
+			log.Errorf("store: %s also failed to load (%v); quarantined to %s", DBBakFileName, err, quarantined)
+		}
+		return fmt.Errorf("database AND its bak are both unusable (quarantined): refusing to fabricate state - the quarantine artifacts hold the bytes")
+	}
+	s.adoptDB(db, loaded)
+	s.health.LoadedFromBak = true
+	s.publishHealthLocked()
+	log.Errorf("store: RECOVERED FROM %s (cause: %v) - the store is running on the previous generation (some recent progress may be missing); investigate the quarantine artifacts", DBBakFileName, cause)
+	return nil
+}
+
+// adoptDB installs a successfully loaded database into the store.
+func (s *Store) adoptDB(db *sql.DB, loaded *loadedDB) {
+	s.db = db
+	s.characters = loaded.characters
+	s.rebuildAllCharacterLookupsLocked()
+	s.deleted = loaded.deleted
+	s.ground.loadedRecords = loaded.ground
+	// loadDB allocates every plane map, so none is nil here.
+	s.mailboxes = loaded.mailboxes
+	s.guilds = loaded.guilds
+	s.guildMembers = loaded.guildMembers
+	s.camps = loaded.camps
+	s.campMembers = loaded.campMembers
+	s.nameReservations = loaded.nameReservations
+	s.meta = loaded.meta
+	// A load-seeded halloween plane (loadedDB.halloweenSeeded) holds
+	// derived bytes, not the disk's: flag it so the first commit
+	// writes its row, as every commit did before the plane skip.
+	if loaded.halloweenSeeded {
+		s.changes.halloweenBoxes = true
+	}
+	// The survival arena plane takes the same first-commit write when
+	// it was seeded from the schema 42 per-character counts (#3322).
+	if loaded.sookArenaSeeded {
+		s.changes.sookArenaAccounts = true
+	}
+	s.residues = loaded.residues
+	// The stamps every commit writes: never below what the store
+	// already holds (a newer store inside the read window keeps its
+	// own), never below this binary's.
+	s.schemaStamp = max(loaded.version, CurrentVersion)
+	s.layoutStamp = max(loaded.layout, CurrentLayoutVersion)
+	s.ground.loadedGidCounter = loaded.meta.GidCounter
+	s.charDivision = map[*domain.Character]string{}
+	s.committedDigests = map[committedCharacterKey][32]byte{}
+	s.committedRows = map[committedCharacterKey]*domain.Character{}
+	s.committedMetaDigests = map[string][32]byte{}
+	s.ledger.seen = map[*domain.Character]int64{}
+	for divisionID, records := range s.characters {
+		for _, c := range records {
+			s.charDivision[c] = divisionID
+			s.seedLedgerLocked(c)
+		}
+	}
+	// The writer handle adopted above never auto-checkpoints
+	// (configureDB); the background checkpointer copies its WAL
+	// instead (#2142 slice 0).
+	s.checkpoints = startWALCheckpointer(s.dbPath)
+	// The economy fold lane (#3187) folds the ledger's old rows into
+	// the hourly buckets and deletes them in bounded batches.
+	s.economyFold = startEconomyFold(s)
+	if s.asyncCommit && s.writer == nil {
+		s.writer = startCommitWriter(db, s.mu.now)
+	}
+}

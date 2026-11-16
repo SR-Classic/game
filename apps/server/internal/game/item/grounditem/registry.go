@@ -1,0 +1,709 @@
+/*
+===========================================================================
+
+registry.go - owns registry behavior and its checked data boundaries
+
+===========================================================================
+*/
+// Package grounditem holds the server-authoritative registry of items lying on
+// the ground, plus the distance and approach rules that decide when a pickup
+// may execute.
+//
+// Ground items belong to a division and one population lifetime. The neutral snapshot
+// values in domain feed the authority store, which commits them in the same
+// SQLite transaction as the character half of a drop or pickup. Gameplay
+// lookups and bootstrap rows filter the owning population; maintenance
+// publications use the object's admitted scene scope.
+//
+// The rules mirror the (retired) Node launcher-api's server.mjs (source
+// deleted at the Go cutover).
+package grounditem
+
+import (
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/item/wire"
+)
+
+// GidBase is the bottom of the ground-item entity id band. Player entities
+// live at 100000+ and NPCs at 200000+, so drops start above both.
+const GidBase uint32 = domain.GroundItemGIDBase
+
+// Ground-item lifetime: FIXTURE POLICY, *NOT* NATIVE TRUTH. The client binary
+// carries no ground-item expiry to recover - CIItem_Draw has no lifetime or
+// fade clock, and the 0x36AB handler only despawns when the SERVER says to.
+// Retail's drop lifetime lives in the server binary, which this project does
+// not have, so the duration below is INVENTED for the fixture and must never
+// be cited as reversed truth. The sweep emits the same 0x36AB despawn the
+// pickup path already uses, so the client needs no new case.
+const (
+	FixtureLifetime = 180 * time.Second
+	SweepInterval   = 5 * time.Second
+	// OwnerLifetime is native server truth: the ground item releases its
+	// owner record (+0x150) after its timer (+0x158) reaches 30.0 seconds.
+	OwnerLifetime = 30 * time.Second
+)
+
+// Item is one item lying on the ground.
+/*
+================
+Item
+================
+*/
+type Item struct {
+	TradeOwner string
+	Summon     *domain.CharacterCOS
+	RecordID   uint64 // item record identity, separate from ground runtime Gid
+	Population Population
+	Gid        uint32
+	RefObjID   uint32
+	Codename   string
+	// TypeFlags is the itemdata type-flag word; it selects the conditional
+	// fields of the spawn row.
+	// ArenaPowerup is ephemeral; tagged pickups never enter an inventory.
+	ArenaPowerup uint8
+	TypeFlags    uint16
+	// GoldAmount is non-zero only for a gold heap.
+	GoldAmount   uint32
+	Plus         uint8
+	VarianceBits uint64
+	Durability   uint32
+	// MagicOptions are the encoded magic-option u64 params the item's
+	// CSOItem body carries (wire.ItemBody.MagicOptions): server state
+	// so a pickup restores them onto the granted row - the ground spawn
+	// wire itself never carries them.
+	MagicOptions []uint64
+	Data         uint32 // item record data word (+0x38): capsule monster, Spirit clock
+	// StackCount is the heap's count for a stackable ETC drop. It never
+	// reaches the CIItem spawn wire - the native ground label carries no
+	// count for non-gold items - but it is server state so a pickup can
+	// restore the stack, and an over-cap pickup writes the remainder back.
+	// Zero reads as 1.
+	StackCount uint16
+	Position   Point
+	Y          float32
+	Heading    uint16
+	// OwnerJID is the temporary native pickup reservation. Zero is public.
+	OwnerJID uint32
+	// ForgeBound marks a GM-forged item on the ground plane (port only,
+	// issue #1980): pickup restores the mark, so a bound drop stays bound.
+	ForgeBound bool
+	// DroppedBy records the character that dropped or earned it.
+	DroppedBy string
+	// LostTo is the account whose player kill scattered these trade goods
+	// (a transport's death, or its rider's under SRO_TRADER_CARGO_DROP),
+	// "" for any other drop. Port-only, not native: job honor
+	// (game/action/jobhonor.go) scores a thief's haul only when the
+	// thief's own account dealt that kill. Memory only: a restart forgets
+	// it, as it forgets the honor runs, so restored goods score nothing.
+	LostTo string
+	// DroppedAt is when the drop hit the ground; the fixture-policy expiry
+	// sweep keys off it. The zero value means "never expires", matching the
+	// fixture, which skips entries without a timestamp.
+	DroppedAt time.Time
+}
+
+// IsGold reports whether this entry is a gold heap rather than an item.
+/*
+================
+IsGold
+================
+*/
+func (i Item) IsGold() bool {
+	return i.GoldAmount > 0
+}
+
+// SpawnRow builds the CIItem spawn row for this entry. withAppearTail selects
+// the single-object 0x30D7 form, which a fresh drop uses; object-list chunks
+// omit the tail.
+/*
+================
+SpawnRow
+================
+*/
+func (i Item) SpawnRow(withAppearTail bool) wire.GroundItemRow {
+	row := wire.GroundItemRow{
+		RefObjID:   i.RefObjID,
+		TypeFlags:  i.TypeFlags,
+		Codename:   i.Codename,
+		OwnerLabel: i.TradeOwner,
+		GoldAmount: i.GoldAmount,
+		Gid:        i.Gid,
+		Position: wire.Position{
+			RegionID: i.Position.RegionID,
+			X:        i.Position.X,
+			Y:        i.Y,
+			Z:        i.Position.Z,
+			Heading:  i.Heading,
+		},
+		WithAppearTail: withAppearTail,
+	}
+	if i.OwnerJID != 0 {
+		row.HasOwner = 1
+		row.OwnerJID = i.OwnerJID
+	}
+	if withAppearTail {
+		row.AppearFlag = 1
+	}
+	return row
+}
+
+// Registry holds the ground items of every division.
+//
+// It is safe for concurrent use: the gateway serves each session on its own
+// goroutine, and a division's drops are shared across all of them.
+//
+// The registry owns the live in-memory lifecycle only. Mutation sites run
+// registry calls inside the store commit door; the store reads Snapshot
+// under the documented lock order and writes the character and ground rows
+// in one transaction. There is no registry-local write path.
+/*
+================
+Registry
+================
+*/
+type Registry struct {
+	mu         sync.Mutex
+	byDivision map[string]map[uint32]Item
+	counter    uint32
+	// revision counts content mutations (Add/Remove/SetStackCount/
+	// ExpireItems/Clear/Restore). The authority store's commit door reads
+	// it to skip re-persisting ground rows on commits that never touched
+	// the ground plane.
+	revision uint64
+	// divRevisions counts the same mutations per division, so a reader
+	// cached on one division (the ground scope cache) rebuilds only when
+	// its own division moved - under the one global counter, any
+	// division's drop rebuilt every division's copy (#2030).
+	divRevisions map[string]uint64
+	// changes stamps every gid a mutation touched, for the store's
+	// commit to persist only those rows (changes.go).
+	changes changeJournal
+	// divLogs notes the same stamps per division, in division
+	// revisions, for a reader that keeps a copy of one division and
+	// asks only for what moved (division_delta.go). divLogFloor is the
+	// revision of the last Restore: no log reaches behind it.
+	divLogs     map[string]*divisionLog
+	divLogFloor uint64
+	// ownerStamp is the earliest DroppedAt among owned (reserved)
+	// drops, held so the tick's owner-expiry peek answers in O(1)
+	// instead of walking the plane (#2033). Adds can only lower it;
+	// ownerStampStale says a removal, release, population retirement,
+	// clear or restore may have raised it, so the next peek pays one
+	// refresh walk and is exact again.
+	ownerStamp      time.Time
+	ownerStampStale bool
+}
+
+// Revision reports the mutation counter. Two equal reads with no
+// mutation in between guarantee identical Snapshot content.
+/*
+================
+Revision
+================
+*/
+func (r *Registry) Revision() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.revision
+}
+
+/*
+================
+bumpLocked
+
+One content mutation in one division: the global counter moves (the
+commit door's skip test reads it) and the division's own counter
+moves with it, so a per-division cache rebuilds only for its own
+division's edits. Callers hold the lock.
+================
+*/
+func (r *Registry) bumpLocked(divisionID string) {
+	r.revision++
+	if r.divRevisions == nil {
+		r.divRevisions = make(map[string]uint64)
+	}
+	r.divRevisions[divisionID]++
+}
+
+// DivisionRevision reports one division's mutation counter, with
+// Revision's guarantee for that division's content alone.
+/*
+================
+DivisionRevision
+================
+*/
+func (r *Registry) DivisionRevision(divisionID string) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.divRevisions[divisionID]
+}
+
+// NewRegistry returns an empty Registry.
+/*
+================
+NewRegistry
+================
+*/
+func NewRegistry() *Registry {
+	// No store has persisted this registry yet: its first commit
+	// diffs the whole plane (changes.go).
+	return &Registry{byDivision: make(map[string]map[uint32]Item), changes: changeJournal{full: true}}
+}
+
+// division returns the division's map, creating it on first use. Callers must
+// hold the lock.
+/*
+================
+division
+================
+*/
+func (r *Registry) division(divisionID string) map[uint32]Item {
+	items, ok := r.byDivision[divisionID]
+	if !ok {
+		items = make(map[uint32]Item)
+		r.byDivision[divisionID] = items
+	}
+	return items
+}
+
+// Add registers a drop, assigns it the next entity id and returns the stored
+// entry. Any Gid already set on item is ignored - the registry is the sole
+// allocator, so two concurrent drops cannot collide.
+/*
+================
+Add
+================
+*/
+func (r *Registry) Add(divisionID string, item Item) Item {
+	if !item.Population.Valid() {
+		return Item{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	slot, ok := r.nextFreeSlot()
+	if !ok {
+		return Item{}
+	}
+	r.counter = slot
+	r.bumpLocked(divisionID)
+	item.Gid = GidBase + slot
+	item.MagicOptions = append([]uint64(nil), item.MagicOptions...)
+	item.Summon = domain.CloneCOS(item.Summon)
+	r.division(divisionID)[item.Gid] = item
+	r.noteOwnerStampLocked(item)
+	r.stampLocked(divisionID, item.Gid)
+	item.MagicOptions = append([]uint64(nil), item.MagicOptions...)
+	item.Summon = domain.CloneCOS(item.Summon)
+	return item
+}
+
+/*
+================
+nextFreeSlot
+
+The ground band holds MaxGroundItemGIDCounter ids and a beta server drops
+far more items than that between restarts, so the cursor wraps: the
+original server likewise recycles object ids once their objects are gone.
+An id is reused only when no division still holds it, so a client can never
+see a live drop's id handed to a second one. A band full of live drops is
+the only refusal. Caller holds r.mu.
+================
+*/
+func (r *Registry) nextFreeSlot() (uint32, bool) {
+	slot := r.counter
+	for range domain.MaxGroundItemGIDCounter {
+		slot = slot%domain.MaxGroundItemGIDCounter + 1
+		if !r.holdsGid(GidBase + slot) {
+			return slot, true
+		}
+	}
+	return 0, false
+}
+
+/*
+================
+holdsGid
+
+Caller holds r.mu.
+================
+*/
+func (r *Registry) holdsGid(gid uint32) bool {
+	for _, items := range r.byDivision {
+		if _, ok := items[gid]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Get returns the entry with the given entity id.
+/*
+================
+Get
+================
+*/
+func (r *Registry) Get(divisionID string, gid uint32) (Item, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	item, ok := r.byDivision[divisionID][gid]
+	item.MagicOptions = append([]uint64(nil), item.MagicOptions...)
+	item.Summon = domain.CloneCOS(item.Summon)
+	return item, ok
+}
+
+// Remove takes the entry out of the registry and returns it.
+//
+// The second result is false when the entry was already gone, which is the
+// signal to answer the native "cannot be picked" notice: two players racing
+// for the same drop both reach here, and only one gets true.
+/*
+================
+Remove
+================
+*/
+func (r *Registry) Remove(divisionID string, gid uint32) (Item, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	items, ok := r.byDivision[divisionID]
+	if !ok {
+		return Item{}, false
+	}
+	item, ok := items[gid]
+	if !ok {
+		return Item{}, false
+	}
+	delete(items, gid)
+	r.bumpLocked(divisionID)
+	r.stampLocked(divisionID, gid)
+	if item.OwnerJID != 0 {
+		r.ownerStampStale = true
+	}
+	return item, true
+}
+
+// SetStackCount rewrites a live entry's stack count in place, which is how an
+// over-cap pickup leaves the remainder on the ground: the heap keeps its gid
+// and its rendered entity, so no despawn or respawn is involved. The result
+// is false when the entry is gone.
+/*
+================
+SetStackCount
+================
+*/
+func (r *Registry) SetStackCount(divisionID string, gid uint32, count uint16) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	items, ok := r.byDivision[divisionID]
+	if !ok {
+		return false
+	}
+	item, ok := items[gid]
+	if !ok {
+		return false
+	}
+	item.StackCount = count
+	items[gid] = item
+	r.bumpLocked(divisionID)
+	r.stampLocked(divisionID, gid)
+	return true
+}
+
+// ExpireItems removes and returns the division's entries whose fixture
+// lifetime has elapsed: DroppedAt is set and now-DroppedAt >= lifetime. The
+// caller emits one 0x36AB despawn per returned entry, exactly like the pickup
+// path. Entries without a timestamp never expire. Results are ordered by
+// entity id so the despawn burst is deterministic.
+/*
+================
+ExpireItems
+================
+*/
+func (r *Registry) ExpireItems(divisionID string, now time.Time, lifetime time.Duration) []Item {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	items := r.byDivision[divisionID]
+	var expired []Item
+	for gid, item := range items {
+		if item.DroppedAt.IsZero() || now.Sub(item.DroppedAt) < lifetime {
+			continue
+		}
+		expired = append(expired, item)
+		delete(items, gid)
+	}
+	if len(expired) > 0 {
+		r.bumpLocked(divisionID)
+		for _, item := range expired {
+			r.stampLocked(divisionID, item.Gid)
+			if item.OwnerJID != 0 {
+				r.ownerStampStale = true
+			}
+		}
+	}
+	sort.Slice(expired, func(a, b int) bool { return expired[a].Gid < expired[b].Gid })
+	return expired
+}
+
+/*
+================
+HasExpired
+
+The expiry peek behind ExpireItems: some entry sits at or past its
+fixture lifetime. Reads only the stored DroppedAt stamps and never
+detaches a record, so scanning the whole plane costs no copy (the
+sweep's cadence probe used to clone every drop, pet records and their
+cargo included, just to read two fields per row, #2030).
+================
+*/
+func (r *Registry) HasExpired(divisionID string, now time.Time, lifetime time.Duration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, item := range r.byDivision[divisionID] {
+		if !item.DroppedAt.IsZero() && now.Sub(item.DroppedAt) >= lifetime {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+================
+HasExpiredOwner
+
+The owner-expiry peek behind ReleaseExpiredOwners, across every
+division: some reserved drop sits at or past its owner lifetime.
+Answers from the cached earliest owned DroppedAt under the registry
+lock (#2033): adds lower it in O(1), and the only writes that can
+raise it - removals, owner releases, population retirements, clears
+and restores - mark it stale, so the next peek pays one refresh walk
+and every peek stays exact. The release pass still re-checks every
+row under the maintenance barrier.
+================
+*/
+func (r *Registry) HasExpiredOwner(now time.Time, lifetime time.Duration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.ownerStampStale {
+		r.refreshOwnerStampLocked()
+	}
+	return !r.ownerStamp.IsZero() && now.Sub(r.ownerStamp) >= lifetime
+}
+
+/*
+================
+noteOwnerStampLocked
+
+Lower the cached earliest owned stamp for one stored row. An add can
+only move the earliest boundary earlier, never later, so this is the
+one owner write that needs no refresh walk. Caller holds r.mu.
+================
+*/
+func (r *Registry) noteOwnerStampLocked(item Item) {
+	if item.OwnerJID == 0 || item.DroppedAt.IsZero() {
+		return
+	}
+	if r.ownerStamp.IsZero() || item.DroppedAt.Before(r.ownerStamp) {
+		r.ownerStamp = item.DroppedAt
+	}
+}
+
+/*
+================
+refreshOwnerStampLocked
+
+Recompute the earliest owned stamp with one walk of the plane. Runs
+only when a mutation that can raise the minimum marked the cache
+stale, so idle ticks never pay it. Caller holds r.mu.
+================
+*/
+func (r *Registry) refreshOwnerStampLocked() {
+	r.ownerStamp = time.Time{}
+	for _, items := range r.byDivision {
+		for _, item := range items {
+			r.noteOwnerStampLocked(item)
+		}
+	}
+	r.ownerStampStale = false
+}
+
+// ReleaseExpiredOwners makes reserved drops public at the native 30-second
+// boundary without replacing their entity identity. The caller broadcasts
+// 0x31E2 for each returned row; subsequent calls return nothing.
+/*
+================
+ReleaseExpiredOwners
+================
+*/
+func (r *Registry) ReleaseExpiredOwners(divisionID string, now time.Time, lifetime time.Duration) []Item {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	items := r.byDivision[divisionID]
+	var released []Item
+	for gid, item := range items {
+		if item.OwnerJID == 0 || item.DroppedAt.IsZero() || now.Sub(item.DroppedAt) < lifetime {
+			continue
+		}
+		item.OwnerJID = 0
+		items[gid] = item
+		item.MagicOptions = append([]uint64(nil), item.MagicOptions...)
+		item.Summon = domain.CloneCOS(item.Summon)
+		released = append(released, item)
+	}
+	if len(released) > 0 {
+		r.bumpLocked(divisionID)
+		r.ownerStampStale = true
+		for _, item := range released {
+			r.stampLocked(divisionID, item.Gid)
+		}
+	}
+	sort.Slice(released, func(a, b int) bool { return released[a].Gid < released[b].Gid })
+	return released
+}
+
+// DivisionIDs returns every division that currently holds entries, sorted,
+// so the sweep can walk them deterministically.
+/*
+================
+DivisionIDs
+================
+*/
+func (r *Registry) DivisionIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make([]string, 0, len(r.byDivision))
+	for divisionID, items := range r.byDivision {
+		if len(items) == 0 {
+			continue
+		}
+		out = append(out, divisionID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Codenames returns the division's distinct item codenames in entity
+// id order (first sighting wins), read under the lock without copying
+// a single entry: the bootstrap's reference seam needs the names of
+// what lies on the ground, never the drops themselves, and the deep
+// copy All pays per entry (magic options, the summon record) was
+// bought for two fields (#2030).
+/*
+================
+Codenames
+================
+*/
+func (r *Registry) Codenames(divisionID string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	items := r.byDivision[divisionID]
+	// Distinct codenames are a small fraction of a division's drops;
+	// the seen set grows to them, never to the division's size.
+	seen := map[string]bool{}
+	var out []string
+	for _, gid := range sortedGids(items) {
+		codename := items[gid].Codename
+		if codename == "" || seen[codename] {
+			continue
+		}
+		seen[codename] = true
+		out = append(out, codename)
+	}
+	return out
+}
+
+// All returns the division's entries ordered by entity id, so an object list
+// built from them is deterministic.
+/*
+================
+All
+================
+*/
+func (r *Registry) All(divisionID string) []Item {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.allLocked(divisionID)
+}
+
+/*
+================
+sortedGids
+
+A division's gids in ascending order. All and the persisted snapshot
+read their items in this order: sorting the gids and then reading the
+map moves 4-byte keys, where sorting the copied rows moved whole items
+through sort.Slice's reflective swapper - 17% of the synthetic tick's
+CPU in the per-commit snapshot (#2031).
+================
+*/
+func sortedGids(items map[uint32]Item) []uint32 {
+	gids := make([]uint32, 0, len(items))
+	for gid := range items {
+		gids = append(gids, gid)
+	}
+	slices.Sort(gids)
+	return gids
+}
+
+// Count reports how many entries a division holds.
+/*
+================
+Count
+================
+*/
+func (r *Registry) Count(divisionID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.byDivision[divisionID])
+}
+
+// Clear drops every entry of a division.
+/*
+================
+Clear
+================
+*/
+func (r *Registry) Clear(divisionID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if items, ok := r.byDivision[divisionID]; ok && len(items) > 0 {
+		r.bumpLocked(divisionID)
+		// Every gid of the vanished division is a delete.
+		for gid := range items {
+			r.stampLocked(divisionID, gid)
+			if items[gid].OwnerJID != 0 {
+				r.ownerStampStale = true
+			}
+		}
+	}
+	delete(r.byDivision, divisionID)
+}
+
+// PendingKey is the key a pending pickup approach is tracked under. The
+// character name is folded to lower case because the fixture matches character
+// names case-insensitively.
+/*
+================
+PendingKey
+================
+*/
+func PendingKey(divisionID, characterName string) string {
+	return divisionID + ":" + strings.ToLower(characterName)
+}

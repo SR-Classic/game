@@ -1,0 +1,113 @@
+package monster
+
+// PendingMover retains a settled, inactive actor without its live movement
+// machinery. It is not a spawn template: position and every retained clock,
+// revision, channel and transition identity survive expansion unchanged.
+type PendingMover struct {
+	Spawning                                                                      bool
+	BehaviorDeadlineMs                                                            int64
+	Pose                                                                          Pose
+	Activity                                                                      ActivityCadence
+	PreviousEvent, LastEvent                                                      MoverEvent
+	TransitionSerial, RetaliationRevision                                         uint64
+	AttackIntervalMs, LastBattleActivityMs, HomingStartedMs, HomingAcquireAfterMs uint32
+	Channel, PursuitChannel, NavigationChannel                                    uint8
+	NavigationSpeed                                                               float64
+	Progress                                                                      MovementProgress
+	Stuck                                                                         bool
+}
+
+func (m MoverState) PendingSnapshot() (PendingMover, bool) {
+	if (m.mode != MoverPending && m.mode != MoverSpawning) || m.DepartMs != 0 || m.ArriveMs != 0 || m.intent.phase != navigationNone {
+		return PendingMover{}, false
+	}
+	p := PendingMover{m.mode == MoverSpawning, m.BehaviorDeadlineMs, m.Pose, m.Activity, m.previousEvent, m.lastEvent, m.transitionSerial, m.retaliationRevision, m.AttackIntervalMs, m.LastBattleActivityMs, m.HomingStartedMs, m.HomingAcquireAfterMs, m.Channel, m.PursuitChannel, m.intent.channel, m.intent.speed, m.progress, m.stuck}
+	m.BehaviorDeadlineMs = 0
+	m.Pose = Pose{}
+	m.Activity = ActivityCadence{}
+	m.mode = 0
+	m.previousEvent = 0
+	m.lastEvent = 0
+	m.transitionSerial = 0
+	m.retaliationRevision = 0
+	m.AttackIntervalMs = 0
+	m.LastBattleActivityMs = 0
+	m.HomingStartedMs = 0
+	m.HomingAcquireAfterMs = 0
+	m.Channel = 0
+	m.PursuitChannel = 0
+	m.intent.channel = 0
+	m.intent.speed = 0
+	m.progress = MovementProgress{}
+	m.stuck = false
+	// No live segment or route refers to this completed path's height closure.
+	m.navigation = nil
+	if m != (MoverState{}) {
+		return PendingMover{}, false
+	}
+	return p, true
+}
+
+/*
+================
+PendingMover.Expand
+
+The full mover a compact pending row stands for.
+================
+*/
+func (p PendingMover) Expand() MoverState {
+	var m MoverState
+	p.ExpandInto(&m)
+	return m
+}
+
+/*
+================
+PendingMover.ExpandInto
+
+Expand written in place: the leg snapshot expands every due actor's
+mover straight into its view slot instead of copying the 632-byte
+value out through two return values (#2985).
+================
+*/
+func (p *PendingMover) ExpandInto(dst *MoverState) {
+	p.expandInto(dst, p.Pose, p.Activity)
+}
+
+/*
+================
+PendingMover.ExpandIntoWith
+
+ExpandInto with the row's settled pose and activity cadence
+replaced by the caller's: compact storage (residentPendingMover)
+keeps those two per actor and interns the rest, so its fill
+expands straight from the interned row it cached instead of
+copying the row out of the handle to amend it first (#3027).
+The navigation speed stays the row's own.
+================
+*/
+func (p *PendingMover) ExpandIntoWith(dst *MoverState, pose Pose, activity ActivityCadence) {
+	p.expandInto(dst, pose, activity)
+}
+
+/*
+================
+PendingMover.expandInto
+
+ExpandInto's body over an explicit pose and cadence: every other
+field is the row's own.
+================
+*/
+func (p *PendingMover) expandInto(dst *MoverState, pose Pose, activity ActivityCadence) {
+	mode := MoverPending
+	if p.Spawning {
+		mode = MoverSpawning
+	}
+	*dst = MoverState{mode: mode, BehaviorDeadlineMs: p.BehaviorDeadlineMs, Pose: pose, Activity: activity,
+		previousEvent: p.PreviousEvent, lastEvent: p.LastEvent, transitionSerial: p.TransitionSerial,
+		retaliationRevision: p.RetaliationRevision, AttackIntervalMs: p.AttackIntervalMs,
+		LastBattleActivityMs: p.LastBattleActivityMs, HomingStartedMs: p.HomingStartedMs,
+		HomingAcquireAfterMs: p.HomingAcquireAfterMs, Channel: p.Channel, PursuitChannel: p.PursuitChannel,
+		intent:   navigationIntent{speed: p.NavigationSpeed, channel: p.NavigationChannel},
+		progress: p.Progress, stuck: p.Stuck}
+}

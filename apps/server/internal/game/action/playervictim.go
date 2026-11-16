@@ -1,0 +1,404 @@
+/*
+===========================================================================
+
+playervictim.go - what a landed hit does to a player, whoever struck it
+
+The reference server's hit outcome resolves each impact against the victim
+(the wall split, the status rolls) and
+its result-recipient pass commits them: the HP debit,
+the damage-to-MP redirect (dgmp), the standing wall's drain, the armour and shield wear of a struck
+victim, then either the death (pkdeath.go) or the battle state, the
+statuses and the skc damage cancellation. A monster's hit and a player's
+hit take this one path; only the attacker's own rolls and bookkeeping
+differ.
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/abnormal"
+	"opensro.online/server/internal/game/combat"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/internal/vitals"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/world/simulation"
+)
+
+/*
+================
+playerStrike
+
+One attacker's hits on one player, resolved before the victim's door.
+================
+*/
+type playerStrike struct {
+	division string
+	victim   *enterworld.Character
+	killer   deathKiller
+	skill    enterworld.SkillRow
+	// impacts is the record count; zero takes the row's att count (a
+	// credited hit - a pulse, a returned hit - carries one).
+	impacts  int
+	formulas []combat.Result
+	splits   []wallSplit
+	wall     standingWall
+	walled   bool
+	records  []abnormal.Record
+	owner    *playerAbnormalOwner
+	// displacement is the knockdown or knockback the impact at displaceAt
+	// rolled (playerdisplacement.go); nil for none.
+	displacement *playerDisplacement
+	displaceAt   int
+	// linkedShare marks a share a fence or Pain Quota moved onto this
+	// victim; its own links do not run again (linkeddamage.go).
+	linkedShare bool
+	// quotaMembers are the party members a Pain Quota on the victim divides
+	// among, planned before the door (planQuotaMembers).
+	quotaMembers []uint32
+	now          int64
+}
+
+/*
+================
+playerStruck
+
+What the commit did.
+================
+*/
+type playerStruck struct {
+	attacker        uint32
+	impacts, absorb []wire.SkillCastTargetImpact
+	// before is the victim's HP ahead of each impact (a drain's cap).
+	before        []uint32
+	fatal, struck bool
+	refugeHealed  bool
+	warCombat     domain.GuildWarCombat
+	killer        *enterworld.Character
+	// mpSpent is what dgmp took from MP; mp is the MP it left.
+	mpSpent, mp      uint32
+	deathEffects     []wire.Frame
+	deathProgression []wire.Frame
+	// withdrawn closes the casts a displacement interrupted.
+	withdrawn []wire.Frame
+	battle    []wire.Frame
+	wear      wearFrames
+	owner     *playerAbnormalOwner
+	// linkMoves are the shares fence and Pain Quota links took off the
+	// hits, applied to their takers after the door (strikeLinkedShares).
+	linkMoves []linkedMove
+}
+
+/*
+================
+planPlayerStrike
+
+The reference server's hit outcome per impact against a player defender: the hit behind
+the victim's standing wall (resolve), then the attacker's status roll
+(roll), which a blocked or ck-killed impact skips. False when an
+impact cannot be resolved, or lands nothing on an unwalled victim; a
+status cast's record is a landed zero-damage hit.
+================
+*/
+func (rt *Runtime) planPlayerStrike(s *playerStrike,
+	resolve func(wall *enterworld.SkillWall) (combat.WallOutcome, error),
+	roll func(wall *enterworld.SkillWall, formula combat.Result) ([]abnormal.Record, error)) bool {
+	s.wall, s.walled = rt.standingWallOf(s.division, s.victim.Name)
+	var wallRule *enterworld.SkillWall
+	if s.walled {
+		wallRule = &s.wall.wall
+	}
+	count := s.impacts
+	if count == 0 {
+		count = creatureImpactCount(s.skill)
+	}
+	for range count {
+		split, err := resolve(wallRule)
+		formula := split.Defender
+		if err != nil || formula.Damage == 0 && !s.walled && !formula.Blocked && !formula.Slain && !s.skill.StatusCast && !s.skill.CreatureStatusCast {
+			return false
+		}
+		s.splits = append(s.splits, wallSplit{absorbed: split.Absorbed, flags: formula.ResultFlags, covered: split.Covered})
+		s.formulas = append(s.formulas, formula)
+		if formula.Blocked || formula.Slain {
+			continue
+		}
+		records, err := roll(wallRule, formula)
+		if err != nil {
+			return false
+		}
+		s.records = append(s.records, records...)
+	}
+	if len(s.formulas) == 0 {
+		return false
+	}
+	// Port-only Tailwind intercepts a damaging monster attack before any HP/status commit.
+	if !s.linkedShare && s.killer.monster != nil {
+		for _, formula := range s.formulas {
+			if formula.Damage > 0 && !formula.Blocked && rt.tailwindIntercept(s.division, s.victim, s.killer.monster.Gid, s.now) {
+				return false
+			}
+		}
+	}
+	if !s.linkedShare {
+		s.quotaMembers = rt.planQuotaMembers(s.division, s.victim, s.now)
+	}
+	s.owner = rt.newPlayerAbnormalOwner(s.division, s.victim, s.now)
+	if !s.linkedShare && s.killer.monster != nil {
+		s.owner.bond = rt.planPetBond(s.division, s.victim, s.now)
+		s.owner.refuge = rt.planRavenRefuge(s.division, s.victim, s.now)
+	}
+	s.killer = rt.prepareDeathKiller(s.division, s.victim, s.killer)
+	s.owner.sources = rt.capturePlayerAbnormalSources(s.division, s.victim, s.owner.block, s.records)
+	return true
+}
+
+/*
+================
+strikePlayerInDoor
+
+The reference server's recipient side inside the victim's door. A record a standing wall
+absorbs whole skips the recipient branch; a struck victim's
+landed hits wear its armour and its blocks its shield.
+================
+*/
+func (rt *Runtime) strikePlayerInDoor(s playerStrike) playerStruck {
+	c := s.victim
+	out := playerStruck{owner: s.owner, killer: s.killer.player}
+	if s.killer.monster != nil {
+		out.attacker = s.killer.monster.Gid
+	}
+	if s.killer.player != nil {
+		out.attacker = enterworld.ObjectIDForCharacter(s.killer.player)
+	}
+	hit := abnormal.HitContext{Attack: s.skill.ReplacementPinned && s.skill.Replacement.MatchesExecutionSelector}
+	_, _, remaining, remainingMP := rt.playerKeeperVitals(s.division, c)
+	redirect := rt.effects.DamageToMPPercent(s.division, c.Name)
+	for _, formula := range s.formulas {
+		hit.Magical = hit.Magical || formula.MagicalDamage != 0
+		// The reference server runs these before dgmp: fences and Pain Quota
+		// take their shares off the hit first.
+		if !s.linkedShare && !formula.Slain {
+			formula = rt.shareLinkedDamageInDoor(s, formula, &out)
+		}
+		// Port-only absorption protects mana as well as HP on a fully warded hit.
+		if !formula.Slain && s.killer.monster != nil && rt.petShieldRecipientAllowed(c) {
+			formula.Damage = rt.absorbPetShield(s.division, enterworld.ObjectIDForCharacter(c), formula.Damage, s.now)
+		}
+		// The reference server runs dgmp per impact after the wall split, whoever struck;
+		// a ck kill takes the whole HP and redirects nothing.
+		if redirect != 0 && !formula.Slain {
+			var spent uint32
+			formula, spent = combat.RedirectDamageToMP(formula, uint32(remainingMP), redirect)
+			remainingMP -= int64(spent)
+			out.mpSpent += spent
+		}
+		if !formula.Slain && s.owner != nil {
+			formula.Damage = sharePetBond(s.owner.bond, formula.Damage)
+		}
+		maximum := int64(0)
+		if s.owner != nil && s.owner.refuge.book != 0 && !formula.Slain {
+			maximum = int64(s.owner.MaxHP())
+			formula.Damage = ravenRefugeDamage(s.owner.refuge, remaining, maximum, formula.Damage)
+		}
+		out.before = append(out.before, uint32(remaining))
+		debit := int64(vitals.HitDebit(uint32(remaining), formula.Damage))
+		if formula.Slain {
+			debit = remaining // the ck kill marks the target dead
+		}
+		if rt.sookPowerActive(s.division, c, sookInvincible, s.now) {
+			debit = min(debit, max(int64(0), remaining-1))
+			formula.Damage, formula.Slain = uint32(debit), false
+		}
+		if run := rt.sookRun(s.division, c); run != nil && run.program.PausedAt != 0 {
+			debit, formula.Damage, formula.Slain = 0, 0, false
+		}
+		before := remaining
+		remaining -= debit
+		if maximum > 0 {
+			heal := ravenRefugeRecovery(s.owner.refuge, c, before, remaining, maximum, s.now)
+			remaining += heal
+			out.refugeHealed = out.refugeHealed || heal > 0
+		}
+		if s.owner != nil {
+			s.owner.noteSookReflection(out.attacker, uint32(debit))
+		}
+		out.fatal = remaining == 0
+		out.impacts = append(out.impacts, wire.SkillCastTargetImpact{
+			ResultFlags: formula.ResultFlags,
+			// The reference server serializes the full hit independently of HP.
+			Damage:  formula.Damage,
+			Fatal:   out.fatal,
+			Blocked: formula.Blocked,
+			Slain:   formula.Slain,
+		})
+		if out.fatal {
+			break
+		}
+	}
+	c.CurrentHP = &remaining
+	if out.mpSpent != 0 {
+		c.CurrentMP = &remainingMP
+		out.mp = uint32(remainingMP)
+	}
+	out.struck = len(out.impacts) > 0
+	if s.walled && !s.skill.WallBypass {
+		var absorbed uint32
+		out.absorb, absorbed = wallRecords(s.wall, s.splits, len(out.impacts))
+		rt.drainWall(s.division, c.Name, s.wall.token, absorbed)
+		out.struck = !allWallAbsorbed(out.absorb)
+	}
+	if out.struck {
+		var tally wearTally
+		for _, impact := range out.impacts {
+			// The reference server jumps past the landed count: a ck kill wears nothing.
+			if !impact.Slain {
+				tally.note(impact.Blocked, false)
+			}
+		}
+		for _, roll := range [...]struct{ mode, count uint8 }{{wearArmour, tally.armour}, {wearShield, tally.shield}} {
+			taken := rt.rollEquipmentWear(s.division, c, roll.mode, roll.count)
+			out.wear.actor = append(out.wear.actor, taken.actor...)
+			out.wear.public = append(out.wear.public, taken.public...)
+		}
+	}
+	if !out.fatal && s.displacement != nil && s.displaceAt < len(out.impacts) && out.struck && !rt.sookPowerActive(s.division, c, sookUnstoppable, s.now) {
+		if point, withdrawn, ok := rt.commitPlayerDisplacementInDoor(s.division, c, s.displacement); ok {
+			if s.displacement.down {
+				out.impacts[s.displaceAt].Knockdown = point
+			} else {
+				out.impacts[s.displaceAt].Knockback = point
+			}
+			out.withdrawn = withdrawn
+		}
+	}
+	if out.fatal {
+		out.warCombat = rt.prepareGuildWarCombat(s.division, c, s.killer)
+		out.deathEffects, out.deathProgression = rt.settlePlayerDeathInDoor(s.division, c, s.killer, s.now)
+		// Death clears statuses, but the already absorbed bond cost still belongs to this hit.
+		owner := out.owner
+		out.owner = rt.clearPlayerAbnormalInDoor(s.division, c, s.now)
+		if owner != nil && len(owner.sookReflected) > 0 {
+			if out.owner == nil {
+				out.owner = owner
+			} else if out.owner != owner {
+				out.owner.sookReflected = append(out.owner.sookReflected, owner.sookReflected...)
+				owner.sookReflected = nil
+			}
+		}
+		if owner != nil && owner.bond != nil {
+			if out.owner == nil {
+				out.owner = owner
+			}
+			out.owner.bond = owner.bond
+		}
+	} else {
+		out.battle = rt.enterBattleState(s.division, c, s.now)
+		rt.endJobActivation(s.division, c)
+		out.owner.applyHit(hit, s.records)
+		// Reference server: a landed hit tests the victim's skc damage masks.
+		// INFERENCE: a fence or Pain Quota share is the queued area context's
+		// deferred tick, not a hit outcome (linkeddamage.go), so it does not
+		// run the damage-effect pass: a Bard taking a share keeps its dance
+		// or music.
+		if !s.linkedShare {
+			rt.cancelEffectsOnDamage(s.division, c, s.skill.Attack.Flags, s.now)
+		}
+	}
+	return out
+}
+
+/*
+================
+playerStruckFrames
+
+The struck victim's publication after its door: statuses, wear, the death
+(effects retired before the life change, the zero baseline, then 0x3122),
+the seated recipient standing, and the battle state. public goes to every
+observer, victim to the victim alone.
+================
+*/
+func (rt *Runtime) playerStruckFrames(division string, victim *enterworld.Character, struck playerStruck, now int64) (public, private []wire.Frame) {
+	for _, impact := range struck.impacts {
+		if impact.Damage == 0 {
+			continue
+		}
+		public = append(public, rt.tailwindDamage(division, victim, struck.attacker, now)...)
+		break
+	}
+	if struck.mpSpent != 0 {
+		// The redirected MP reaches its owner alone, as a combat-sourced 0x3057.
+		private = append(private, wire.Frame{Opcode: simulation.OpVitalsUpdate,
+			Payload: simulation.MPRefreshPayload(enterworld.ObjectIDForCharacter(victim), simulation.VitalsSourceCombatDamage, struck.mp)})
+	}
+	if struck.refugeHealed && !struck.fatal {
+		public = append(public, wire.Frame{Opcode: simulation.OpVitalsUpdate, Payload: simulation.HPRefreshPayload(enterworld.ObjectIDForCharacter(victim), simulation.VitalsSourceSkillRecovery, uint32(enterworld.CurrentHP(victim)))})
+		public = append(public, crowVisualFrame(crowVisual{gid: enterworld.ObjectIDForCharacter(victim), kind: crowPlumeVisual, book: 1, at: rt.LiveSpawnFor(division, victim)}))
+	}
+	statuses := rt.playerAbnormalPublication(division, victim, struck.owner)
+	public = append(public, statuses.public...)
+	private = append(private, statuses.actor...)
+	public = append(public, struck.wear.public...)
+	private = append(private, struck.wear.actor...)
+	public = append(public, struck.withdrawn...)
+	if struck.fatal {
+		rt.recordFortressDeath(division, victim, struck.killer, now)
+		rt.recordFlagWarDeath(division, victim, struck.killer, now)
+		rt.recordInstanceDeath(division, victim)
+		rt.publishGuildWarCombat(division, struck.warCombat, now)
+		if rt.PushCharacterFrames != nil && rt.PushDivisionPeerFrames != nil {
+			// Native death retires effects before publishing the life change.
+			// Enqueue under the action lock, before a rebirth/new application
+			// can reuse these wire tokens.
+			rt.publishBodyStatus(division, victim.Name, struck.deathEffects)
+		} else {
+			public = append(public, struck.deathEffects...)
+		}
+		life := beginFatalLifePublication(enterworld.ObjectIDForCharacter(victim))
+		// B245/B505 retains fatal damage until the client impact callback; the
+		// death-sourced 0x33A6 advances the wire baseline to zero without
+		// applying it twice, and 0x3122 owns the life-state transition.
+		baseline := life.publishDeathBaseline()
+		public = append(public, wire.Frame{Opcode: baseline.opcode, Payload: baseline.payload})
+		dead := life.publishDead()
+		public = append(public, wire.Frame{Opcode: dead.opcode, Payload: dead.payload})
+	}
+	// Entering battle (from the normal hit) follows the hit.
+	if struck.struck && !struck.fatal {
+		public = append(public, rt.offensiveResultRecipient(division, victim, now)...)
+	}
+	public = append(public, struck.battle...)
+	private = append(private, struck.deathProgression...)
+	return public, private
+}
+
+/*
+================
+planStrikeDisplacement
+
+The strike's displacement roll on its first impact the victim survives
+(no displacement lands on a corpse, and a blocked or ck-killed impact
+rolls none).
+================
+*/
+func (rt *Runtime) planStrikeDisplacement(s *playerStrike, actor criticalActor, from, at simulation.Spawn) error {
+	_, _, hp, _ := rt.playerKeeperVitals(s.division, s.victim)
+	for i, formula := range s.formulas {
+		hp -= min(hp, int64(formula.Damage))
+		if formula.Blocked || formula.Slain || hp <= 0 {
+			if hp <= 0 {
+				return nil
+			}
+			continue
+		}
+		d, err := rt.planPlayerDisplacement(displacementRoll{division: s.division, actor: actor, from: from,
+			skill: s.skill, victim: s.victim, at: at, now: s.now})
+		if err != nil || d != nil {
+			s.displacement, s.displaceAt = d, i
+			return err
+		}
+	}
+	return nil
+}

@@ -1,0 +1,178 @@
+/*
+===========================================================================
+
+gmmonster.go - GM /LOADMONSTER: monsters created at the GM's position
+
+The retail server's summon command (the SpecialCommand LOADMONSTER
+case) creates count instances of one monster reference at the GM's own
+position, each with a random heading, through the ordinary world factory. They are ordinary monsters: production AI, aggro, attacks, damage
+and death. Like script-created monsters they have no respawning nest.
+
+===========================================================================
+*/
+package simulation
+
+import (
+	"opensro.online/server/internal/domain"
+	"opensro.online/server/internal/game/world/instance"
+	"opensro.online/server/internal/game/world/monster"
+)
+
+// The retail server clamps the requested count to 1..250.
+const gmMonsterMaxCount = 250
+
+/*
+================
+GMMonsterSpawn
+
+The action owner supplies residency and the GM's live pose under division
+authority.
+================
+*/
+type GMMonsterSpawn struct {
+	Division   string
+	Population instance.Lease
+	RefObjID   uint32
+	Count      uint8
+	Type       uint8
+	Position   Spawn
+	// Port-only, not native: event encounters target the solo entrant.
+	Arena bool
+	// Port-only: non-immediate spawns retain their native proximity acquisition.
+	ArenaPassive bool
+	NowMs        int64
+}
+
+/*
+================
+GMSpawnRarity
+
+The retail server resolves the requested type byte against the reference's own type
+(+0x89): a unique (3) or type-8 reference keeps its own; otherwise a
+requested normal (0), champion (1), giant (4) or 7 is kept and any other
+value falls back to the reference's type.
+================
+*/
+func GMSpawnRarity(requested, referenceType uint8) uint8 {
+	requested &= 0x0f
+	own := referenceType & 0x0f
+	if own == 3 || own == 8 {
+		return own
+	}
+	switch requested {
+	case 0, 1, 4, 7:
+		return requested
+	}
+	return own
+}
+
+/*
+================
+SpawnGMMonsters
+
+Returns how many monsters were created; zero refuses the command. Every
+instance shares the GM's point; only its heading is drawn, as rand()/32767
+of a full turn in radians, passed as a float to the world
+factory like the nest path's heading.
+
+INFERENCE: SpawnHeading is the wire word, which the client decodes as
+degrees * 65535 / 360 (the inverse of its client serializer CNavigationDeadreckon_WriteMovementPayloadToStream). The
+server's own spawn-record writer was not traced, so a native quirk there is
+not ruled out; this takes the nest path's radians -> word conversion so the
+client sees the drawn direction.
+================
+*/
+func (s *MonsterState) SpawnGMMonsters(request GMMonsterSpawn) int {
+	return len(s.SpawnGMMonstersTracked(request))
+}
+
+/*
+================
+SpawnGMMonstersTracked
+
+The same command path, returning the created gids so a caller that must act
+on the spawns (/ZOE kills them immediately) can name them.
+================
+*/
+func (s *MonsterState) SpawnGMMonstersTracked(request GMMonsterSpawn) []uint32 {
+	count := int(request.Count)
+	if count < 1 {
+		count = 1
+	}
+	if count > gmMonsterMaxCount {
+		count = gmMonsterMaxCount
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ref, ok := s.template.Refs[request.RefObjID]
+	if !ok || ref.MaxHP == 0 {
+		return nil
+	}
+	state := s.populationForLease(request.Division, request.Population)
+	if state == nil {
+		return nil
+	}
+	center := request.Position
+	spawn := normalizeGeneratedMonsterSpawn(monster.SpawnPoint{
+		RefObjID: ref.RefObjID, RegionID: center.RegionID, X: center.X, Y: center.Y, Z: center.Z,
+	})
+	spawn, valid := s.resolveSpawnGround(spawn, center.Y)
+	if !valid {
+		return nil
+	}
+	rarity := GMSpawnRarity(request.Type, ref.MonsterType)
+	if request.Arena && (request.Type == 0x14 || request.Type == 6 && ref.MonsterType == 0) {
+		// Port-only: survival may request elites; native GM grade resolution stays unchanged.
+		rarity = request.Type
+	}
+	created := make([]uint32, 0, count)
+	for len(created) < count {
+		if s.counter >= domain.MaxMonsterGIDCounter {
+			break
+		}
+		angle := float64(float32(float64(float32(float64(s.randomWord())/nativeRandomMaximum)) * nativeCircleRadians))
+		s.counter++
+		actor := monster.Instance{
+			Gid: monster.GidBase + s.counter, Ref: ref, Spawn: spawn, NestDetached: true, GMSpawned: true, Arena: request.Arena,
+			SpawnHeading: HeadingWordFromRadians(angle),
+			Nest: monster.NestRow{
+				SpawnPoint: spawn, PolicyPinned: true, HasRarityOverride: true, RarityOverride: rarity,
+			},
+		}
+		actor.CurrentHP = actor.EffectiveMaxHP()
+		if tactics, found := monster.ResolveSummonTactics(ref, 0, s.random); found {
+			actor.Nest.NativeTacticsFlags = tactics.NativeFlags
+			actor.Nest.TargetPolicy = tactics.TargetPolicy
+			if tactics.HasControls {
+				actor.Nest.Controls, actor.Nest.HasControls = tactics.Controls, true
+				actor.Nest.ConditionalSkills = tactics.ConditionalSkills
+				actor.Nest.SightRange = float64(tactics.Controls.SightRange)
+				actor.Nest.Aggressive = tactics.Controls.AggressType == 0
+			}
+		}
+		if request.Arena {
+			actor.Arena = true
+			actor.Nest.TargetPolicy = 2
+			// Keep native sight/aggression for the other 70%; passive must not disable proximity aggro.
+			if !request.ArenaPassive {
+				actor.Nest.Aggressive = true
+				actor.Nest.SightRange = 640
+				actor.Nest.Controls.AggressType = 0
+				actor.Nest.Controls.SightRange = 640
+			}
+		}
+		mover := monster.NewSpawnMover(actor, request.NowMs)
+		mover.Activity = monster.NewActivityCadence(uint32(request.NowMs), s.randomWord())
+		if state.movers == nil {
+			state.movers = newMoverStorage(nil)
+		}
+		state.instances.set(actor.Gid, actor)
+		state.movers.set(actor.Gid, mover)
+		state.behavior.set(actor.Gid, 0)
+		state.listRegionGid(spawn.RegionID, actor.Gid)
+		created = append(created, actor.Gid)
+		// The retail spawn arms every spawned monster's timers, a GM's included.
+		armLifetimeLocked(state, actor, request.NowMs)
+	}
+	return created
+}

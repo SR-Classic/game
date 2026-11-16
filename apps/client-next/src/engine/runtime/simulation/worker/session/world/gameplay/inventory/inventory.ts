@@ -1,0 +1,2578 @@
+/*
+===========================================================================
+
+inventory.ts - inventory authority publications and serialized item commands
+
+Owns player and avatar slots, reference projections and pending native moves.
+Child owners handle process-specific state while this owner commits item rows.
+
+===========================================================================
+*/
+import { AVATAR_STORAGE_CAPACITY, avatarSlotFits, isAvatarItem } from "@/engine/foundation/gameplay/avatar-socket";
+import {
+	companionItemUseNotice,
+	cosItemUseTail,
+	type CosItemUseContext
+} from "@/engine/foundation/gameplay/cos-item-use";
+import { globalChatTail, isGlobalChatItem } from "@/engine/foundation/gameplay/global-chat";
+import { isTradeGoods } from "@/engine/foundation/gameplay/specialty-deal";
+import { type ChatLinkRef, encodeChatLinkRefs } from "@/engine/foundation/gameplay/chat-item-links";
+import { isNameChangeScrollItem, nameChangeTail } from "@/engine/foundation/gameplay/name-change";
+import {
+	nativeStackIdentity,
+	planContainerMove,
+	sameStackIdentity,
+	stackable
+} from "@/engine/foundation/gameplay/container-transfer";
+import { INVENTORY_TRANSACTION_TIMEOUT, type Degradation } from "@/engine/contracts/network";
+import { createMall } from "./mall/mall";
+import { createArenaChest, ARENA_CHEST_OPCODE } from "@/engine/foundation/gameplay/arena-chest";
+import { createCompanionRentals } from "./companion-rentals";
+import type { MallPurchase } from "@/engine/foundation/gameplay/item-mall-wire";
+import {
+	itemCooldown,
+	potionCategory,
+	potionCooldownMs,
+	type ItemCooldown
+} from "@/engine/foundation/gameplay/item-cooldowns";
+import {
+	itemTooltipReference,
+	itemMagicReferences,
+	type ItemTooltipReference
+} from "@/engine/foundation/gameplay/item-tooltip-reference";
+import { cosQuickDestination, cosTransferRequest, planCosTransfer } from "@/engine/foundation/gameplay/cos-transfer";
+import {
+	storageMoveRequest,
+	storageMoveResult,
+	STORAGE_MOVE_ROOM,
+	STORAGE_MOVE_DEPOSIT,
+	STORAGE_MOVE_WITHDRAW,
+	type StorageMove,
+	type StorageRoom,
+	storageWireType
+} from "@/engine/foundation/gameplay/storage-room";
+import { createAlchemy, stoneDesignatedAttribute } from "./alchemy/alchemy";
+import { REPAIR_ONE_SLOT, REPAIR_RESPONSE_OPCODE, repairRequest } from "@/engine/foundation/gameplay/repair";
+import { createGacha } from "./gacha/gacha";
+import { gachaPrizes } from "@/engine/foundation/gameplay/gacha-catalog";
+import { isGachaVoucher } from "@/engine/foundation/ui/gacha-window";
+import type { SystemNotice } from "@/engine/foundation/gameplay/system-notices";
+import { createMagicOptionGrant } from "./magic-option/magic-option";
+import { itemStateDelta } from "@/engine/foundation/gameplay/item-state-delta";
+import { itemSlotFlashKinds } from "@/engine/foundation/ui/item-slot-effects";
+import { itemMagicDefinitions } from "@/engine/foundation/ui/item-tooltip-magic";
+import { itemMaxDurability } from "@/engine/foundation/ui/item-tooltip-stats";
+import type { GachaPrizeRow, ItemProcessCommand } from "@/engine/contracts/item-process";
+import {
+	saleResult,
+	soldInventory,
+	commerceJson,
+	commerceInteger,
+	shopCatalog,
+	buybackEntries
+} from "@/engine/foundation/gameplay/commerce";
+import { decodeInventoryItem, etcCarriesPlusByte } from "@/engine/foundation/gameplay/inventory-item";
+import {
+	applyExchangeSwap,
+	emptyExchange,
+	exchangeFrame,
+	exchangeRequest,
+	type ExchangeCommand
+} from "@/engine/foundation/gameplay/exchange";
+import type { ExchangeState } from "@/engine/contracts/item-process";
+import {
+	emptyStall,
+	stallFrame,
+	stallRequest,
+	type StallCommand,
+	type StallOutcome,
+	type StallState
+} from "@/engine/foundation/gameplay/stall";
+import { equipDurabilityWarning } from "@/engine/foundation/audio/item-sounds";
+import type { InventoryItem } from "@/engine/contracts/gameplay";
+import { MALL_BALANCE_CONTROL, MALL_SILK_HISTORY_CONTROL } from "@/engine/foundation/gameplay/commerce-controls";
+import { MAX_INVENTORY_SLOT_COUNT } from "@/engine/foundation/gameplay/quickslots";
+
+const NPC_SHOP_CAPABILITY = 0x1;
+// Capacity announce 0x3092 [kind][capacity]; kind 1 is the bag. The server
+// grows the bag live when a paid expansion completes and announces the new
+// size here, in the same session, with no world entry in between.
+const STORAGE_CAPACITY_OPCODE = 0x3092;
+const STORAGE_CAPACITY_INVENTORY = 1;
+const NPC_SPECIAL_TRADE_CAPABILITY = 0x800;
+// A pet pickup answers when the pet reaches the drop or gives up: the
+// server allows its approach 9000 ms (cosground.go cosPickupApproachTimeoutMs),
+// retires it on the pet's next tick, then the answer crosses the network. The
+// shared 10 s wait left one second for both, and a long walk ended sessions.
+const COS_PICKUP_ANSWER_MS = 15000;
+// An open answer is ordered behind the inbound stream: while frames still
+// arrive it is in transit, not lost. A full answer window past the last
+// frame - or this hard limit from the first frame seen - ends the wait
+// (#2148; the movement receipt rule of #1978 on the item lane).
+const INBOUND_HOLD_MS = 10000;
+const INBOUND_LIMIT_MS = 90000;
+/*
+================
+createInventory
+================
+*/
+export function createInventory(
+	send: ( frame: import("@/engine/contracts/network").WireFrame ) => void,
+	play: ( handle: import("@/engine/foundation/ui/sound-catalog").UiSoundHandle ) => void = () => {},
+	playItem: ( cue: import("@/engine/contracts/audio").ItemSoundRequest ) => void = () => {}
+) {
+	const alchemy = createAlchemy(), gacha = createGacha(), mall = createMall(), magicOption = createMagicOptionGrant();
+	const arena = createArenaChest( preview );
+	const companionRentals = createCompanionRentals();
+	let mallDelivery: { prepared: ReturnType<typeof decodeShopItems>; slots: number[]; } | null = null;
+	let avatars = new Map<number, InventoryItem>();
+	let slots = new Map<number, InventoryItem>(),
+		pending: {
+			receivedSlots?: readonly number[];
+			cosGid?: number;
+			opcode: number;
+			source: number;
+			destination?: number;
+			movementType?: number;
+			amount?: number;
+			npc?: number;
+			tab?: number;
+			quantity?: number;
+			snapshot?: boolean;
+			buybackId?: number;
+			// A warehouse move (storage-room.ts); settled by storageSettle.
+			storage?: boolean;
+			buybackIndex?: number;
+			deadline: number;
+			// The latest deadline an inbound hold may reach, fixed by the first hold.
+			answerLimit?: number;
+			// When the first reference hold reached this request (#2148): the
+			// timeout report stamps how long before the deadline it landed.
+			firstHeldAt?: number;
+		} | null = null,
+		error: string | null = null;
+	let itemCooldowns: readonly ItemCooldown[] = [];
+	// The open player exchange (exchange.ts): its offers name bag slots, so
+	// the swap it reports lands on this owner's slots.
+	let exchange: ExchangeState = emptyExchange();
+	// The street stall the player keeps or stands at, and the stall network
+	// window (stall.ts); a purchase lands on this owner's slots.
+	let stall: StallState = emptyStall();
+	// Port-only, not native: SRO_RAISED_GOLD_CAPS widens the stall offer
+	// price field to u64 (stall.ts); the world entry publishes it.
+	let raisedGoldCaps = false;
+	// Set when a request went unanswered past its deadline; only a world
+	// bootstrap (a fresh entry, or a resumed transport's EnterWorld) clears it.
+	// timedOutRequest names that request for the incident report.
+	let timedOut = false, timedOutRequest = "", timedOutDetail = "";
+	let bindingMoves: import("@/engine/foundation/gameplay/quickslot-inventory").QuickslotInventoryMove[] = [];
+	let shop: import("@/engine/foundation/gameplay/commerce").ShopState | undefined;
+	let shopCompletionRevision = 0;
+	let shopSource: typeof shop, shopPresentation: typeof shop;
+	/*
+================
+preview
+================
+	*/
+	function preview( row: import("@/engine/foundation/gameplay/commerce").CommercePreview ): InventoryItem {
+		const bytes = Uint8Array.from( row.body ), types = new Map( refs );
+		if ( types.has( row.refObjId ) && types.get( row.refObjId ) !== row.typeFlags ) {
+			throw Error( "Conflicting commerce preview type" );
+		}
+		types.set( row.refObjId, row.typeFlags );
+		const decoded = decodeInventoryItem( bytes, 0, types, objRefs );
+		if ( !decoded.item || decoded.next !== bytes.length ) throw Error( "Invalid commerce preview body" );
+		return { ...decoded.item, name: row.name };
+	}
+	/*
+================
+presentShop
+================
+	*/
+	function presentShop() {
+		if ( !shop ) {
+			shopSource = undefined;
+			shopPresentation = undefined;
+			return undefined;
+		}
+		if ( shopSource !== shop ) {
+			shopSource = shop;
+			shopPresentation = {
+				...shop,
+				offers: shop.offers.map( row => ({
+					...row,
+					icon: icons.get( row.refObjId ),
+					items: row.items?.map( present )
+				}) ),
+				buyback: shop.buyback?.map( row => ({
+					...row,
+					icon: icons.get( row.refObjId ),
+					item: row.item ? present( row.item ) : undefined
+				}) )
+			};
+		}
+		return shopPresentation;
+	}
+	/*
+================
+specialtyShopPage
+
+5B694C: while the store page is built, a package whose first item is
+a trade good writes the store's specialty-page field (+0x25F4), the
+field the sell-end test (75113D) reads. The port builds one page per
+shop from its catalogue, so the marker is the shop's: its goods are
+trade goods throughout. A package classifies by its first content,
+as natively; a good with no reference row never marks the page.
+================
+	*/
+	function specialtyShopPage(
+		offers: readonly import("@/engine/foundation/gameplay/commerce").ShopOffer[]
+	): boolean {
+		return offers.length > 0 &&
+			offers.every( offer => isTradeGoods( refs.get( offer.contents?.[0]?.refObjId ?? offer.refObjId ) ?? 0 ) );
+	}
+	// The presented bag (bag()). Every writer of slots clears it: the next
+	// read builds a new array, which is how gameplay's journal sees a change.
+	let published: readonly InventoryItem[] | null = null;
+	// One-shot slot flashes the 0x3645 item-state (7654B0) and 0x31E8 durability
+	// (77C300) updates raised; each lasts under 1.3 s, so older entries are
+	// dropped on the next update.
+	let itemFlashes: readonly {
+		readonly slot: number;
+		readonly kind: "changed" | "life" | "repair";
+		readonly atMs: number;
+	}[] = [];
+	const FLASH_RETENTION_MS = 2000;
+	// Skipped cosmetic steps for the world's degraded reports, bounded the
+	// way entities bounds its queue (the world reports each code once).
+	const MAX_PENDING_DEGRADATIONS = 64;
+	let degradations: Degradation[] = [];
+	const objRefs = new Map<number, number>();
+	const useCooldowns = new Map<number, number>();
+	const refs = new Map<number, number>(), names = new Map<number, string>();
+	const icons = new Map<number, string>();
+	const codenames = new Map<number, string>();
+	const tooltipRefs = new Map<number, ItemTooltipReference>();
+	// The Magic Pang window's twelve prizes with the reference icons, rebuilt when references change.
+	let gachaRows: {
+		iconCount: number;
+		refCount: number;
+		nameCount: number;
+		tooltipCount: number;
+		rows: readonly GachaPrizeRow[];
+	} | null = null;
+	// The chat line a voucher update raises, taken by the gameplay owner after each packet.
+	let exchangeNotice: SystemNotice | null = null;
+	let magicRefs = itemMagicReferences( undefined );
+	let presentations = new WeakMap<InventoryItem, InventoryItem>();
+	/*
+================
+present
+================
+	*/
+	function present( item: InventoryItem ): InventoryItem {
+		const cached = presentations.get( item );
+		if ( cached ) return cached;
+		const tooltip = tooltipRefs.get( item.refObjId );
+		const result = {
+			...item,
+			name: names.get( item.refObjId ) ?? item.name,
+			icon: icons.get( item.refObjId ) ?? item.icon,
+			tooltip,
+			nativeFields: tooltip?.fields,
+			magicReferences: itemMagicDefinitions( item.magic, magicRefs, tooltip?.fields.itemClass )
+		};
+		presentations.set( item, result );
+		return result;
+	}
+	/*
+	================
+	referenceItem
+
+	A plain instance of a reference (no plus, no options, full durability),
+	presented like a bag row: the item a catalogue slot shows before any
+	instance exists (Magic Pang prizes, fortress forge rows). Native binds
+	the same plain record into those slots (CIFSlot_SetBoundItem 56D190),
+	so the hover help is the fresh item's. Undefined while the reference
+	itself has not arrived.
+	================
+	*/
+	function referenceItem( refObjId: number, quantity: number ): InventoryItem | undefined {
+		const typeFlags = refs.get( refObjId );
+		if ( typeFlags === undefined ) return undefined;
+		const item = present( {
+			slot: 0,
+			refObjId,
+			typeFlags,
+			quantity,
+			plus: 0,
+			durability: 0,
+			variance: "0",
+			magic: []
+		} );
+		return { ...item, durability: itemMaxDurability( item ) };
+	}
+	/*
+	================
+	gachaPrizeRows
+
+	The Magic Pang prizes with reference icons. Icons arrive after the first frame, so
+	the cached rows are rebuilt when the icon table has grown.
+	================
+	*/
+	function gachaPrizeRows(): readonly GachaPrizeRow[] {
+		if (
+			gachaRows?.iconCount === icons.size &&
+			gachaRows.refCount === refs.size &&
+			gachaRows.nameCount === names.size &&
+			gachaRows.tooltipCount === tooltipRefs.size
+		) return gachaRows.rows;
+		const rows = gachaPrizes( refs ).map( prize => ({
+			entry: prize.entry,
+			refObjId: prize.refObjId,
+			quantity: prize.quantity,
+			nameSymbol: prize.nameSymbol,
+			icon: icons.get( prize.refObjId ),
+			item: referenceItem( prize.refObjId, prize.quantity )
+		}) );
+		gachaRows = {
+			iconCount: icons.size,
+			refCount: refs.size,
+			nameCount: names.size,
+			tooltipCount: tooltipRefs.size,
+			rows
+		};
+		return rows;
+	}
+	/*
+================
+bag
+
+The presented bag rows, rebuilt only after a writer cleared them: every
+change to the bag yields a new array (gameplay's journal compares it).
+================
+	*/
+	function bag(): readonly InventoryItem[] {
+		return published ?? (published = [ ...slots.values() ].map( present ));
+	}
+	let inventorySlotCount: number | undefined, equipmentSlotCount: number | undefined;
+	/*
+================
+slot
+================
+	*/
+	function slot( n: number ) {
+		if ( !Number.isInteger( n ) || n < 0 || n > 255 ) {
+			throw new Error( "Invalid inventory slot" );
+		}
+		return n;
+	}
+	/*
+================
+degrade
+
+Records a skipped cosmetic step for the world's degraded reports; the
+queue is bounded so an undrained owner cannot grow it.
+================
+	*/
+	function degrade( degradation: Degradation ) {
+		if ( degradations.length < MAX_PENDING_DEGRADATIONS ) degradations.push( degradation );
+	}
+	/*
+================
+companionContext
+
+7892D0 reads the retained object reference, not the item reference association.
+Never synthesize a character reference for a fresh summoner.
+================
+	*/
+	function companionContext( flags: number, context?: CosItemUseContext ): CosItemUseContext {
+		const targetSlot = (flags >>> 7 & 15) === 1 ? context?.revivalSlot : context?.summonerSlot;
+		const target = targetSlot === undefined ? undefined : slots.get( targetSlot );
+		const character = target?.summon?.refObjId;
+		return {
+			records: [],
+			...context,
+			summonedCharacterTypeFlags: character === undefined ? undefined : objRefs.get( character )
+		};
+	}
+	/*
+================
+body
+================
+	*/
+	function body( p: Uint8Array, index: number ): InventoryItem | null {
+		const { item, next } = decodeInventoryItem( p, index, refs, objRefs );
+		if ( next !== p.length ) throw new Error( "Invalid inventory item body" );
+		return item ? { ...item, name: names.get( item.refObjId ), icon: icons.get( item.refObjId ) } : null;
+	}
+
+	/*
+================
+decodeShopItems
+================
+	*/
+	function decodeShopItems(
+		items: unknown,
+		target: ReadonlyMap<number, InventoryItem> = slots,
+		capacity = inventorySlotCount ?? 256
+	) {
+		if ( !Array.isArray( items ) || items.length > 256 ) throw Error( "Invalid shop inventory" );
+		const next = new Map( target ),
+			seen = new Set<number>(),
+			nextRefs = new Map( refs ),
+			nextNames = new Map( names );
+		for ( const row of items ) {
+			if ( !row || typeof row !== "object" ) throw Error( "Invalid shop inventory row" );
+			const n = commerceInteger( row.slot, capacity - 1 ),
+				id = commerceInteger( row.refObjId, 0xffffffff, 1 ),
+				flags = commerceInteger( row.typeFlags, 65535 );
+			if (
+				seen.has( n ) || typeof row.name !== "string" || row.name.length > 256 || !Array.isArray( row.body ) ||
+				row.body.length > 2048
+			) throw Error( "Invalid shop inventory row" );
+			seen.add( n );
+			for ( const b of row.body ) commerceInteger( b, 255 );
+			if ( nextRefs.has( id ) && nextRefs.get( id ) !== flags ) throw Error( "Conflicting shop item reference" );
+			nextRefs.set( id, flags );
+			nextNames.set( id, row.name );
+			const bytes = Uint8Array.from( row.body ), decoded = decodeInventoryItem( bytes, 0, nextRefs, objRefs );
+			if ( !decoded.item || decoded.item.refObjId !== id || decoded.next !== bytes.length ) {
+				throw Error( "Invalid shop item body" );
+			}
+			next.set( n, { ...decoded.item, slot: n, name: row.name } );
+		}
+		return { next, nextRefs, nextNames };
+	}
+	/*
+================
+applyShopItems
+================
+	*/
+	function applyShopItems( items: unknown ) {
+		const { next, nextRefs, nextNames } = decodeShopItems( items );
+		slots = next;
+		refs.clear();
+		for ( const [id, flags] of nextRefs ) refs.set( id, flags );
+		names.clear();
+		for ( const [id, name] of nextNames ) names.set( id, name );
+		published = null;
+		gachaRows = null;
+	}
+	/*
+================
+describeRequest
+
+The unanswered request in the timeout report: its answer opcode, and the
+movement type of an item move.
+================
+	*/
+	function describeRequest( request: NonNullable<typeof pending> ): string {
+		const opcode = "0x" + request.opcode.toString( 16 ).toUpperCase().padStart( 4, "0" );
+		return "movementType" in request && request.movementType !== undefined ?
+			opcode + " move " + request.movementType :
+			opcode;
+	}
+	/*
+================
+timeoutMessage
+================
+	*/
+	function timeoutMessage(): string {
+		const request = timedOutRequest ? " (" + timedOutRequest + ")" : "";
+		const detail = timedOutDetail ? "; " + timedOutDetail : "";
+		return "Inventory transaction timed out" + request + detail + "; reconnect to resynchronize";
+	}
+	/*
+================
+holdAnswer
+
+An open answer waits behind the inbound stream (the reference frames, or
+any frame at all): its deadline reaches until, never past the limit the
+first hold fixed - a stream that never ends must not keep an answer open
+forever. The mall's open request rides the same stream and holds with it.
+================
+	*/
+	function holdAnswer( now: number, until: number, limit: number ) {
+		if ( pending ) {
+			const answerLimit = pending.answerLimit ?? limit;
+			const deadline = Math.max( pending.deadline, Math.min( until, answerLimit ) );
+			pending = { ...pending, deadline, answerLimit, firstHeldAt: pending.firstHeldAt ?? now };
+		}
+		mall.holdUntil( now, until, limit );
+	}
+	/*
+================
+busy
+
+A Magic Pang roll does not hold the bag: native reads its busy byte only
+for the Magic Pang window's own slot (CIFItemSlot_DispatchActivation
+567520..567535, message 0x8C), never for CIFInventory.
+================
+	*/
+	function busy() {
+		return pending !== null || mall.pending() || timedOut || alchemy.state().pending ||
+			magicOption.state().phase === "waiting";
+	}
+	/*
+================
+transfer
+================
+	*/
+	function transfer( next: Map<number, InventoryItem>, source: number, destination: number, quantity: number ) {
+		if ( source === destination ) {
+			throw new Error( "Same-slot inventory result" );
+		}
+		const a = next.get( source ), b = next.get( destination );
+		if ( !a ) {
+			throw new Error( "Inventory result references empty source" );
+		}
+		// Equipment moves swap whole records, including ammunition. Only bag-to-bag
+		// moves may split/merge counts; companion moves obey the same rule.
+		if ( source >= (equipmentSlotCount ?? 13) && destination >= (equipmentSlotCount ?? 13) ) {
+			// 756A60 uses full counts for occupied stacks; the echoed wire quantity
+			// only selects a split into an empty slot. The reference owns the cap.
+			const cap = tooltipRefs.get( a.refObjId )?.fields.maxStack;
+			const caps = new Map<number, number>();
+			if ( cap !== undefined ) caps.set( a.refObjId, cap );
+			const rows = planContainerMove(
+				[ ...next.values() ],
+				{ source, destination, quantity },
+				caps,
+				"inventory"
+			);
+			next.clear();
+			for ( const row of rows ) next.set( row.slot, row );
+			return;
+		}
+		next.set( destination, { ...a, slot: destination } );
+		if ( b ) next.set( source, { ...b, slot: source } );
+		else next.delete( source );
+	}
+	return {
+		/*
+================
+noticeItem
+
+Port-only: the item a drop/plus notice names (notice-links.ts), decoded
+from its body with the bag's own references and presented like a bag row.
+Undefined for anything this client cannot decode; a notice is player-adjacent
+data and never fails the session.
+================
+		*/
+		noticeItem( body: Uint8Array ): InventoryItem | undefined {
+			try {
+				const decoded = decodeInventoryItem( body, 0, refs, objRefs );
+				return decoded.item && decoded.next === body.length ? present( decoded.item ) : undefined;
+			} catch {
+				return undefined;
+			}
+		},
+		/*
+================
+bindCompanion
+
+830EC0 -> 59C2E0 binds the private COS record to its summoner inventory
+slot, and 59DAA0 (CIFInventory_FindSummonerByCompanionGID) locates that
+CSOItem by its bound companion GID (auxParam2) after a bag slot move.
+The separate 3645 receipt owns the native active/dead state byte.
+================
+ */
+		bindCompanion( record: import("@/engine/contracts/gameplay").CosRecord ) {
+			let slot = record.inventorySlot;
+			for ( const [candidateSlot, candidate] of slots ) {
+				if ( candidate.summon?.gid === record.gid ) {
+					slot = candidateSlot;
+					break;
+				}
+			}
+			if ( slot === undefined ) return;
+			const previous = slots.get( slot );
+			// Native 59C2E0 ignores an absent slot; it does not create an item.
+			if ( !previous ) return;
+			if ( (previous.typeFlags & 0x7fe) !== 0xcc ) {
+				throw Error( "Companion record has no summoner item" );
+			}
+			slots.set( slot, {
+				...previous,
+				summon: {
+					...previous.summon,
+					gid: record.gid,
+					state: record.dead ? 4 : 2,
+					refObjId: record.refObjId,
+					name: record.name,
+					rentals: previous.summon?.rentals ?? []
+				}
+			} );
+			published = null;
+		},
+		/*
+================
+openMall
+================
+		*/
+		openMall( now: number ) {
+			if ( busy() ) throw Error( "Inventory command unavailable" );
+			const frame = mall.open( now );
+			send( frame );
+			return frame;
+		},
+		/*
+================
+purchaseMall
+================
+		*/
+		purchaseMall( request: MallPurchase, now: number ) {
+			if ( busy() ) throw Error( "Inventory command unavailable" );
+			const frame = mall.purchase( request, now );
+			send( frame );
+			return frame;
+		},
+		/*
+================
+inquireMallSilkHistory
+================
+		*/
+		inquireMallSilkHistory( period: number, now: number ) {
+			if ( busy() ) throw Error( "Inventory command unavailable" );
+			const frame = mall.inquireSilkHistory( period, now );
+			send( frame );
+			return frame;
+		},
+		/*
+================
+takeBindingMoves
+================
+		*/
+		takeBindingMoves() {
+			const result = bindingMoves;
+			bindingMoves = [];
+			return result;
+		},
+		/*
+================
+nameItem
+================
+		*/
+		nameItem() {
+			const row = slots.get( 8 );
+			return row ? { refObjId: row.refObjId, typeFlags: row.typeFlags } : undefined;
+		},
+		/*
+================
+useType
+================
+		*/
+		useType( slot: number ) {
+			return slots.get( slot )?.typeFlags;
+		},
+		/*
+================
+useCooldown
+================
+		*/
+		useCooldown( slot: number ) {
+			const item = slots.get( slot );
+			return item ? useCooldowns.get( item.refObjId ) ?? 0 : undefined;
+		},
+		present,
+		/*
+================
+objectRefs
+
+The summonable character references (refObjSnapshot) a summoner's
+pet record names, for decoders of rows held elsewhere (the storage room).
+================
+		*/
+		objectRefs(): ReadonlyMap<number, number> {
+			return objRefs;
+		},
+		/*
+================
+takeExchangeNotice
+
+The exchange line the last 0x3645 or 0x3272 raised, once.
+================
+		*/
+		takeExchangeNotice(): SystemNotice | null {
+			const notice = exchangeNotice;
+			exchangeNotice = null;
+			return notice;
+		},
+		/*
+================
+takeDegradations
+
+The skipped cosmetic steps since the last take, for the world's
+degraded reports.
+================
+		*/
+		takeDegradations(): Degradation[] {
+			const taken = degradations;
+			degradations = [];
+			return taken;
+		},
+		/*
+================
+reference
+
+A reference's name and icon by id, for rows that are no item (the forge).
+================
+		*/
+		reference( refObjId: number ) {
+			return { name: names.get( refObjId ), icon: icons.get( refObjId ) };
+		},
+		/*
+================
+referenceItem
+================
+		*/
+		referenceItem,
+		/*
+================
+petGearItem
+
+A fresh item of a known reference in a slot that is no bag slot (a pet's
+worn gear and its blue options, pet-training.ts), with the bag's name, icon
+and tooltip; null for a reference this client was never told about.
+================
+		*/
+		petGearItem( refObjId: number, slot: number, magic: readonly string[] = [] ): InventoryItem | null {
+			const typeFlags = refs.get( refObjId );
+			if ( typeFlags === undefined ) return null;
+			return present( {
+				slot,
+				refObjId,
+				typeFlags,
+				quantity: 1,
+				plus: 0,
+				durability: 0,
+				variance: "0",
+				magic: [ ...magic ]
+			} );
+		},
+		/*
+================
+presented
+
+Rows another owner holds (the storage room) with the bag's names, icons and
+tooltips. A listed storage row carries only its reference id; without this
+it drew nothing, and only rows moved in from the bag (which keep theirs)
+showed until the next login (BUG-069).
+================
+		*/
+		presented( items: readonly InventoryItem[] ): InventoryItem[] {
+			return items.map( present );
+		},
+		/*
+================
+references
+================
+		*/
+		references( rows: readonly import("@/engine/foundation/gameplay/commerce").CommerceItemReference[] ) {
+			for ( const row of rows ) {
+				if ( refs.has( row.refObjId ) && refs.get( row.refObjId ) !== row.typeFlags ) {
+					throw Error( "Conflicting inventory item reference" );
+				}
+			}
+			for ( const row of rows ) {
+				refs.set( row.refObjId, row.typeFlags );
+				names.set( row.refObjId, row.name );
+				if ( row.icon !== undefined ) icons.set( row.refObjId, row.icon );
+				if ( row.tooltip ) tooltipRefs.set( row.refObjId, row.tooltip );
+			}
+			published = null;
+			presentations = new WeakMap();
+			gachaRows = null;
+			shopSource = undefined;
+		},
+		/*
+================
+bootstrap
+================
+		*/
+		bootstrap( value: unknown ) {
+			bindingMoves = [];
+			raisedGoldCaps = (value as { raisedGoldCaps?: unknown; } | null)?.raisedGoldCaps === true;
+			itemCooldowns = [];
+			presentations = new WeakMap();
+			gachaRows = null;
+			alchemy.reset();
+			companionRentals.reset();
+			gacha.reset();
+			exchange = emptyExchange();
+			// Keep naming identity and the log sequence when an empty phase is not
+			// published to the UI.
+			stall = { ...emptyStall( stall.namingSequence ), logSequence: stall.logSequence };
+			mall.reset();
+			mallDelivery = null;
+			tooltipRefs.clear();
+			magicRefs = itemMagicReferences( (value as { magicOptionSnapshot?: unknown; }).magicOptionSnapshot );
+			magicOption.bootstrap( (value as { avatarMagicOptions?: unknown; }).avatarMagicOptions, magicRefs );
+			const b = value as {
+				inventorySlotCount?: number;
+				equipmentSlotCount?: number;
+				refItemSnapshot?: {
+					icon?: string;
+					name?: string;
+					codename?: string;
+					nativeFields?: { useCooldownDuration528?: number; };
+					descriptionSymbol?: string;
+					refObjId: number;
+					typeFlags: number;
+				}[];
+				avatarItems?: { slot: number; refObjId: number; body: number[]; }[];
+				equipItems?: {
+					slot: number;
+					refObjId: number;
+					body: number[];
+				}[];
+			};
+			if (
+				b.inventorySlotCount !== undefined &&
+				(!Number.isInteger( b.inventorySlotCount ) || b.inventorySlotCount < 1 || b.inventorySlotCount > 256 ||
+					!Number.isInteger( b.equipmentSlotCount ) || b.equipmentSlotCount! < 0 ||
+					b.equipmentSlotCount! > b.inventorySlotCount)
+			) throw new Error( "Invalid inventory capacity" );
+			inventorySlotCount = b.inventorySlotCount;
+			equipmentSlotCount = b.equipmentSlotCount;
+			names.clear();
+			icons.clear();
+			codenames.clear();
+			objRefs.clear();
+			for (
+				const row of (value as { refObjSnapshot?: { refObjId: number; tidWord: number; }[]; }).refObjSnapshot ??
+					[]
+			) objRefs.set( row.refObjId, row.tidWord );
+			refs.clear();
+			useCooldowns.clear();
+			slots.clear();
+			avatars.clear();
+			pending = null;
+			shop = undefined;
+			timedOut = false;
+			timedOutRequest = "";
+			timedOutDetail = "";
+			error = null;
+			for ( const r of b.refItemSnapshot ?? [] ) {
+				const tooltip = itemTooltipReference( r.nativeFields, r.descriptionSymbol );
+				if ( tooltip ) tooltipRefs.set( r.refObjId, tooltip );
+				if ( r.icon !== undefined ) {
+					if ( typeof r.icon !== "string" || r.icon.length > 256 ) throw Error( "Invalid item icon" );
+					icons.set( r.refObjId, r.icon );
+				}
+				const cooldown = r.nativeFields?.useCooldownDuration528 ?? 0;
+				if ( !Number.isInteger( cooldown ) || cooldown < 0 || cooldown > 0x7fffffff ) {
+					throw Error( "Invalid item cooldown authority" );
+				}
+				useCooldowns.set( r.refObjId, cooldown );
+				refs.set( r.refObjId, r.typeFlags );
+				if ( typeof r.name === "string" ) names.set( r.refObjId, r.name );
+				if ( typeof r.codename === "string" ) codenames.set( r.refObjId, r.codename );
+			}
+			const next = new Map<number, InventoryItem>(), seenSlots = new Set<number>();
+			for ( const row of b.equipItems ?? [] ) {
+				const n = slot( row.slot );
+				if ( seenSlots.has( n ) ) {
+					throw new Error( "Duplicate inventory slot" );
+				}
+				seenSlots.add( n );
+				const item = body( Uint8Array.from( row.body ), 0 );
+				if ( (item?.refObjId ?? 0) !== row.refObjId ) {
+					throw new Error( "Inventory reference mismatch" );
+				}
+				if ( item ) next.set( n, { ...item, slot: n } );
+			}
+			const nextAvatars = new Map<number, InventoryItem>();
+			for ( const row of b.avatarItems ?? [] ) {
+				const n = slot( row.slot );
+				if ( n >= AVATAR_STORAGE_CAPACITY || nextAvatars.has( n ) ) {
+					throw Error( "Invalid avatar storage slot" );
+				}
+				const item = body( Uint8Array.from( row.body ), 0 );
+				if (
+					!item || item.refObjId !== row.refObjId || !isAvatarItem( item.typeFlags ) ||
+					!avatarSlotFits( item.typeFlags, n )
+				) {
+					throw Error( "Invalid avatar item" );
+				}
+				nextAvatars.set( n, { ...item, slot: n } );
+			}
+			avatars = nextAvatars;
+			slots = next;
+			published = null;
+		},
+		/*
+================
+process
+================
+		*/
+		/*
+================
+exchangeReceive
+
+Folds an exchange frame; returns null when the frame is not the
+exchange's, else the category-1 notice code it raised (0 for none).
+================
+		*/
+		exchangeReceive( frame: import("@/engine/contracts/network").WireFrame ): number | null {
+			const outcome = exchangeFrame( exchange, frame, refs, objRefs );
+			if ( !outcome ) return null;
+			if ( outcome.swap ) {
+				slots = applyExchangeSwap( slots, outcome.swap, equipmentSlotCount ?? 13, inventorySlotCount ?? 45 );
+				published = null;
+			}
+			if ( outcome.message ) exchangeNotice = outcome.message;
+			exchange = outcome.state;
+			return outcome.notice ?? 0;
+		},
+		/*
+================
+stallReceive
+
+Folds a stall frame and applies its bag changes; null when the frame is
+not the stall's.
+================
+		*/
+		stallReceive( frame: import("@/engine/contracts/network").WireFrame, localGid: number ): StallOutcome | null {
+			const outcome = stallFrame( stall, frame, { localGid, refs, objRefs, names, widePrice: raisedGoldCaps } );
+			if ( !outcome ) return null;
+			const firstBag = equipmentSlotCount ?? 13, endBag = inventorySlotCount ?? 45;
+			if ( outcome.receive?.length || outcome.give?.length ) {
+				const next = new Map( slots );
+				for ( const item of outcome.receive ?? [] ) {
+					let slot = firstBag;
+					while ( slot < endBag && next.has( slot ) ) slot++;
+					if ( slot >= endBag ) throw Error( "Stall purchase exceeds the bag" );
+					next.set( slot, { ...item, slot } );
+				}
+				for ( const give of outcome.give ?? [] ) {
+					const row = next.get( give.bagSlot );
+					if ( !row ) continue;
+					if ( row.quantity > give.quantity ) {
+						next.set( give.bagSlot, { ...row, quantity: row.quantity - give.quantity } );
+					} else next.delete( give.bagSlot );
+				}
+				slots = next;
+				published = null;
+			}
+			stall = outcome.state;
+			return outcome;
+		},
+		/*
+================
+stallPhase
+================
+		*/
+		stallPhase(): StallState["phase"] {
+			return stall.phase;
+		},
+		/*
+================
+interactionWindowOpen
+
+The windows CGInterface_IsInteractionBlocked (67D090) tests after the NPC
+lock: the alchemy box (67D0A3), a visible stall control for its owner or a
+visitor (67D0AE), the gacha machine (67D0CB) and the stall network (67D0D6).
+================
+		*/
+		interactionWindowOpen() {
+			return alchemy.state().visible || gacha.state().visible || stall.phase === "owner" ||
+				stall.phase === "visitor" || stall.network.open;
+		},
+		/*
+================
+tradePinned
+
+The player keeps a stall, stands at one or has an exchange open: the
+server's interaction gate (action PlayerInteractionLocked, #3433) refuses
+its walks and its skills until the window closes.
+================
+		*/
+		tradePinned() {
+			return stall.phase === "owner" || stall.phase === "visitor" || exchange.open;
+		},
+		/*
+================
+stallCommand
+================
+		*/
+		stallCommand( command: StallCommand ) {
+			const request = stallRequest( stall, command, raisedGoldCaps );
+			stall = request.state;
+			for ( const frame of request.frames ) send( frame );
+			return request.frames.at( -1 ) ?? null;
+		},
+		/*
+================
+exchangeCommand
+================
+		*/
+		exchangeCommand( command: ExchangeCommand ) {
+			const frame = exchangeRequest( exchange, command );
+			if ( command.kind === "exchange-request" ) exchange = { ...exchange, requesting: true };
+			send( frame );
+			return frame;
+		},
+		process( command: ItemProcessCommand, now: number ) {
+			if ( command.kind === "alchemy-open" ) {
+				alchemy.open();
+				return null;
+			}
+			if ( command.kind === "alchemy-close" || command.kind === "alchemy-cancel" ) {
+				const frame = alchemy.cancel();
+				if ( frame ) send( frame );
+				if ( command.kind === "alchemy-close" ) alchemy.close();
+				return frame;
+			}
+			if ( command.kind === "gacha-close" ) {
+				gacha.close();
+				return null;
+			}
+			if ( command.kind === "magic-option-close" ) {
+				magicOption.close();
+				return null;
+			}
+			// The window's item and confirm answer with notices (magicOptionItem).
+			if ( command.kind === "magic-option-take" || command.kind === "magic-option-grant" ) {
+				throw Error( "Magic option item commands go through magicOptionItem" );
+			}
+			if ( busy() ) throw Error( "Inventory process unavailable" );
+			if ( command.kind === "magic-option-open" ) {
+				const frame = magicOption.open( command.gid );
+				send( frame );
+				return frame;
+			}
+			if ( command.kind === "gacha-roll" ) {
+				for ( const cue of gacha.start( command.entry, command.slot, slots.get( command.slot ), now ) ) {
+					play( cue );
+				}
+				return null;
+			}
+			if ( command.kind === "gacha-exchange" ) {
+				const exchange = gacha.exchange( command.gid );
+				send( exchange );
+				return exchange;
+			}
+			// 625980 names the designated attribute's change apart from
+			// an assimilated one, so the start remembers which attribute
+			// the used stone designates (its codename names it).
+			let designated: string | undefined;
+			if ( command.kind === "alchemy-start" ) {
+				for ( const slot of command.slots.slice( 1 ) ) {
+					designated = stoneDesignatedAttribute(
+						command.mode,
+						codenames.get( slots.get( slot )?.refObjId ?? -1 )
+					);
+					if ( designated ) break;
+				}
+			}
+			const frame = command.kind === "gacha-open" ?
+				gacha.open( command.gid ) :
+				alchemy.start( command.mode, command.slots, slots, now, command.quantity, designated );
+			send( frame );
+			return frame;
+		},
+		/*
+================
+magicOptionItem
+
+The grant window's item drop and confirm: the request it sends, or the
+notice symbol of a refusal the client makes itself.
+================
+		*/
+		magicOptionItem(
+			command: { readonly kind: "magic-option-take"; readonly slot: number; } | {
+				readonly kind: "magic-option-grant";
+				readonly codename: string;
+			}
+		): string | null {
+			if ( command.kind === "magic-option-take" ) return magicOption.take( slots.get( command.slot ) );
+			if ( busy() ) throw Error( "Inventory process unavailable" );
+			// The free-slot check reads the reference's option capacity
+			// (maxMagicOptions51c), which only the presented item carries; the
+			// bare slot row read as 0 and refused every grant without a request.
+			const row = slots.get( magicOption.state().item ?? -1 ),
+				result = magicOption.grant( command.codename, row && present( row ) );
+			if ( result.frame ) send( result.frame );
+			return result.notice ?? null;
+		},
+		/*
+================
+cosTrade
+================
+		*/
+		cosTrade(
+			record: import("@/engine/contracts/gameplay").CosRecord,
+			buy: boolean,
+			slot: number,
+			quantity: number,
+			tab: number,
+			now: number
+		) {
+			if (
+				busy() || !shop || shop.error || record.dead || record.hp === 0 || !record.inventory ||
+				record.status < 1
+			) throw Error( "COS shop unavailable" );
+			commerceInteger( slot, 255 );
+			commerceInteger( quantity, 65535, 1 );
+			commerceInteger( tab, 255 );
+			if ( buy && !shop.offers.some( row => row.tab === tab && row.slot === slot ) ) {
+				throw Error( "Unknown shop offer" );
+			}
+			if ( !buy && !record.inventory.some( row => row.slot === slot && row.quantity >= quantity ) ) {
+				throw Error( "COS sale source unavailable" );
+			}
+			const payload = new Uint8Array( buy ? 13 : 12 ), v = new DataView( payload.buffer );
+			payload[0] = buy ? 19 : 20;
+			v.setUint32( 1, record.gid, true );
+			if ( buy ) {
+				payload[5] = tab;
+				payload[6] = slot;
+			} else payload[5] = slot;
+			v.setUint16( buy ? 7 : 6, quantity, true );
+			v.setUint32( buy ? 9 : 8, shop.npc, true );
+			const frame = { opcode: 0x706d, payload };
+			send( frame );
+			pending = {
+				opcode: 0xb06d,
+				cosGid: record.gid,
+				source: slot,
+				npc: shop.npc,
+				tab,
+				quantity,
+				movementType: buy ? 19 : 20,
+				deadline: now + 10000
+			};
+			error = null;
+			return frame;
+		},
+		/*
+================
+cosShopSnapshot
+================
+		*/
+		cosShopSnapshot( record: import("@/engine/contracts/gameplay").CosRecord, p: Uint8Array ) {
+			const r = commerceJson( p );
+			if (
+				pending?.movementType !== 19 || pending.snapshot || r.cosGid !== record.gid ||
+				pending.cosGid !== record.gid || r.npc !== pending.npc || r.tab !== pending.tab ||
+				r.slot !== pending.source || r.quantity !== pending.quantity
+			) throw Error( "Unexpected COS shop snapshot" );
+			const { next } = decodeShopItems(
+				r.items,
+				new Map( record.inventory!.map( row => [ row.slot, row ] ) ),
+				record.status
+			);
+			pending = {
+				...pending,
+				snapshot: true,
+				receivedSlots: (r.items as { slot: number; }[]).map( row => row.slot )
+			};
+			return { ...record, inventory: [ ...next.values() ] };
+		},
+		/*
+================
+cosPurchase
+================
+		*/
+		cosPurchase( p: Uint8Array ) {
+			if ( p.length < 11 || p[0] !== 1 || p[1] !== 19 || p.length !== 11 + p[8]! ) {
+				throw Error( "Invalid COS purchase result" );
+			}
+			const v = new DataView( p.buffer, p.byteOffset, p.byteLength );
+			if (
+				pending?.movementType !== 19 || !pending.snapshot || pending.cosGid !== v.getUint32( 2, true ) ||
+				pending.tab !== p[6] || pending.source !== p[7] ||
+				pending.quantity !== v.getUint16( p.length - 2, true )
+			) throw Error( "Unmatched COS purchase result" );
+			const destinations = [ ...p.subarray( 9, p.length - 2 ) ];
+			if (
+				!destinations.length || destinations.some( slot => !pending!.receivedSlots?.includes( slot ) ) ||
+				pending.receivedSlots?.some( slot => !destinations.includes( slot ) )
+			) throw Error( "COS purchase destinations differ from snapshot" );
+			pending = null;
+			error = null;
+		},
+		/*
+================
+cosSold
+================
+		*/
+		cosSold( gid: number, slot: number, quantity: number, npc: number ) {
+			if ( !pending ) return; // Retain authoritative sale publications with no local intent.
+			if (
+				pending?.movementType !== 20 || pending.cosGid !== gid || pending.source !== slot ||
+				pending.quantity !== quantity || pending.npc !== npc
+			) throw Error( "Unmatched COS sale result" );
+			pending = null;
+			error = null;
+		},
+		/*
+================
+storageMove
+
+Plan the move against the current bag and room before it reaches the wire,
+so an impossible request never leaves the client.
+================
+		*/
+		storageMove( room: StorageRoom, move: StorageMove, now: number, caps: ReadonlyMap<number, number> ) {
+			if ( busy() ) throw Error( "Inventory command unavailable" );
+			if ( room.phase !== "open" ) throw Error( "Storage room is not open" );
+			const bagMove = move.type === STORAGE_MOVE_DEPOSIT || move.type === STORAGE_MOVE_WITHDRAW;
+			const bagSlot = move.type === STORAGE_MOVE_DEPOSIT ? move.source : move.destination;
+			if (
+				bagMove && (bagSlot < equipmentSlotCount! || bagSlot >= inventorySlotCount!) ||
+				move.type !== STORAGE_MOVE_ROOM && !bagMove && move.gold < 1
+			) throw Error( "Invalid storage move" );
+			storageMoveResult(
+				{ opcode: 0xb06d, payload: Uint8Array.of( 1, move.type ) },
+				room,
+				[ ...slots.values() ],
+				move,
+				caps
+			);
+			const frame = storageMoveRequest( room.npc, move, room.guild );
+			send( frame );
+			pending = {
+				opcode: 0xb06d,
+				movementType: move.type,
+				source: move.source,
+				destination: move.destination,
+				quantity: move.quantity,
+				amount: move.gold,
+				npc: room.npc,
+				storage: true,
+				deadline: now + 10000
+			};
+			error = null;
+			return frame;
+		},
+		/*
+================
+storageSettle
+
+The room after the pending warehouse move's success echo, or null when the
+frame is not that echo (a rejection takes the generic receive path).
+================
+		*/
+		storageSettle( room: StorageRoom, p: Uint8Array, caps: ReadonlyMap<number, number> ): StorageRoom | null {
+			if ( !pending?.storage || p[0] !== 1 || p[1] !== storageWireType( pending.movementType!, room.guild ) ) {
+				return null;
+			}
+			const v = new DataView( p.buffer, p.byteOffset, p.byteLength );
+			const echo = pending.movementType === STORAGE_MOVE_ROOM ?
+				p.length === 6 && p[2] === pending.source && p[3] === pending.destination &&
+				v.getUint16( 4, true ) === pending.quantity :
+				pending.movementType === STORAGE_MOVE_DEPOSIT || pending.movementType === STORAGE_MOVE_WITHDRAW ?
+				p.length === 4 && p[2] === pending.source && p[3] === pending.destination :
+				p.length === 6 && v.getUint32( 2, true ) === pending.amount;
+			if ( !echo ) throw Error( "Unmatched storage move result" );
+			const move: StorageMove = {
+				type: pending.movementType!,
+				source: pending.source,
+				destination: pending.destination ?? 0,
+				quantity: pending.quantity ?? 0,
+				gold: pending.amount ?? 0
+			};
+			const next = storageMoveResult( { opcode: 0xb06d, payload: p }, room, [ ...slots.values() ], move, caps )!;
+			slots = new Map( next.bag.map( row => [ row.slot, row ] ) );
+			published = null;
+			pending = null;
+			return next.room;
+		},
+		/*
+================
+transferCos
+
+A quick transfer names no destination; the slot is picked here, where the
+stack limits are known. No slot to fill sends nothing.
+================
+		*/
+		transferCos(
+			record: import("@/engine/contracts/gameplay").CosRecord,
+			toCos: boolean,
+			source: number,
+			requested: number | undefined,
+			now: number,
+			caps: ReadonlyMap<number, number>
+		) {
+			if ( busy() ) throw Error( "Inventory command unavailable" );
+			const destination = requested ?? cosQuickDestination( record, [ ...slots.values() ], toCos, source, {
+				capacity: inventorySlotCount!,
+				equipment: equipmentSlotCount!
+			}, caps );
+			if ( destination === null ) return null;
+			planCosTransfer(
+				record,
+				[ ...slots.values() ],
+				toCos,
+				source,
+				destination,
+				inventorySlotCount!,
+				equipmentSlotCount!,
+				caps
+			);
+			const frame = cosTransferRequest( record.gid, toCos, source, destination );
+			send( frame );
+			pending = {
+				opcode: 0xb06d,
+				cosGid: record.gid,
+				source,
+				destination,
+				movementType: toCos ? 0x1b : 0x1a,
+				deadline: now + 10000
+			};
+			error = null;
+			return frame;
+		},
+		/*
+================
+cosTransferred
+================
+		*/
+		cosTransferred(
+			record: import("@/engine/contracts/gameplay").CosRecord,
+			p: Uint8Array,
+			caps: ReadonlyMap<number, number>
+		) {
+			// Set aside like receive: the resynchronizing bootstrap rebuilds it.
+			if ( timedOut ) return record;
+			if ( p.length !== 8 || p[0] !== 1 || (p[1] !== 0x1a && p[1] !== 0x1b) ) {
+				throw Error( "Invalid COS transfer result" );
+			}
+			const gid = new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint32( 2, true );
+			const matched = pending && pending.opcode === 0xb06d && pending.movementType === p[1] &&
+				pending.cosGid === gid && record.gid === gid && pending.source === p[6] &&
+				pending.destination === p[7];
+			if ( !matched ) {
+				// Native 756CF0 arms 0x1A/0x1B hold no request to match: the
+				// result applies to the bags it names, and a replayed copy of
+				// an already-applied transfer finds its source slot empty and
+				// changes nothing. The port keeps its pending only as the
+				// authority for what a live request may consume: a result
+				// whose source item is already gone is a duplicate or a
+				// re-entry replay and is set aside, never a session failure.
+				// A mismatched result against a live pending whose source
+				// item is still present stays fatal, as before.
+				if ( record.gid !== gid ) return record;
+				const sourcePresent = p[1] === 0x1b ?
+					slots.has( p[6]! ) :
+					(record.inventory?.some( row => row.slot === p[6] ) ?? false);
+				if ( !sourcePresent ) return record;
+				if ( pending ) throw Error( "Unmatched COS transfer result" );
+			}
+			const next = planCosTransfer(
+				record,
+				[ ...slots.values() ],
+				p[1] === 0x1b,
+				p[6]!,
+				p[7]!,
+				inventorySlotCount!,
+				equipmentSlotCount!,
+				caps
+			);
+			slots = new Map( next.player.map( row => [ row.slot, row ] ) );
+			published = null;
+			pending = null;
+			return next.cos;
+		},
+		/*
+================
+cosGround
+================
+		*/
+		cosGround( frame: import("@/engine/contracts/network").WireFrame, now: number ) {
+			if ( busy() ) throw Error( "Inventory command unavailable" );
+			const p = frame.payload, v = new DataView( p.buffer, p.byteOffset, p.byteLength );
+			if ( frame.opcode !== 0x706d || !(p[0] === 0x11 && p.length === 9 || p[0] === 0x12 && p.length === 6) ) {
+				throw Error( "Invalid COS ground request" );
+			}
+			send( frame );
+			pending = {
+				opcode: 0xb06d,
+				cosGid: v.getUint32( 1, true ),
+				source: p[0] === 0x12 ? p[5]! : 0,
+				movementType: p[0],
+				deadline: now + (p[0] === 0x11 ? COS_PICKUP_ANSWER_MS : 10000)
+			};
+			error = null;
+			return frame;
+		},
+		/*
+================
+cosPickupShown
+
+A pet's pickup that the party's item share hands to another member is
+answered to that member alone: 525DC0 rewrites the record to a type-6
+pickup addressed to the recipient (+0x28/+0x2C), so the owner sees only the
+pet's 0x35C7 scoop. The pet's own grant answers before its scoop in the same
+burst, so a scoop that finds the request still pending ends it.
+================
+		*/
+		cosPickupShown( gid: number ) {
+			if ( pending?.opcode === 0xb06d && pending.movementType === 0x11 && pending.cosGid === gid ) {
+				pending = null;
+				error = null;
+			}
+		},
+		/*
+================
+cosGrounded
+================
+		*/
+		cosGrounded( p: Uint8Array ) {
+			const gid = new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint32( 2, true );
+			const matched = !!pending && pending.cosGid === gid && pending.movementType === p[1] &&
+				(p[1] !== 0x12 || pending.source === p[6]);
+			// A pet's pickup holds no lock in the original client: a receipt
+			// whose request another scoop already ended (cosPickupShown) still
+			// applies to the pet's bag. A drop answers only its own request.
+			if ( !matched && p[1] === 0x11 ) return;
+			if ( !matched ) throw Error( "Unmatched COS ground result" );
+			pending = null;
+			error = null;
+		},
+		/*
+================
+cosMove
+================
+		*/
+		cosMove( frame: import("@/engine/contracts/network").WireFrame, now: number ) {
+			if ( busy() ) throw Error( "Inventory command unavailable" );
+			const p = frame.payload, v = new DataView( p.buffer, p.byteOffset, p.byteLength );
+			if ( frame.opcode !== 0x706d || p.length !== 9 || p[0] !== 0x10 ) {
+				throw Error( "Invalid COS inventory command" );
+			}
+			send( frame );
+			pending = {
+				opcode: 0xb06d,
+				cosGid: v.getUint32( 1, true ),
+				source: p[5]!,
+				destination: p[6]!,
+				quantity: v.getUint16( 7, true ),
+				movementType: 0x10,
+				deadline: now + 10000
+			};
+			error = null;
+			return frame;
+		},
+		/*
+================
+cosMoved
+================
+		*/
+		cosMoved( p: Uint8Array ) {
+			const v = new DataView( p.buffer, p.byteOffset, p.byteLength );
+			if (
+				p.length !== 10 || pending?.movementType !== 0x10 || pending.cosGid !== v.getUint32( 2, true ) ||
+				pending.source !== p[6] || pending.destination !== p[7] || pending.quantity !== v.getUint16( 8, true )
+			) throw Error( "Unmatched COS inventory result" );
+			pending = null;
+			error = null;
+		},
+		/*
+================
+avatarMove
+================
+		*/
+		avatarMove( equip: boolean, source: number, destination: number, now: number ) {
+			if ( busy() ) throw Error( "Inventory is busy" );
+			slot( source );
+			slot( destination );
+			const from = equip ? slots : avatars, to = equip ? avatars : slots, item = from.get( source );
+			if (
+				!item || !isAvatarItem( item.typeFlags ) || (equip && to.has( destination )) || (equip ?
+					(source < (equipmentSlotCount ?? 13) || source >= (inventorySlotCount ?? 0) ||
+						!avatarSlotFits( item.typeFlags, destination )) :
+					(source >= AVATAR_STORAGE_CAPACITY || destination < (equipmentSlotCount ?? 13) ||
+						destination >= (inventorySlotCount ?? 0)))
+			) throw Error( "Invalid avatar transfer" );
+			const movementType = equip ? 0x24 : 0x23,
+				frame = { opcode: 0x706d, payload: Uint8Array.of( movementType, source, destination ) };
+			send( frame );
+			pending = { opcode: 0xb06d, source, destination, movementType, deadline: now + 10000 };
+			error = null;
+			return frame;
+		},
+		/*
+================
+move
+================
+		*/
+		move( source: number, destination: number, quantity: number, now = 0 ) {
+			if ( timedOut ) throw Error( timeoutMessage() );
+			slot( source );
+			slot( destination );
+			if (
+				inventorySlotCount !== undefined && (source >= inventorySlotCount || destination >= inventorySlotCount)
+			) throw new Error( "Inventory slot exceeds capacity" );
+			if (
+				busy() || !slots.has( source ) || source === destination || !Number.isInteger( quantity ) ||
+				quantity < 0 || quantity > 65535
+			) {
+				throw new Error( "Inventory command unavailable" );
+			}
+			const p = new Uint8Array( 5 );
+			p[1] = source;
+			p[2] = destination;
+			new DataView( p.buffer ).setUint16( 3, quantity, true );
+			const frame = { opcode: 0x706d, payload: p };
+			send( frame );
+			pending = { opcode: 0xb06d, source, destination, movementType: 0, deadline: now + 10000 };
+			error = null;
+			return frame;
+		},
+		/*
+================
+drop
+================
+		*/
+		drop( n: number, now = 0 ) {
+			if ( timedOut ) throw Error( timeoutMessage() );
+			const item = slots.get( slot( n ) );
+			if ( busy() || !item || n < (equipmentSlotCount ?? 13) ) throw Error( "Item drop unavailable" );
+			const frame = { opcode: 0x706d, payload: Uint8Array.of( 7, n ) };
+			send( frame );
+			pending = { opcode: 0xb06d, source: n, movementType: 7, deadline: now + 10000 };
+			error = null;
+			return frame;
+		},
+		/*
+================
+dropGold
+================
+		*/
+		dropGold( amount: number, now = 0 ) {
+			if ( timedOut ) throw Error( timeoutMessage() );
+			if ( busy() || !Number.isInteger( amount ) || amount < 1 || amount > 100000000 ) {
+				throw Error( "Gold drop unavailable" );
+			}
+			const payload = new Uint8Array( 5 );
+			payload[0] = 10;
+			new DataView( payload.buffer ).setUint32( 1, amount, true );
+			const frame = { opcode: 0x706d, payload };
+			send( frame );
+			pending = { opcode: 0xb06d, source: 0, movementType: 10, amount, deadline: now + 10000 };
+			error = null;
+			return frame;
+		},
+		/*
+================
+openShop
+================
+		*/
+		openShop( gid: number, now: number, capabilities = NPC_SHOP_CAPABILITY ) {
+			if ( busy() ) throw Error( "Inventory command unavailable" );
+			commerceInteger( gid, 0xffffffff, 1 );
+			const payload = new Uint8Array( 8 ), v = new DataView( payload.buffer );
+			v.setUint32( 0, gid, true );
+			// 5DA414..5DA426: the shop row selects special trade when granted.
+			const mask = capabilities & NPC_SPECIAL_TRADE_CAPABILITY ?
+				NPC_SPECIAL_TRADE_CAPABILITY :
+				NPC_SHOP_CAPABILITY;
+			v.setUint32( 4, mask, true );
+			const frame = { opcode: 0x7338, payload };
+			send( frame );
+			if ( shop?.npc !== gid ) shop = undefined;
+			pending = { opcode: 11, source: 0, npc: gid, deadline: now + 10000 };
+			return frame;
+		},
+		/*
+================
+closeSpecialtyShop
+
+751114..751150: the specialty sell-end hides the shop when the open
+page is the specialty-goods page (75113D), before the banner. Any
+other open shop stays. Returns whether a shop closed.
+================
+		*/
+		closeSpecialtyShop() {
+			if ( !shop?.specialty ) return false;
+			shop = undefined;
+			shopCompletionRevision++;
+			return true;
+		},
+		/*
+================
+trade
+================
+		*/
+		trade( buy: boolean, n: number, quantity: number, tab: number, now: number ) {
+			if ( busy() || !shop || shop.error ) throw Error( "Shop is unavailable" );
+			commerceInteger( n, 255 );
+			commerceInteger( quantity, 65535, 1 );
+			commerceInteger( tab, 255 );
+			if ( buy && !shop.offers.some( o => o.tab === tab && o.slot === n ) ) throw Error( "Unknown shop offer" );
+			if ( !buy ) {
+				const item = slots.get( n );
+				if ( !item || n < (equipmentSlotCount ?? 13) || quantity > item.quantity ) {
+					throw Error( "Sale is unavailable" );
+				}
+			}
+			const payload = new Uint8Array( buy ? 9 : 8 ), v = new DataView( payload.buffer );
+			payload[0] = buy ? 8 : 9;
+			if ( buy ) {
+				payload[1] = tab;
+				payload[2] = n;
+			} else payload[1] = n;
+			v.setUint16( buy ? 3 : 2, quantity, true );
+			v.setUint32( buy ? 5 : 4, shop.npc, true );
+			const frame = { opcode: 0x706d, payload };
+			send( frame );
+			pending = {
+				opcode: 0xb06d,
+				source: n,
+				movementType: buy ? 8 : 9,
+				npc: shop.npc,
+				tab,
+				quantity,
+				deadline: now + 10000
+			};
+			error = null;
+			return frame;
+		},
+		/*
+================
+buyback
+================
+		*/
+		buyback( id: number, now: number ) {
+			if ( busy() || !shop || shop.error || !shop.buyback?.some( e => e.id === id ) ) {
+				throw Error( "Buyback unavailable" );
+			}
+			commerceInteger( id, 0xffffffff, 1 );
+			const entry = shop.buyback.find( e => e.id === id )!;
+			const payload = new Uint8Array( 5 ), v = new DataView( payload.buffer );
+			v.setUint32( 0, shop.npc, true );
+			payload[4] = entry.index;
+			const frame = { opcode: 0x77e7, payload };
+			send( frame );
+			pending = {
+				opcode: 13,
+				source: 0,
+				npc: shop.npc,
+				buybackId: id,
+				buybackIndex: entry.index,
+				quantity: entry.quantity,
+				deadline: now + 10000
+			};
+			error = null;
+			return frame;
+		},
+		/*
+================
+repair
+
+0x746F at the shop's smith: one inventory slot, or every item. The answer
+is 0xB46F; each repaired item's durability and the balance ride their own
+packets.
+================
+		*/
+		repair( mode: 1 | 2, slot: number, now: number ) {
+			if ( busy() || !shop || shop.error ) throw Error( "Repair is unavailable" );
+			const frame = repairRequest( shop.npc, mode, mode === REPAIR_ONE_SLOT ? slot : 0 );
+			send( frame );
+			pending = { opcode: REPAIR_RESPONSE_OPCODE, source: slot, npc: shop.npc, deadline: now + 10000 };
+			error = null;
+			return frame;
+		},
+		/*
+================
+holdForDress
+
+A job dress bar (0x3434) holds the suit move's answer for its seconds.
+================
+		*/
+		holdForDress( until: number ) {
+			if ( pending?.opcode === 0xb06d ) pending = { ...pending, deadline: Math.max( pending.deadline, until ) };
+		},
+		/*
+================
+holdForReferences
+
+Every open answer waits behind the reference frames (gameplay
+referenceProgress), so none can have been lost before until. The first hold
+fixes limit, and later frames cannot move it: a stream that never ends must
+not keep an answer open forever.
+================
+		*/
+		holdForReferences( now: number, until: number, limit: number ) {
+			holdAnswer( now, until, limit );
+		},
+		/*
+================
+noteInboundProgress
+
+Every frame, whichever owner answers it (gameplay's receive wrapper),
+proves the inbound stream is delivering: an answer still missing is
+ordered behind what has not been consumed yet, not lost. The wait ends a
+full window after the stream falls silent, or at the hard limit.
+================
+		*/
+		noteInboundProgress( now: number ) {
+			holdAnswer( now, now + INBOUND_HOLD_MS, now + INBOUND_LIMIT_MS );
+		},
+		/*
+================
+use
+================
+		*/
+		use( n: number, now = 0, context?: CosItemUseContext, message?: string, links: readonly ChatLinkRef[] = [] ) {
+			if ( timedOut ) throw Error( timeoutMessage() );
+			const item = slots.get( slot( n ) );
+			if ( !item || busy() ) {
+				throw new Error( "Item use unavailable" );
+			}
+			if ( itemCooldown( itemCooldowns, item.typeFlags, now ) ) return null;
+			// The Global Chatting item carries its line (693C90); the
+			// name-change scroll carries its new name (#1689); nothing
+			// else leaves the companion tail path.
+			const tail = isNameChangeScrollItem( item.refObjId ) ?
+				nameChangeTail( context?.renameName ?? "" ) :
+				isGlobalChatItem( item.typeFlags ) ?
+				Uint8Array.from( [ ...globalChatTail( message ?? "" ), ...encodeChatLinkRefs( links ) ] ) :
+				cosItemUseTail( item.typeFlags, [ ...slots.values() ], companionContext( item.typeFlags, context ) );
+			const p = new Uint8Array( 3 + tail.length );
+			p.set( tail, 3 );
+			p[0] = n;
+			new DataView( p.buffer ).setUint16( 1, item.typeFlags, true );
+			const frame = { opcode: 0x75bd, payload: p };
+			send( frame );
+			pending = { opcode: 0xb5bd, source: n, deadline: now + 10000 };
+			error = null;
+			return frame;
+		},
+		/*
+================
+useNotice
+
+Expected Grass/Clock target failures do not send or acquire the pending lane.
+================
+		*/
+		useNotice( n: number, context?: CosItemUseContext ) {
+			const item = slots.get( slot( n ) );
+			if ( !item ) return null;
+			return companionItemUseNotice(
+				item.typeFlags,
+				[ ...slots.values() ],
+				companionContext( item.typeFlags, context )
+			);
+		},
+		/*
+================
+receive
+================
+		*/
+		receive(
+			op: number,
+			p: Uint8Array,
+			now = 0,
+			recovery?: { country: number | undefined; abnormal: number; unlimitedItems?: readonly number[]; }
+		) {
+			if ( op === ARENA_CHEST_OPCODE ) {
+				arena.receive( p, now );
+				return true;
+			}
+			// After a timeout the inventory waits for the bootstrap that
+			// resynchronizes it. Frames before it (a resumed transport replays
+			// what it queued while detached, ahead of EnterWorld) are set aside,
+			// never applied: a late answer could settle the wrong request.
+			if ( timedOut ) return false;
+			// 766E30: owner timed job (2, 4) restores the soldier-scroll lane.
+			// A successful receipt alone does not create this category timer.
+			if ( op === 0x3792 && p[0] === 2 && p[1] === 4 ) {
+				if ( p.length !== 6 ) throw Error( "Invalid guild soldier cooldown" );
+				const seconds = new DataView( p.buffer, p.byteOffset, p.byteLength ).getInt32( 2, true );
+				if ( seconds > 0 ) {
+					itemCooldowns = [ ...itemCooldowns.filter( row => row.category !== 30 ), {
+						category: 30,
+						startedAtMs: now,
+						durationMs: seconds * 1000
+					} ];
+					published = null;
+				}
+				return true;
+			}
+			if ( op === STORAGE_CAPACITY_OPCODE ) {
+				// A bag only grows: the slots the player holds stay addressable.
+				const capacity = p[1]!;
+				if (
+					p.length !== 2 || p[0] !== STORAGE_CAPACITY_INVENTORY || inventorySlotCount === undefined ||
+					capacity < inventorySlotCount || capacity > MAX_INVENTORY_SLOT_COUNT
+				) {
+					throw Error( "Invalid inventory capacity" );
+				}
+				inventorySlotCount = capacity;
+				return true;
+			}
+			if ( op === MALL_BALANCE_CONTROL ) {
+				mall.balance( p );
+				return true;
+			}
+			if ( op === MALL_SILK_HISTORY_CONTROL ) {
+				mall.silkHistoryAnswer( p );
+				return true;
+			}
+			if ( op === 15 ) {
+				const items = mall.projection( p );
+				if ( items !== undefined ) {
+					const prepared = decodeShopItems( items );
+					const received = (items as { slot: number; }[]).map( row => row.slot );
+					if ( received.some( slot => slot < (equipmentSlotCount ?? 13) ) ) {
+						throw Error( "Mall delivery references equipment" );
+					}
+					mallDelivery = { prepared, slots: received };
+				}
+				return true;
+			}
+			if ( op === 0xb06d && p[0] === 1 && p[1] === 0x18 ) {
+				if ( !mallDelivery ) throw Error( "Mall receipt lacks delivery" );
+				mall.acknowledge( p, mallDelivery.slots );
+				const { next, nextRefs, nextNames } = mallDelivery.prepared;
+				slots = next;
+				refs.clear();
+				for ( const [id, flags] of nextRefs ) refs.set( id, flags );
+				names.clear();
+				for ( const [id, name] of nextNames ) names.set( id, name );
+				published = null;
+				gachaRows = null;
+				mallDelivery = null;
+				return true;
+			}
+			if ( op === 0xb06d && p[0] === 2 && mall.reject( p ) ) return true;
+			if ( op === 0xb338 ) {
+				// 75AE50 kind 2: the NPC refused the function request (category 13,
+				// e.g. code 4 too far). No catalogue follows a refused shop open, so
+				// release it now; gameplay owns the notice.
+				if ( p[0] === 2 && pending?.opcode === 11 ) {
+					pending = null;
+					shop = undefined;
+					shopCompletionRevision++;
+					error = null;
+					return true;
+				}
+				return magicOption.opened( p ) || gacha.opened( p );
+			}
+			if ( op === 0x32d9 ) {
+				// CPSMission_OnAvatarMagicOptionAdd0x32D9 (770140): the granted
+				// item replaces its bag row; a refusal is the gameplay notice.
+				const n = magicOption.result( p );
+				if ( n === null ) return true;
+				const next = body( p, 3 );
+				if ( !next || !slots.has( n ) ) throw Error( "Magic option grant references absent item" );
+				slots.set( n, { ...next, slot: n } );
+				published = null;
+				return true;
+			}
+			if ( op === 0xb053 ) {
+				for ( const cue of gacha.result( p, slots.get( gacha.state().slot ?? -1 ) ) ) play( cue );
+				return true;
+			}
+			if ( op === 0x3645 ) {
+				const before = slots.get( p[0]! ), next = itemStateDelta( p, slots, refs, names );
+				// 7654B0 words UIIT_MSG_GACHA_EXCHANGE from the voucher the update hits: its recorded
+				// reference and quantity.
+				if ( before && isGachaVoucher( before.typeFlags ) && before.magic.length === 2 ) {
+					const reward = Number( BigInt( before.magic[0]! ) & 0xffffffffn );
+					exchangeNotice = {
+						key: "UIIT_MSG_GACHA_EXCHANGE",
+						value: Number( BigInt( before.magic[1]! ) & 0xffffffffn ),
+						arguments: [ names.get( reward ) ?? "" ],
+						formatKinds: [ "s", "d" ]
+					};
+				}
+				const kinds = itemSlotFlashKinds( p[1]!, before?.summon?.state, next.item?.summon?.state );
+				if ( kinds.length ) {
+					itemFlashes = [
+						...itemFlashes.filter( f => now - f.atMs < FLASH_RETENTION_MS ),
+						...kinds.map( kind => ({ slot: next.slot, kind, atMs: now }) )
+					];
+				}
+				if ( next.item ) slots.set( next.slot, next.item );
+				else slots.delete( next.slot );
+				published = null;
+				return true;
+			}
+			if ( op === 0xb16f || op === 0x3359 || op === 0xb549 ) {
+				const success = p[0] === 1, arming = op !== 0xb549 && p[1] === 1;
+				const length = success ? (op === 0xb549 ? 1 : arming ? 2 : 6) : p[0] === 2 ? 2 : 1;
+				if ( p.length !== length ) throw Error( "Invalid compound result" );
+				if ( success && arming ) return true;
+				for (
+					const cue of alchemy.compound(
+						success,
+						success && op !== 0xb549 ?
+							new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint32( 2, true ) :
+							undefined,
+						p[0] === 2 ? p[1]! : null
+					)
+				) play( cue );
+				return true;
+			}
+			if ( op === 0xb373 || op === 0xb651 ) {
+				if ( p[0] !== 1 ) {
+					if ( p.length !== (p[0] === 2 ? 2 : 1) ) throw Error( "Invalid alchemy rejection" );
+					// A stone whose roll failed (0xB651 [2, 0x23]; the server
+					// spends the stone on the failed roll) is a finished attempt:
+					// CIFAlchemyReinforce_ShowResult's (client @0x0062b0b0) 0x80
+					// arm plays the failure effect and writes the failure line, so
+					// it records an outcome. Every other code is a refusal and
+					// finishes nothing.
+					const stoneFailed = op === 0xb651 && p[0] === 2 && p[1] === 0x23;
+					const target = stoneFailed ? slots.get( alchemy.state().slot ?? -1 ) : undefined;
+					const detail = stoneFailed ?
+						{
+							plus: target?.plus ?? 0,
+							previousPlus: target?.plus ?? 0,
+							durability: target?.durability ?? 0,
+							previousDurability: target?.durability ?? 0
+						} :
+						undefined;
+					for (
+						const cue of alchemy.result( 0, stoneFailed ? 0x80 : 0, p[0] === 2 ? p[1]! : null, detail )
+					) {
+						play( cue );
+					}
+					return true;
+				}
+				if ( p.length < 3 || p[2]! < 13 ) throw Error( "Invalid alchemy slot" );
+				const n = p[2]!, old = slots.get( n );
+				if ( !old ) throw Error( "Alchemy result references absent target" );
+				let flags = 0x10, next: InventoryItem | null;
+				if ( op === 0xb373 && p[1] === 0 ) {
+					if ( p.length < 4 ) throw Error( "Truncated alchemy failure" );
+					if ( p[3] ) {
+						if ( p.length !== 4 ) throw Error( "Invalid destroyed item result" );
+						flags = 0x40;
+						next = null;
+					} else {
+						next = body( p, 4 );
+						flags = 0x20 | (next?.plus !== old.plus ? 1 : 0) |
+							(next?.durability !== old.durability ? 2 : 0);
+					}
+				} else {
+					next = body( p, 3 );
+					flags = p[1] ? 0x10 : 0x20;
+				}
+				if ( next ) slots.set( n, { ...next, slot: n } );
+				else slots.delete( n );
+				published = null;
+				const detail = {
+					plus: next?.plus ?? 0,
+					previousPlus: old.plus,
+					durability: next?.durability ?? 0,
+					previousDurability: old.durability,
+					// 0xB651 is a magic or attribute stone's answer.
+					...(op === 0xb651 && flags & 0x10 && next ?
+						{
+							stone: {
+								before: present( old ),
+								after: present( { ...next, slot: n } ),
+								...(alchemy.state().designated ?
+									{ designated: alchemy.state().designated } :
+									{})
+							}
+						} :
+						{})
+				};
+				for ( const cue of alchemy.result( n, flags, null, detail ) ) play( cue );
+				return true;
+			}
+			if ( op === 0x31e8 ) {
+				if ( p.length !== 5 ) throw Error( "Invalid durability result" );
+				const n = p[0]!;
+				if ( n >= 0x3d ) return true;
+				const item = slots.get( n );
+				if ( !item ) {
+					// The frame is a fixed five bytes and fully read; what it
+					// names is only a held item's durability, its repair sound
+					// and flash. INFERENCE (no native trace of the empty-slot
+					// arm): 77C300 writes the value on the slot's item object,
+					// so an empty slot has nothing to write and the update is
+					// dropped. The port degrades instead of ending the session
+					// (production "Durability result references absent item",
+					// #2877: repair answers naming bag slots this client no
+					// longer held, replayed on re-entry).
+					degrade( {
+						code: "durability-unknown-slot",
+						message: "Durability result for unheld slot " + n,
+						frame: { opcode: op, payload: p }
+					} );
+					return true;
+				}
+				const value = new DataView( p.buffer, p.byteOffset, p.byteLength ).getInt32( 1, true ),
+					old = item.durability | 0;
+				const cue = value > old ?
+					(old === 0 ? "SND_REVIVE" : "SND_REPAIR") :
+					n < 13 ?
+					(value === 0 ? "SND_EQBREAK" : value === 6 ? "SND_EQDANGER" : null) :
+					null;
+				slots.set( n, { ...item, durability: value } );
+				// 77C300: a repaired or revived item also flashes its slot (54FA20
+				// through 592BD0 / 59C3A0).
+				if ( value > old ) {
+					// 54FA20 resets one counter at +0x5C4; repeated repairs restart it.
+					itemFlashes = [
+						...itemFlashes.filter( f =>
+							now - f.atMs < FLASH_RETENTION_MS && !(f.slot === n && f.kind === "repair")
+						),
+						{ slot: n, kind: "repair", atMs: now }
+					];
+				}
+				published = null;
+				if ( cue ) play( cue );
+				return true;
+			}
+			if ( op === 11 ) {
+				const parsed = shopCatalog( p ),
+					next = {
+						...parsed,
+						offers: parsed.offers.map( row => ({ ...row, items: row.previews?.map( preview ) }) ),
+						buyback: parsed.buyback?.map( row => ({
+							...row,
+							item: row.preview ? preview( row.preview ) : undefined
+						}) ),
+						specialty: specialtyShopPage( parsed.offers )
+					};
+				if ( pending?.opcode !== 11 || pending.npc !== next.npc ) return true;
+				shop = next;
+				pending = null;
+				shopCompletionRevision++;
+				error = next.error ?? null;
+				return true;
+			}
+			if ( op === 13 ) {
+				const r = commerceJson( p ),
+					id = commerceInteger( r.id ),
+					npc = commerceInteger( r.npc, 0xffffffff, 1 ),
+					entries = buybackEntries( r.entries ).map( row => ({
+						...row,
+						item: row.preview ? preview( row.preview ) : undefined
+					}) );
+				if ( r.error !== undefined && (typeof r.error !== "string" || r.error.length > 256) ) {
+					throw Error( "Invalid buyback error" );
+				}
+				if ( id === 0 ) {
+					if ( !Array.isArray( r.items ) || r.items.length || r.error ) {
+						throw Error( "Invalid buyback publication" );
+					}
+					if ( shop?.npc === npc ) shop = { ...shop, buyback: entries };
+					return true;
+				}
+				if (
+					pending?.opcode !== 13 || pending.snapshot || pending.npc !== npc || pending.buybackId !== id ||
+					shop?.npc !== npc
+				) throw Error( "Unexpected buyback result" );
+				if ( r.error ) {
+					if ( !Array.isArray( r.items ) || r.items.length ) {
+						throw Error( "Rejected buyback changed inventory" );
+					}
+				} else {
+					if ( !Array.isArray( r.items ) || r.items.length !== 1 ) {
+						throw Error( "Buyback lacks complete item" );
+					}
+					applyShopItems( r.items );
+				}
+				shop = { ...shop, buyback: entries };
+				pending = r.error ?
+					null :
+					{ ...pending, snapshot: true, destination: (r.items as { slot: number; }[])[0]!.slot };
+				error = r.error as string | undefined ?? null;
+				return true;
+			}
+			if ( op === 0xb7e7 ) {
+				if ( p[0] === 1 && p.length === 1 ) return true;
+				if ( p[0] !== 2 || p.length !== 2 ) throw Error( "Invalid buyback acknowledgement" );
+				if ( pending?.buybackId !== undefined ) {
+					if ( pending.snapshot ) throw Error( "Buyback rejection follows committed inventory" );
+					pending = null;
+					error = `Buyback rejected: ${p[1]}`;
+				}
+				return true;
+			}
+			if ( op === 0xb06d && p[0] === 1 && p[1] === 0x22 ) {
+				if (
+					p.length !== 6 || !pending || pending.buybackIndex !== p[3] || !pending.snapshot ||
+					new DataView( p.buffer, p.byteOffset, p.byteLength ).getUint16( 4, true ) !== pending.quantity ||
+					p[2] !== pending.destination || slots.get( p[2]! )?.quantity !== pending.quantity
+				) throw Error( "Unmatched native buyback restore" );
+				const item = slots.get( p[2]! )!;
+				pending = null;
+				playItem( { handle: "SND_EQUIP", typeFlags: item.typeFlags } );
+				return true;
+			}
+			if ( op === 12 ) {
+				const r = commerceJson( p );
+				if (
+					!pending || pending.movementType !== 8 || pending.snapshot || r.npc !== pending.npc ||
+					r.tab !== pending.tab || r.slot !== pending.source || r.quantity !== pending.quantity
+				) throw Error( "Unexpected shop inventory" );
+				applyShopItems( r.items );
+				pending = { ...pending, snapshot: true };
+				return true;
+			}
+			if ( op === 0x3752 ) {
+				if ( p.length !== 2 ) {
+					throw new Error( "Invalid ammunition update" );
+				}
+				const item = slots.get( 7 ), quantity = new DataView( p.buffer, p.byteOffset, 2 ).getUint16( 0, true );
+				if ( item ) {
+					published = null;
+					if ( quantity ) {
+						slots.set( 7, { ...item, quantity } );
+					} else {
+						slots.delete( 7 );
+					}
+				}
+				return true;
+			}
+			if ( op === REPAIR_RESPONSE_OPCODE ) {
+				if ( p[0] === 1 ? p.length !== 1 : p.length !== 2 || p[0] !== 2 ) {
+					throw Error( "Invalid repair result" );
+				}
+				if ( pending?.opcode === REPAIR_RESPONSE_OPCODE ) pending = null;
+				return true;
+			}
+			if ( op !== 0xb06d && op !== 0xb5bd ) {
+				return false;
+			}
+			const v = new DataView( p.buffer, p.byteOffset, p.byteLength );
+			if ( p[0] === 2 ) {
+				if ( p.length !== 2 ) {
+					throw new Error( "Invalid inventory rejection" );
+				}
+				if ( pending?.opcode === op ) {
+					pending = null;
+				}
+				error = `Inventory rejected: ${p[1]}`;
+				return true;
+			}
+			if ( p[0] !== 1 ) {
+				throw new Error( "Invalid inventory result" );
+			}
+			if ( op === 0xb06d && (p[1] === 0x23 || p[1] === 0x24) ) {
+				if (
+					p.length < 7 || p.length !== 7 + p[6]! * 5 || pending?.movementType !== p[1] ||
+					pending.source !== p[2] || (p[1] === 0x24 && pending.destination !== p[3])
+				) throw Error( "Unmatched avatar transfer result" );
+				const nextBag = new Map( slots ),
+					nextAvatar = new Map( avatars ),
+					cues: import("@/engine/contracts/audio").ItemSoundRequest[] = [];
+				const apply = ( type: number, source: number, destination: number, quantity: number ) => {
+					if ( type !== 0x23 && type !== 0x24 ) throw Error( "Invalid avatar submove family" );
+					const equip = type === 0x24,
+						from = equip ? nextBag : nextAvatar,
+						to = equip ? nextAvatar : nextBag,
+						item = from.get( source );
+					if (
+						quantity !== 1 || !item || !isAvatarItem( item.typeFlags ) || to.has( destination ) ||
+						(equip ?
+							(source < (equipmentSlotCount ?? 13) || source >= (inventorySlotCount ?? 0) ||
+								!avatarSlotFits( item.typeFlags, destination )) :
+							(source >= AVATAR_STORAGE_CAPACITY || destination < (equipmentSlotCount ?? 13) ||
+								destination >= (inventorySlotCount ?? 0)))
+					) throw Error( "Avatar transfer occupancy mismatch" );
+					from.delete( source );
+					to.set( destination, { ...item, slot: destination } );
+					cues.push( { handle: "SND_EQUIP", typeFlags: item.typeFlags } );
+				};
+				apply( p[1]!, p[2]!, p[3]!, v.getUint16( 4, true ) );
+				for ( let o = 7; o < p.length; o += 5 ) {
+					apply( p[o]!, p[o + 1]!, p[o + 2]!, v.getUint16( o + 3, true ) );
+				}
+				slots = nextBag;
+				avatars = nextAvatar;
+				published = null;
+				pending = null;
+				error = null;
+				for ( const cue of cues ) playItem( cue );
+				return true;
+			}
+			const sale = saleResult( op, p );
+			if ( sale ) {
+				if ( sale.cosGid !== undefined ) return false;
+				if ( sale.slot < (equipmentSlotCount ?? 13) ) throw Error( "Sale result references equipment slot" );
+				const next = soldInventory( [ ...slots.values() ], sale.slot, sale.quantity );
+				slots = new Map( next.map( row => [ row.slot, row ] ) );
+				published = null;
+				if (
+					pending?.movementType === 9 && pending.source === sale.slot && pending.quantity === sale.quantity
+				) pending = null;
+				return true;
+			}
+			if ( op === 0xb06d && p[1] === 8 ) {
+				if ( p.length < 7 || p.length !== 7 + p[4]! ) throw Error( "Invalid purchase result" );
+				const quantity = v.getUint16( p.length - 2, true );
+				if (
+					!pending || pending.movementType !== 8 || pending.tab !== p[2] || pending.source !== p[3] ||
+					pending.quantity !== quantity || !pending.snapshot
+				) throw Error( "Purchase lacks matching inventory snapshot" );
+				pending = null;
+				return true;
+			}
+			const next = new Map( slots );
+			const committedMoves: typeof bindingMoves = [];
+			const moveCues: { item: InventoryItem; warn: boolean; }[] = [];
+			const applyMove = ( source: number, destination: number, quantity: number ) => {
+				const a = next.get( source ), b = next.get( destination );
+				// 757652 reads destination +68 (plus), not +7C (count). Preserve
+				// that native flag: 574800 always moves source bindings, while this
+				// flag keeps destination bindings attached to the destination control.
+				// Port-only, not native: a stone stacked past its native cap of 1
+				// (SRO_STACK_SIZES, #583) carries its assimilation value in plus, so
+				// it reads 0 there and merges by the stone identity, keeping the same
+				// bindings as any other stack, including retained stacks after
+				// rollback. At cap 1 with two singles the native read stands.
+				const cap = a ? tooltipRefs.get( a.refObjId )?.fields.maxStack ?? 0 : 0;
+				const stackedStone = !!a && etcCarriesPlusByte( a.typeFlags ) &&
+					(cap > 1 || a.quantity > 1 || (b?.quantity ?? 0) > 1);
+				const keepDestination = !!a && !!b && source >= (equipmentSlotCount ?? 13) &&
+					destination >= (equipmentSlotCount ?? 13) && stackable( a ) &&
+					(stackedStone ?
+						sameStackIdentity( a, b ) && a.quantity <= cap :
+						nativeStackIdentity( a, b ) && a.quantity + b.plus <= cap);
+				transfer( next, source, destination, quantity );
+				committedMoves.push( {
+					source,
+					destination,
+					destinationMoves: !!b && !keepDestination
+				} );
+				const item = next.get( destination )!;
+				moveCues.push( {
+					item,
+					warn: source >= (equipmentSlotCount ?? 13) && destination < (equipmentSlotCount ?? 13) &&
+						equipDurabilityWarning( item.typeFlags, item.durability )
+				} );
+			};
+			if ( op === 0xb5bd ) {
+				if ( p.length !== 6 ) {
+					throw new Error( "Invalid item use result" );
+				}
+				const n = p[1]!, held = next.get( n ), quantity = v.getUint16( 2, true );
+				const item = held?.typeFlags === v.getUint16( 4, true ) ? held : undefined;
+				// CPSMission_OnItemUseResponse0xB5BD (755E40) takes the answer's count
+				// as the slot's truth (CSOItem_SetCount; an empty slot at 0) and its
+				// cooldown lane from the answer's type word. It never compares the
+				// count with what the client held, so a use answered after another
+				// change to the stack (a pickup merge) still applies, and no answer
+				// ends the session.
+				// Deliberate deviation, port-only, not native: 755E40 stamps the count
+				// and cooldown on whatever item now sits in the slot, so an answer that
+				// races a move rewrites an unrelated item. That is a bug in the
+				// original, so the port applies nothing when the slot is empty or
+				// holds another type word: the count belongs to the item the server
+				// used, and the lane's duration needs that item's reference.
+				// Every success answer for the held item starts its lane
+				// (CGInterface_AddItemCooldown), as 755E40 does; failure answers
+				// ([2][code]) never reach here.
+				if ( item ) {
+					const category = potionCategory( v.getUint16( 4, true ) );
+					if ( category ) {
+						// Read the reference before last-stack removal; failed receipts never reach here.
+						{
+							const durationMs = potionCooldownMs(
+								category,
+								tooltipRefs.get( item.refObjId )?.fields ?? {},
+								recovery?.country,
+								recovery?.abnormal ?? 0
+							);
+							itemCooldowns = [ ...itemCooldowns.filter( row => row.category !== category ), {
+								category,
+								startedAtMs: now,
+								durationMs
+							} ];
+						}
+					}
+					// 755F02 registers authored cooldowns separately from potion lanes.
+					const fields = tooltipRefs.get( item.refObjId )?.fields ?? {};
+					const durationMs = fields.useCooldownDuration528 ?? 0;
+					if ( durationMs > 0 ) {
+						const group = fields.useCooldownGroup524 ?? 0;
+						itemCooldowns = [
+							...itemCooldowns.filter( row =>
+								row.category !== 18 ||
+								(group ? row.group !== group : !!row.group || row.refObjId !== item.refObjId)
+							),
+							{
+								category: 18,
+								group,
+								refObjId: item.refObjId,
+								startedAtMs: now,
+								durationMs
+							}
+						];
+					}
+					if ( quantity ) {
+						next.set( n, { ...item, quantity } );
+					} else {
+						next.delete( n );
+					}
+				}
+			} else if ( p[1] === 0 ) {
+				if ( p.length < 7 || p.length !== 7 + p[6]! * 5 ) {
+					throw new Error( "Invalid inventory move result" );
+				}
+				applyMove( p[2]!, p[3]!, v.getUint16( 4, true ) );
+				for ( let o = 7; o < p.length; o += 5 ) {
+					if ( p[o] !== 0 ) {
+						throw new Error( "Unsupported inventory submove" );
+					}
+					applyMove( p[o + 1]!, p[o + 2]!, v.getUint16( o + 3, true ) );
+				}
+			} else if ( (p[1] === 6 || p[1] === 0x1c) && p[2] === 254 ) {
+				if ( p.length !== 7 ) throw Error( "Invalid gold pickup result" );
+				// Amount granted, not a bag slot or the absolute balance.
+				// 30B3 type 1 owns the balance; gameplay prints the gain notice;
+				// ANI_PICK owns sound, avoiding duplicates.
+			} else if ( (p[1] === 6 || p[1] === 0x1c) && p[2] !== 254 ) {
+				const n = slot( p[2]! );
+				if ( n < (equipmentSlotCount ?? 13) || n >= (inventorySlotCount ?? 256) ) {
+					throw Error( "Pickup references a non-bag slot" );
+				}
+				const item = body( p, 3 );
+				if ( item ) next.set( n, { ...item, slot: n } );
+				else next.delete( n );
+			} else if ( p[1] === 14 || p[1] === 15 ) {
+				if ( p.length < 4 ) throw Error( "Truncated quest inventory result" );
+				if ( p[1] === 14 && p[2] === 254 ) {
+					if ( p.length !== 7 ) throw Error( "Invalid quest gold grant result" );
+					// A gold heap granted at the gold slot: the amount, not a
+					// bag row - 30B3 type 1 owns the balance and gameplay
+					// prints the gain notice, as on the pickup gold arm.
+				} else {
+					const n = slot( p[2]! );
+					if ( n < (equipmentSlotCount ?? 13) || n >= (inventorySlotCount ?? 256) ) {
+						throw Error( "Quest item references non-bag slot" );
+					}
+					if ( p[1] === 15 ) {
+						if ( p.length !== 4 || !next.has( n ) ) throw Error( "Invalid quest item removal" );
+						next.delete( n );
+					} else {
+						const item = body( p, 4 );
+						if ( !item ) throw Error( "Empty quest item grant" );
+						const old = next.get( n );
+						if ( old && old.refObjId !== item.refObjId ) {
+							throw Error( "Quest grant overwrites another item" );
+						}
+						next.set( n, { ...item, slot: n } );
+					}
+				}
+			} else if ( p[1] === 7 ) {
+				if ( p.length !== 3 ) {
+					throw new Error( "Invalid item removal" );
+				}
+				// 47 -> 0 at 757F6A retains the removed equipment snapshot's
+				// TID for its 75803D sound request; the bag removal leg is silent.
+				const item = next.get( p[2]! );
+				if ( item && p[2]! < (equipmentSlotCount ?? 13) ) moveCues.push( { item, warn: false } );
+				next.delete( p[2]! );
+			} else if ( p[1] === 10 ) {
+				if ( p.length !== 6 || v.getUint32( 2, true ) < 1 || v.getUint32( 2, true ) > 100000000 ) {
+					throw Error( "Invalid gold drop result" );
+				}
+			} else if ( p[1] === 4 || p[1] === 5 || p[1] === 0x0d ) {
+				// 759A30 types 4, 5 and 0xD are the exchange table's answers;
+				// exchangeReceive folds them while the window is open. A late
+				// one after the window closed moves nothing in the bag - the
+				// exchange swap on the success opcode is the only bag mutation
+				// - so it stays unclaimed rather than forcing a resync.
+				return false;
+			} else if ( p[1] === 0x0b || p[1] === 0x0c || p[1] === 0x20 || p[1] === 0x21 ) {
+				// The warehouse gold answers (STORAGE_GOLD_WITHDRAW/DEPOSIT,
+				// 0x20/0x21 on the guild wire): the moved amount lives only
+				// in the armed pending, which storageSettle claims. A late
+				// one with no pending carries nothing this client can apply
+				// and never touches the bag - the room gold is read again
+				// when the warehouse re-opens - so it stays unclaimed
+				// rather than forcing a resync.
+				return false;
+			} else if ( p[1] === undefined ) {
+				// A success byte with no result type is not a complete
+				// result; like every other truncated frame it changes
+				// nothing and claims nothing.
+				return false;
+			} else {
+				// A success result no arm can apply: the server granted or
+				// moved something this client cannot account for, so the bag
+				// it renders no longer provably matches the server's (B-11:
+				// the slot stays occupied server-side, invisible here, and
+				// later pickups refuse as full against visibly free slots).
+				// Never let it evaporate: declare the inventory desynced,
+				// the state the timeout lane already uses - frames are set
+				// aside and sends refuse until the bootstrap that rebuilds
+				// the bag resynchronizes it.
+				timedOut = true;
+				timedOutRequest = "unappliable 0xB06D result type " + p[1];
+				return true;
+			}
+			slots = next;
+			bindingMoves.push( ...committedMoves );
+			published = null;
+			// Each native result must match the pending operation family and identity.
+			if ( pending?.opcode === op ) {
+				const matches = op === 0xb5bd ?
+					pending.source === p[1] :
+					pending.movementType === p[1] && (p[1] === 10 ?
+						pending.amount === v.getUint32( 2, true ) :
+						pending.source === p[2] && (p[1] !== 0 || pending.destination === p[3]));
+				if ( matches ) pending = null;
+			}
+			if ( op === 0xb5bd ) {
+				const word = v.getUint16( 4, true ), family = word >>> 7 & 15;
+				if (
+					(word & 2) === 0 && (word & 0x1c) === 0x0c && (word & 0x60) === 0x60 &&
+					(family === 1 || family === 2)
+				) play( "SND_POTION" );
+			}
+			// Publication follows complete packet validation and slot commit.
+			// 756CF0 emits per apply row, including bag splits/merges and swaps.
+			for ( const cue of moveCues ) {
+				if ( cue.warn ) play( "SND_EQDANGER" );
+				playItem( { handle: "SND_EQUIP", typeFlags: cue.item.typeFlags } );
+			}
+			return true;
+		},
+		/*
+================
+step
+================
+		*/
+		step( now: number ) {
+			const rentalUpdates = companionRentals.step( slots.values(), now );
+			for ( const item of rentalUpdates ) slots.set( item.slot, item );
+			mall.step( now );
+			const active = itemCooldowns.filter( row => now < row.startedAtMs + row.durationMs ),
+				expired = active.length !== itemCooldowns.length;
+			if ( expired ) itemCooldowns = active;
+			const unlocked = alchemy.step( now );
+			const phase = gacha.state().phase, roll = gacha.step( now, slots.get( gacha.state().slot ?? -1 ) );
+			if ( roll ) {
+				send( roll );
+				return true;
+			}
+			if ( phase !== gacha.state().phase ) return true;
+			if ( pending?.opcode === 11 && now >= pending.deadline ) {
+				pending = null;
+				shop = undefined;
+				shopCompletionRevision++;
+				error = "Merchant did not open the shop";
+				return true;
+			}
+			// Native replies have no transaction ID. After timeout a late response
+			// could acknowledge a new request, so reconnect instead of reopening it.
+			if ( timedOut || pending && now >= pending.deadline ) {
+				if ( !timedOut && pending ) {
+					timedOutRequest = describeRequest( pending );
+					// Was the reference stream holding this answer open, and
+					// since when (#2148)? A held-past-cap timeout and a
+					// never-held one read identically without the stamp.
+					timedOutDetail = pending.firstHeldAt === undefined ?
+						"held=0" :
+						`held=1 firstHoldAgeMs=${Math.round( now - pending.firstHeldAt )}`;
+				}
+				timedOut = true;
+				throw Error( timeoutMessage(), { cause: INVENTORY_TRANSACTION_TIMEOUT } );
+			}
+			return unlocked || expired || rentalUpdates.length > 0;
+		},
+		bag,
+		/*
+		================
+		requestArenaState
+		================
+		*/
+		requestArenaState: () => arena.request(),
+		/*
+		================
+		dismissArena
+		================
+		*/
+		dismissArena() {
+			arena.dismiss();
+		},
+		/*
+================
+state
+================
+		*/
+		state() {
+			return {
+				arenaChest: arena.state() ?
+					{ ...arena.state()!, items: arena.state()!.items.map( present ) } :
+					undefined,
+				itemMall: mall.state(),
+				itemMallSilkHistory: mall.silkHistory(),
+				itemCooldowns,
+				avatarInventory: [ ...avatars.values() ].map( present ),
+				alchemy: alchemy.state(),
+				gacha: { ...gacha.state(), prizes: gachaPrizeRows() },
+				exchange: exchange.open || exchange.requesting ?
+					{
+						...exchange,
+						own: exchange.own.map( row => ({ ...row, item: present( row.item ) }) ),
+						theirs: exchange.theirs.map( row => ({ ...row, item: present( row.item ) }) )
+					} :
+					undefined,
+				stall: stall.phase === "none" && !stall.network.open ?
+					undefined :
+					{
+						...stall,
+						offers: stall.offers.map( row => ({ ...row, item: present( row.item ) }) ),
+						network: {
+							...stall.network,
+							rows: stall.network.rows.map( row => ({ ...row, item: present( row.item ) }) )
+						}
+					},
+				magicOption: magicOption.state(),
+				shop: presentShop(),
+				shopCompletionRevision,
+				inventorySlotCount,
+				equipmentSlotCount,
+				inventory: bag(),
+				itemFlashes,
+				inventoryPending: busy(),
+				error
+			};
+		},
+		/*
+================
+clear
+================
+		*/
+		clear() {
+			bindingMoves = [];
+			itemCooldowns = [];
+			shopCompletionRevision = 0;
+			presentations = new WeakMap();
+			gachaRows = null;
+			tooltipRefs.clear();
+			magicRefs = itemMagicReferences( undefined );
+			alchemy.reset();
+			gacha.reset();
+			exchange = emptyExchange();
+			stall = { ...emptyStall( stall.namingSequence ), logSequence: stall.logSequence };
+			magicOption.reset();
+			mall.reset();
+			arena.clear();
+			mallDelivery = null;
+			shop = undefined;
+			timedOut = false;
+			timedOutRequest = "";
+			timedOutDetail = "";
+			objRefs.clear();
+			names.clear();
+			icons.clear();
+			inventorySlotCount = undefined;
+			equipmentSlotCount = undefined;
+			itemFlashes = [];
+			published = null;
+			slots.clear();
+			avatars.clear();
+			refs.clear();
+			useCooldowns.clear();
+			pending = null;
+			error = null;
+		}
+	};
+}

@@ -1,0 +1,110 @@
+/*
+===========================================================================
+
+skillcooldown.go - effective reuse timing at the player admission boundary
+
+Every skill family registers through this owner. Published reference rows
+stay immutable; already admitted deadlines survive later status changes.
+
+===========================================================================
+*/
+
+package action
+
+import (
+	log "github.com/sirupsen/logrus"
+	"opensro.online/server/internal/game/combat"
+	"opensro.online/server/internal/game/enterworld"
+)
+
+const actionSpeedParameter = 0x8c
+
+/*
+================
+playerSkillCooldown
+
+Use the complete keeper projection, shared with attack and resource checks.
+Those admission checks reject an invalid loadout before registration. Keep
+its authored reuse delay if a teardown caller has already lost that data.
+================
+*/
+func (rt *Runtime) playerSkillCooldown(division string, character *enterworld.Character, skill enterworld.SkillRow) uint32 {
+	stats, _, err := rt.playerCombatStats(division, character)
+	if err != nil {
+		log.WithError(err).Error("skill cooldown keeper projection failed")
+		return skill.CoolTimeMs
+	}
+	percent, _ := stats.Param(actionSpeedParameter)
+	return skill.CooldownDurationMs(percent)
+}
+
+/*
+================
+registerPlayerSkillCooldown
+
+Copy the row only for the existing cooldown-map writer. Other consumers
+must continue to see authored casting, animation and effect lifetimes.
+================
+*/
+func (rt *Runtime) registerPlayerSkillCooldown(division string, character *enterworld.Character, skill enterworld.SkillRow, now int64) {
+	// Instant actions skip registration for an authored zero
+	// cooldown. Persistent and projectile handlers still register it.
+	if skill.ActionHandler == enterworld.SkillActionInstant && skill.CoolTimeMs == 0 {
+		return
+	}
+	if skill.ActionKind == 2 && skill.ActionDurationMs > 0 {
+		stats, _, err := rt.playerCombatStats(division, character)
+		if err == nil {
+			percent, _ := stats.Param(actionSpeedParameter)
+			character.SkillActionRecoveryUntilMs = now + int64(skill.ActionRecoveryDurationMs(percent))
+		}
+	}
+	skill.CoolTimeMs = rt.playerSkillCooldown(division, character, skill)
+	registerOffensiveCooldown(character, skill, now)
+}
+
+/*
+================
+EntryActionSpeed
+
+Local bootstrap and remote scope entry read the same keeper as admission.
+No live record fields are read outside the character snapshot boundary.
+Every session's entry snapshot reads it every tick, so it evaluates the one
+unlinked parameter (combat.PlayerUnlinkedParameter) from the owners
+playerCombatStats reads, instead of the whole projection.
+
+The copy is the cast copy, not the full record (#2140): at a settled
+45-row inventory the full copy was most of this call. Every reader of
+the copy is cleared for the dropped plain bag rows - the projection
+reads the level, max level and base stats, statModifierWrites reads
+the name (its effect writes), the wanted streak and the job-suit slot,
+and, under the attack-pet expansion, the owner's life, town and
+free-battle state and worn suit. The two slot-8 verdicts (suit, cape)
+are this read's load-bearing inventory inputs; the companion-walking
+writers also run over the copy, though their writes name other
+parameters and are filtered out of the one parameter this read
+serves. The cast copy keeps all of that: every non-inventory child,
+the equipment and avatar rows and every companion-carrying bag row.
+TestEntryActionSpeedCastCopyMatchesFullCopy pins this root against
+the full copy. The copy is kept across ticks while the record's write
+epoch holds (keptCastCopy, #3427): prepareTick reads this for every
+session before any tick bracket opens.
+================
+*/
+func (rt *Runtime) EntryActionSpeed(division, name string) float32 {
+	character := rt.keptCastCopy(division, rt.findCharacter(division, name))
+	if character == nil {
+		return 100
+	}
+	percent, err := combat.PlayerUnlinkedParameter(
+		character,
+		rt.statModifierWrites(division, character),
+		rt.playerAbnormal(division, character.Name),
+		actionSpeedParameter,
+	)
+	if err != nil {
+		log.WithError(err).Error("entry action-speed keeper projection failed")
+		return 100
+	}
+	return percent
+}

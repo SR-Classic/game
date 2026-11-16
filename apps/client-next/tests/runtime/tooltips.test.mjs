@@ -1,0 +1,863 @@
+/*
+===========================================================================
+
+tooltips.test.mjs - tests for the client modules it imports
+
+Loads the TypeScript sources directly through the shared native loader
+(tests/helpers/native-source-loader.mjs), so the tests exercise the same
+modules the client ships, not a per-test bundle.
+
+===========================================================================
+*/
+import { CLIENT_PUBLIC_ROOT } from "../../../../scripts/lib/generatedRoot.mjs";
+import "../helpers/native-source-loader.mjs";
+import { pathToFileURL as sourceFileUrl } from "node:url";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { readLocalizedTextDataRowsSync } from "../../../../scripts/build/shared/textDataIo.mjs";
+import { retailTextdataRoot, serverGameDataRoot } from "../../../../scripts/build/world/paths.mjs";
+import { PORT_ITEMS } from "../../../../scripts/build/shared/portItemRows.mjs";
+import {
+	ITEM_TEXT_COMPLETIONS,
+	completeItemText,
+	completeItemTextProjection,
+	completeItemReferenceProjection
+} from "../../../../scripts/build/shared/itemTextCompletions.mjs";
+import { completeEnglishTextProjection } from "../../../../scripts/build/shared/englishCompletions.mjs";
+import { assertItemNameCoverage } from "../../../../scripts/build/shared/itemNameCoverage.mjs";
+import { PORT_ITEM_TEXT } from "../../../../scripts/build/shared/portItemRows.mjs";
+import nameCompletions from "../../../../scripts/build/shared/itemNameCompletions.json" with { type: "json" };
+import { readPublishedAssetJsonSync, readPackedAssetBytesSync } from "../../../../scripts/lib/publishedAsset.mjs";
+import { defined } from "../helpers/defined.mjs";
+import { NATIVE_ONLY } from "../helpers/expanded-build.mjs";
+/*
+================
+load
+================
+*/
+async function load( file ) {
+	return import( sourceFileUrl( file ).href );
+}
+const { decodeTooltipSkills } = await load( "src/engine/foundation/ui/skill-tooltip-catalog.ts" );
+const { skillParameterFormatters } = await load( "src/engine/foundation/ui/skill-tooltip-params.ts" );
+const { skillTooltip } = await load( "src/engine/foundation/ui/skill-tooltip.ts" );
+const { itemTooltipStats } = await load( "src/engine/foundation/ui/item-tooltip-stats.ts" );
+const { tooltipBubble } = await load( "src/engine/foundation/ui/helper-bubble.ts" );
+const source = JSON.parse( readFileSync( CLIENT_PUBLIC_ROOT + "/assets/data/skillData.json", "utf8" ) );
+const catalog = decodeTooltipSkills( source );
+const strings = {
+	...JSON.parse( readFileSync( CLIENT_PUBLIC_ROOT + "/assets/text/textuisystem.en.json", "utf8" ) ).entries,
+	...JSON.parse( readFileSync( CLIENT_PUBLIC_ROOT + "/assets/text/textdataname.en.json", "utf8" ) ).entries
+};
+const text = s => strings[s] ?? "";
+test( "published native catalogue admits every skill and rejects shifted columns", NATIVE_ONLY, () => {
+	// 27835 retail skills plus the 238 Qin-Shi tomb monster skills (#2024;
+	// the eight generals' fourth skills joined in #2948).
+	assert.equal( catalog.size, 28073 );
+	assert.throws( () => decodeTooltipSkills( { ...source, columns: source.columns.slice( 1 ) } ), /catalogue/ );
+} );
+test("all published skill tooltips compose without unresolved prerequisite or parameter crashes", () => {
+	const progression = { level: 1, skillPoints: 0, masteries: [] };
+	let descriptions = 0;
+	for ( const row of catalog.values() ) {
+		if ( !row.masteryId || !row.reqLearnSp ) continue;
+		const rows = skillTooltip(
+			{
+				id: row.id,
+				catalog,
+				learned: [],
+				progression
+			},
+			text,
+			id => String( id )
+		);
+		assert.ok( rows.length > 1 );
+		if ( row.tooltipDescriptionSymbol && text( row.tooltipDescriptionSymbol ) ) descriptions++;
+	}
+	assert.ok( descriptions > 100 );
+});
+test("learning requirements change color at the authoritative threshold; learned skill omits current learn heading", () => {
+	const row = [ ...catalog.values() ].find( r =>
+		r.reqLearnSp > 0 && r.basicActivity === 1 && r.masteryId && r.basicLevel === 1 &&
+		!r.reqGroups.some( q => q.groupId && q.groupId !== r.groupId )
+	);
+	assert.ok( row );
+	const low = skillTooltip(
+		{
+			id: row.id,
+			catalog,
+			learned: [],
+			progression: { skillPoints: 0, masteries: [] }
+		},
+		text,
+		() => "Mastery"
+	);
+	assert.ok( low.some( r => r.color === 0xffff4a4a ) );
+	assert.ok( low.some( r => r.value === text( "PARAM_CONDITION_OF_LEARN" ) ) );
+	const high = skillTooltip(
+		{
+			id: row.id,
+			catalog,
+			learned: [ row.id ],
+			progression: { skillPoints: 1000000, masteries: [ { id: row.masteryId, level: 120 } ] }
+		},
+		text,
+		() => "Mastery"
+	);
+	assert.ok( !high.some( r => r.value === text( "PARAM_CONDITION_OF_LEARN" ) ) );
+	assert.ok( high.some( r => r.value === text( "PARAM_CONDITION_OF_NEXT_LEVEL" ) ) );
+});
+test("unlearned passive tooltips describe first acquisition instead of the successor", () => {
+	for ( const id of [ 69, 8485 ] ) {
+		const row = defined( catalog.get( id ) );
+		const next = defined( catalog.groups.get( row.groupId + ":2" ) );
+		const rows = skillTooltip(
+			{
+				id,
+				catalog,
+				learned: [],
+				progression: { skillPoints: 0, masteries: [] }
+			},
+			text,
+			() => "Mastery"
+		);
+		assert.equal( row.basicActivity, 0 );
+		assert.ok( rows.some( r => r.value === text( "PARAM_CONDITION_OF_LEARN" ) ) );
+		assert.ok(
+			rows.some( r => r.value === text( "PARAM_MASTERY_LEVEL" ) + " : Mastery Lv " + row.reqMasteryLevel )
+		);
+		assert.ok( rows.some( r => r.value === text( "PARAM_REQ_SP" ) + " : " + row.reqLearnSp ) );
+		assert.ok( !rows.some( r => r.value === text( "PARAM_CONDITION_OF_NEXT_LEVEL" ) ) );
+		assert.ok( !rows.some( r => r.value === text( "PARAM_REQ_SP" ) + " : " + next.reqLearnSp ) );
+	}
+});
+
+test("unlearned active tooltips do not combine acquisition and next-rank requirements", () => {
+	const row = defined(
+		[ ...catalog.values() ].find( r =>
+			r.basicActivity === 1 && r.basicLevel === 1 && r.masteryId && r.reqLearnSp > 0 &&
+			catalog.groups.has( r.groupId + ":2" )
+		)
+	);
+	const rows = skillTooltip(
+		{
+			id: row.id,
+			catalog,
+			learned: [],
+			progression: { skillPoints: 0, masteries: [] }
+		},
+		text,
+		() => "Mastery"
+	);
+	assert.ok( rows.some( r => r.value === text( "PARAM_CONDITION_OF_LEARN" ) ) );
+	assert.ok( !rows.some( r => r.value === text( "PARAM_CONDITION_OF_NEXT_LEVEL" ) ) );
+});
+
+test("published first ranks select acquisition independently of activity or civilization", () => {
+	let count = 0;
+	for ( const row of catalog.values() ) {
+		if ( row.basicLevel !== 1 || !row.masteryId || !row.reqLearnSp ) continue;
+		const rows = skillTooltip(
+			{
+				id: row.id,
+				catalog,
+				learned: [],
+				progression: { masteries: [] }
+			},
+			text,
+			() => "Mastery"
+		);
+		assert.ok( rows.some( r => r.value === text( "PARAM_CONDITION_OF_LEARN" ) ), String( row.id ) );
+		assert.ok( !rows.some( r => r.value === text( "PARAM_CONDITION_OF_NEXT_LEVEL" ) ), String( row.id ) );
+		count++;
+	}
+	assert.ok( count > 100 );
+});
+
+test("learned passive groups use successor requirements and terminal ranks have none", () => {
+	for ( const id of [ 69, 8485 ] ) {
+		const first = defined( catalog.get( id ) );
+		const second = defined( catalog.groups.get( first.groupId + ":2" ) );
+		const terminal = [ ...catalog.values() ].filter( r => r.groupId === first.groupId )
+			.sort( ( a, b ) => b.basicLevel - a.basicLevel )[0];
+		assert.ok( terminal );
+		for ( const learned of [ [ first.id ], [ second.id ] ] ) {
+			const rows = skillTooltip(
+				{
+					id,
+					catalog,
+					learned,
+					progression: { masteries: [] }
+				},
+				text,
+				() => "Mastery"
+			);
+			assert.ok( !rows.some( r => r.value === text( "PARAM_CONDITION_OF_LEARN" ) ) );
+			assert.ok( rows.some( r => r.value === text( "PARAM_REQ_SP" ) + " : " + second.reqLearnSp ) );
+		}
+		const rows = skillTooltip(
+			{
+				id: terminal.id,
+				catalog,
+				learned: [ terminal.id ],
+				progression: { masteries: [] }
+			},
+			text,
+			() => "Mastery"
+		);
+		assert.ok( !rows.some( r => r.value === text( "PARAM_CONDITION_OF_LEARN" ) ) );
+		assert.ok( !rows.some( r => r.value === text( "PARAM_CONDITION_OF_NEXT_LEVEL" ) ) );
+	}
+});
+
+test("weapon variance, opt level and broken durability use native display rules", () => {
+	const fields = {};
+	for (
+		const name of [
+			"varianceIntMin1c0",
+			"varianceIntMax1c4",
+			"varianceIntMin240",
+			"varianceIntMax244",
+			"varianceIntMin248",
+			"varianceIntMax24c",
+			"varianceIntMin254",
+			"varianceIntMax258",
+			"varianceIntMin25c",
+			"varianceIntMax260",
+			"varianceFloatPerPlus250",
+			"varianceFloatPerPlus264",
+			"varianceIntMin288",
+			"varianceIntMax28c",
+			"varianceFloatPerPlus290",
+			"varianceIntMin294",
+			"varianceIntMax298",
+			"varianceFloatMin268",
+			"varianceFloatMax26c",
+			"varianceFloatMin270",
+			"varianceFloatMax274",
+			"varianceFloatMin278",
+			"varianceFloatMax27c",
+			"varianceFloatMin280",
+			"varianceFloatMax284"
+		]
+	) fields[name] = 0;
+	Object.assign( fields, {
+		varianceIntMin1c0: 20,
+		varianceIntMax1c4: 40,
+		varianceIntMin240: 10,
+		varianceIntMax244: 41,
+		varianceIntMin248: 20,
+		varianceIntMax24c: 51,
+		varianceFloatPerPlus250: 3
+	} );
+	const item = {
+		typeFlags: 0x132c,
+		plus: 5,
+		variance: String( 31n << 20n ),
+		magic: [],
+		durability: 0,
+		tooltip: { fields }
+	};
+	const rows = itemTooltipStats( item, s => s );
+	// 555720 prints the +5 stats (5 x 3 more) and grades the variance alone.
+	assert.equal( rows.find( r => r.value.startsWith( "PARAM_PA" ) ).value, "PARAM_PA 56 ~ 66 (+100%)" );
+	assert.equal( rows.find( r => r.value.startsWith( "PARAM_DUR" ) ).color, 0xffff4a4a );
+});
+test("tooltip wrapping retains row colors and blank separators across viewport edge placement", () => {
+	const result = tooltipBubble(
+		[ { value: "First", color: 0xffffffff }, { value: " ", color: 0 }, {
+			value: "Unmet requirement",
+			color: 0xffff4a4a
+		} ],
+		[ 1150, 850, 32, 32 ],
+		[ 0, 0, 1200, 900 ],
+		s => s.length * 7
+	);
+	assert.equal( result.lines.length, 3 );
+	assert.equal( result.lines[2].color, 0xffff4a4a );
+	assert.ok( result.lines[0].rect[0] < 1150 );
+	assert.ok( result.lines.at( -1 ).rect[1] + 18 <= 885 );
+});
+
+test("native tooltip border opacity is independent of fill, text and child ornaments", () => {
+	const result = tooltipBubble(
+		[ { value: "Skill", color: 0xffffffff }, { value: "Attack", color: 0xffff4a4a, ornament: "diamond" } ],
+		[ 300, 100, 32, 32 ],
+		[ 0, 0, 1200, 900 ],
+		s => s.length * 7
+	);
+	assert.deepEqual(
+		result.quads[0].color,
+		[ 26 / 255, 35 / 255, 69 / 255, 181 / 255 ],
+		"679190 fill uses 0xB51A2345"
+	);
+	const border = result.quads.filter( q => /com_tooltip_(corner|edge)\.png$/.test( q.texture ) );
+	assert.equal( border.length, 8 );
+	assert.ok( border.every( q => q.sampling === "nearest" ), "native stretch border uses point filtering" );
+	for ( const q of border ) {
+		assert.deepEqual(
+			q.color,
+			[ 1, 1, 1, 196 / 255 ],
+			"6791C0 display alpha overrides construction before 6FB030"
+		);
+	}
+	assert.equal(
+		result.quads.find( q => q.texture.endsWith( "com_diamond.png" ) ).color[3],
+		1,
+		"child ornament does not inherit parent border alpha"
+	);
+	assert.deepEqual( result.lines.map( row => row.color ), [ 0xffffffff, 0xffff4a4a ] );
+	assert.deepEqual( border.slice( 4 ).map( q => q.uvTurn ), [ 0, 1, 0, 3 ] );
+});
+
+const { itemTooltip } = await load( "src/engine/foundation/ui/item-tooltip.ts" );
+const { itemTooltipMagic } = await load( "src/engine/foundation/ui/item-tooltip-magic.ts" );
+const { tooltipDescription } = await load( "src/engine/foundation/ui/tooltip-description.ts" );
+const { itemTooltipReference, itemMagicReferences } = await load(
+	"src/engine/foundation/gameplay/item-tooltip-reference.ts"
+);
+test("native reference names survive admission; malformed numeric fields and bounds fail closed", () => {
+	const fields = { itemParam1_29c: 120, itemParam2_2a0: 25 };
+	const ref = itemTooltipReference( fields, "SN_POTION_DESC" );
+	fields.itemParam1_29c = 9;
+	assert.equal( ref.fields.itemParam1_29c, 120 );
+	assert.equal( ref.descriptionSymbol, "SN_POTION_DESC" );
+	assert.throws( () => itemTooltipReference( { itemParam1_29c: NaN } ) );
+	assert.throws( () =>
+		itemMagicReferences( [ {
+			paramId: 1,
+			degree: 1,
+			optionName: "MATTR_STR",
+			paramName: "+str",
+			rangeWords: [ 1, -1, 0 ]
+		} ] )
+	);
+});
+// 175 retail English descriptions plus 71 from the English completion layer
+// (englishCompletions/textdataname.json).
+test("all 246 English published rich item descriptions preserve native color and emphasis without leaking markup", () => {
+	let count = 0;
+	for ( const [key, value] of Object.entries( strings ) ) {
+		if ( !key.includes( "ITEM" ) || !value.startsWith( "<sml2>" ) ) continue;
+		count++;
+		const rows = tooltipDescription( value );
+		assert.ok( rows.length );
+		assert.ok( rows.every( row => !/<[^>]+>/.test( row.value ) ) );
+	}
+	assert.equal( count, 246 );
+	const rows = tooltipDescription(
+		'<sml2><strong><font color="255,236,219,156">Heading</font></strong><br>Body</sml2>'
+	);
+	assert.equal( rows[0].strong, true );
+	assert.equal( rows[0].color, 0xffecdb9c );
+	assert.equal( rows[1].strong, false );
+});
+test("magic brackets resolve item degree, zero STR follows native fallback, repair count excludes consumed charge", () => {
+	const refs = [
+		{ paramId: 1, optionName: "MATTR_STR", paramName: "+str", degree: 1, rangeWords: [ 65538, 196608, 0 ] },
+		{ paramId: 2, optionName: "MATTR_STR", paramName: "+str", degree: 2, rangeWords: [ 131075, 262144, 0 ] },
+		{ paramId: 3, optionName: "MATTR_REPAIR", paramName: "+repair", degree: 1 }
+	];
+	const item = {
+		magic: [ String( 3n << 32n | 1n ) ],
+		magicReferences: refs,
+		tooltip: { fields: { itemClass: 4 } },
+		typeFlags: 0x132c
+	};
+	assert.equal( itemTooltipMagic( item, s => s )[0].value, "PARAM_STR 3 PARAM_INCREASE (+50%)" );
+	item.tooltip.fields.itemClass = 1;
+	item.magic = [ "1" ];
+	assert.equal( itemTooltipMagic( item, s => s )[0].value, "PARAM_STR 1 PARAM_INCREASE (+0%)" );
+	item.magic = [ String( 1n << 32n | 3n ) ];
+	assert.equal( itemTooltipMagic( item, s => s )[0].value, "PARAM_REPAIR (0UIIT_STT_COUNT)" );
+});
+test("consumable tooltip keeps flat and ratio recovery separate; equipment enhancement suffix is not suppressed for EU armor", () => {
+	const item = {
+		name: "Potion",
+		typeFlags: 0x8ec,
+		plus: 0,
+		magic: [],
+		tooltip: { fields: { itemParam1_29c: 120, itemParam2_2a0: 25, itemParam3_2a4: 80, itemParam4_2a8: 10 } }
+	};
+	const rows = itemTooltip( item, { masteries: [] }, s => s );
+	assert.ok( rows.some( r => r.value === "PARAM_HEAL_HP[120]" ) );
+	assert.ok( rows.some( r => r.value === "PARAM_HEAL_HP[25]%" ) );
+	assert.ok( rows.some( r => r.value === "PARAM_HEAL_MP[80]" ) );
+	const armor = { name: "EU armor", typeFlags: 0xdac, plus: 3, magic: [] };
+	assert.equal( itemTooltip( armor, { masteries: [] }, s => s )[0].value, "EU armor (+3)" );
+});
+
+// Read-only retail capture: English cells for these developer-spawnable items
+// are empty. A Korean fallback is not retail English and renders as ???? in
+// the Latin atlas. An empty heading must not suppress the valid amount rows.
+test("retail empty item text preserves quantity without invented names or foreign fallback", async () => {
+	const { itemTooltip } = await load( "src/engine/foundation/ui/item-tooltip.ts" );
+	const raw = Object.fromEntries(
+		readLocalizedTextDataRowsSync( path.join( retailTextdataRoot, "textdataname.txt" ) ).map(
+			row => [ row[1], row[8] ]
+		)
+	);
+	for ( const symbol of Object.keys( ITEM_TEXT_COMPLETIONS ) ) {
+		assert.ok( raw[symbol] === undefined || /^(?:-|0)?$/.test( raw[symbol] ), symbol );
+	}
+	const retailText = s => Object.hasOwn( raw, s ) ? raw[s] : text( s );
+	const rows = itemTooltip(
+		{
+			name: "",
+			quantity: 1,
+			typeFlags: 0xeec,
+			magic: [],
+			tooltip: { descriptionSymbol: "SN_ITEM_ETC_SPEED_UP_BASIC_TT_DESC", fields: { maxStack: 20 } }
+		},
+		{ masteries: [] },
+		retailText
+	);
+	assert.ok( rows.some( r => r.value === text( "PARAM_MAX_CONTAIN" ) + " 20" ) );
+	assert.ok( rows.some( r => r.value === text( "UIIT_STT_AMOUNT" ) + " 1" ) );
+	assert.ok( !rows.some( r => r.heading || r.value.includes( "ITEM_" ) || /[\uac00-\ud7af]/.test( r.value ) ) );
+});
+
+const { createUiPreparation } = await load( "src/engine/foundation/ui/ui.ts" );
+test("sampling changes invalidate retained commands, survive admission and reject invalid modes", () => {
+	const owner = createUiPreparation(),
+		q = {
+			rect: [ 0, 0, 8, 8 ],
+			clip: [ 0, 0, 100, 100 ],
+			uv: [ 0, 0, 1, 1 ],
+			color: [ 1, 1, 1, 1 ],
+			texture: "frame"
+		},
+		scene = { revision: 1, width: 100, height: 100, quads: [ q ] };
+	const first = owner.prepare( scene );
+	const next = owner.prepare( { ...scene, revision: 2, quads: [ { ...q, sampling: "nearest" } ] } );
+	assert.equal( next.scene.quads[0].sampling, "nearest" );
+	assert.notEqual( next.scene.quads[0], first.scene.quads[0] );
+	assert.throws( () => owner.prepare( { ...scene, quads: [ { ...q, sampling: "invalid" } ] } ), /sampling/ );
+	assert.equal(
+		owner.prepare( { ...scene, revision: 3, quads: [ { ...q, sampling: "nearest" } ] } ).scene.quads[0],
+		next.scene.quads[0]
+	);
+});
+
+const { buffTooltip } = await load( "src/engine/foundation/ui/buff-tooltip.ts" );
+test("reported beginner speed scroll uses native effect level and measured tooltip bounds", () => {
+	const row = catalog.get( 31107 );
+	assert.ok( row );
+	assert.equal( row.basicLevel, 1 );
+	assert.equal( text( row.nameSymbol ), ITEM_TEXT_COMPLETIONS.SN_ITEM_ETC_SPEED_UP_BASIC );
+	const game = {
+		localGid: 1,
+		attachedEffects: [ { gid: 1, skill: 31107, token: 7, phase: 2, remainingMs: 2516000, receivedAtMs: 1000 } ]
+	};
+	const rows = buffTooltip( { kind: "buff", gid: 1, skill: 31107, token: 7 }, game, 1000, catalog, text );
+	assert.equal( rows[0].value, ITEM_TEXT_COMPLETIONS.SN_ITEM_ETC_SPEED_UP_BASIC + " Lv 1\n " );
+	const bubble = tooltipBubble( rows, [ 300, 100, 20, 20 ], [ 0, 0, 1200, 900 ], s => s.length * 7 );
+	const [x, y, w, h] = bubble.quads[0].rect;
+	assert.equal( w, Math.max( ...bubble.lines.map( r => r.value.length * 7 ) ) );
+	assert.equal( h, bubble.lines.length * 18 );
+	assert.deepEqual( bubble.quads[1].rect, [ x - 8, y - 8, 8, 8 ] );
+	assert.deepEqual( bubble.quads[3].rect, [ x + w, y + h, 8, 8 ] );
+	assert.equal( bubble.lines[0].rect[0], x );
+});
+
+test("a scroll buff's marked-up description paints as text in both tooltips", () => {
+	// The published description carries raw PML (<sml2>, <br>, <font>).
+	// Natively the composer keeps it raw and the tooltip painter routes
+	// it through the markup interpreter (Text_HasSml2Markup), so no tag
+	// may reach the screen from either the buff or the skill tooltip.
+	const row = [ ...catalog.values() ].find( r =>
+		r.tooltipDescriptionSymbol === "SN_ITEM_ETC_E051123_EVATION_SCROLL_TT_DESC"
+	);
+	assert.ok( row );
+	const raw = text( row.tooltipDescriptionSymbol );
+	assert.ok( raw.includes( "<sml2>" ) && raw.includes( "<font" ), "published text carries the raw markup" );
+	const game = {
+		localGid: 1,
+		attachedEffects: [ { gid: 1, skill: row.id, token: 7, phase: 2, remainingMs: 2516000, receivedAtMs: 1000 } ]
+	};
+	const buffValues = buffTooltip( { kind: "buff", gid: 1, skill: row.id, token: 7 }, game, 1000, catalog, text )
+		.map( r => r.value );
+	const skillValues = skillTooltip(
+		{ id: row.id, catalog, learned: [], progression: { level: 1, skillPoints: 0, masteries: [] } },
+		text,
+		id => String( id )
+	).map( r => r.value );
+	for ( const values of [ buffValues, skillValues ] ) {
+		const joined = values.join( "\n" );
+		assert.ok( !/<\/?(sml2|br|font|strong)>/.test( joined ), joined );
+		assert.ok( joined.includes( "Dodging ability will increase" ), joined );
+		assert.ok( joined.includes( "Dodging ratio 30% increase" ), joined );
+	}
+});
+
+test("every published scroll description renders without raw markup (#2571)", () => {
+	// The done-when of BUG-090 over the built text data: every scroll
+	// description the item, skill and buff tooltips can publish - the
+	// item-side SN_ITEM_*SCROLL*_TT_DESC entries and the scroll rows of
+	// the skill catalogue, whose descriptions all funnel through
+	// tooltipDescription - renders as text, never as raw PML tags, and
+	// none of them makes the interpreter throw.
+	const descriptions = new Map();
+	for ( const [symbol, value] of Object.entries( strings ) ) {
+		if ( symbol.includes( "SCROLL" ) && symbol.endsWith( "_TT_DESC" ) && value ) descriptions.set( symbol, value );
+	}
+	for ( const row of catalog.values() ) {
+		const value = text( row.tooltipDescriptionSymbol );
+		if ( (row.nameSymbol.includes( "SCROLL" ) || row.tooltipDescriptionSymbol.includes( "SCROLL" )) && value ) {
+			descriptions.set( row.tooltipDescriptionSymbol, value );
+		}
+	}
+	// The sweep must not go quietly empty, and the published scroll
+	// text does carry markup it has to survive.
+	assert.ok( descriptions.size >= 50, `scroll descriptions swept: ${descriptions.size}` );
+	assert.ok( [ ...descriptions.values() ].some( value => value.includes( "<sml2>" ) ) );
+	const rawTag = /<\/?(sml2|br|font|strong|p|left|center|right|img)\b[^>]*>/i;
+	for ( const [symbol, value] of descriptions ) {
+		const rows = tooltipDescription( value );
+		assert.ok( rows.length > 0, `${symbol}: description rendered no rows` );
+		for ( const row of rows ) assert.ok( !rawTag.test( row.value ), `${symbol}: raw tag in ${row.value}` );
+	}
+});
+
+/*
+================
+assertSameBytes
+
+Byte equality for multi-megabyte files. assert.deepEqual on two large
+Buffers renders a byte-wise diff on failure, which runs for minutes and dies
+with "Array buffer allocation failed" instead of reporting the mismatch.
+================
+*/
+function assertSameBytes( actual, expected, message ) {
+	if ( actual.equals( expected ) ) return;
+	let offset = 0;
+	while ( offset < actual.length && offset < expected.length && actual[offset] === expected[offset] ) offset++;
+	assert.fail( `${message}: ${actual.length} bytes vs ${expected.length}, first difference at byte ${offset}` );
+}
+
+const { createInventory } = await load(
+	"src/engine/runtime/simulation/worker/session/world/gameplay/inventory/inventory.ts"
+);
+test( "item localization is shared by published descriptions and server inventory references", NATIVE_ONLY, () => {
+	const source = readFileSync( path.join( retailTextdataRoot, "textdataname.txt" ) );
+	const projected = completeItemTextProjection( source ), again = completeItemTextProjection( projected );
+	// The server bundle applies the item names first, then the authored English
+	// completions for every other untranslated row (buildServerGameDataBundle).
+	assertSameBytes(
+		readFileSync( path.join( serverGameDataRoot, "textdata", "textdataname.txt" ) ),
+		completeEnglishTextProjection( "textdataname.txt", projected ),
+		"installed server projection uses the same completion policy (rebuild it with pnpm task build server-game-data)"
+	);
+	assertSameBytes( again, projected, "rebuilding must be idempotent" );
+	const before = source.toString( "utf16le" ).split( /\r\n?/ ),
+		after = projected.toString( "utf16le" ).split( /\r\n?/ );
+	// 17 retail-absent names plus every pet gear name and tooltip.
+	assert.equal(
+		after.length - before.length,
+		17 + PORT_ITEMS.length * 2,
+		"only the absent name records are appended"
+	);
+	let changed = 0;
+	for ( let i = 0; i < before.length - 1; i++ ) {
+		if ( before[i] !== after[i] ) {
+			const a = before[i].split( "\t" ), b = after[i].split( "\t" );
+			assert.equal( b[8], ITEM_TEXT_COMPLETIONS[a[1]] );
+			b[8] = a[8];
+			assert.deepEqual( b, a );
+			changed++;
+		}
+	}
+	assert.equal( changed, 557 );
+	const official = completeItemText( {
+		SN_ITEM_MALL_MOVE_SPEED_UP_100: "Official future translation",
+		unrelated: ""
+	} );
+	assert.equal( official.SN_ITEM_MALL_MOVE_SPEED_UP_100, "Official future translation" );
+	assert.equal( official.unrelated, "" );
+	const rawName = Object.fromEntries( after.map( r => r.split( "\t" ) ).map( r => [ r[1], r[8] ] ) );
+	const published = readPublishedAssetJsonSync(
+		"/assets/text/textdataname.en.json",
+		CLIENT_PUBLIC_ROOT
+	).entries;
+	const packed = JSON.parse(
+		readPackedAssetBytesSync(
+			"/assets/text/textdataname.en.json",
+			CLIENT_PUBLIC_ROOT
+		).toString( "utf8" )
+	).entries;
+	for ( const [key, value] of Object.entries( ITEM_TEXT_COMPLETIONS ) ) {
+		assert.equal( rawName[key], value );
+		assert.equal( published[key], value );
+		assert.equal( packed[key], value );
+	}
+	assert.deepEqual( assertItemNameCoverage( retailTextdataRoot, published ), {
+		activeItems: 8439,
+		// Retail titles plus every ordinary/sealed pet gear name.
+		itemTitles: 7394 + PORT_ITEMS.length
+	} );
+	const broken = { ...published, SN_ITEM_ETC_DETECT_01: "-" };
+	assert.throws( () => assertItemNameCoverage( retailTextdataRoot, broken ), /SN_ITEM_ETC_DETECT_01/ );
+	const inventory = createInventory( () => {} );
+	for (
+		const [refObjId, symbol] of [ [ 9263, "SN_ITEM_MALL_MOVE_SPEED_UP_50" ], [
+			9264,
+			"SN_ITEM_MALL_MOVE_SPEED_UP_100"
+		], [ 24198, "SN_ITEM_ETC_SPEED_UP_BASIC" ] ]
+	) {
+		const reference = {
+			refObjId,
+			typeFlags: 0xeec,
+			name: rawName[symbol],
+			icon: "item/etc/mall_move_speed_up_100.ddj",
+			nativeFields: { maxStack: 10 },
+			descriptionSymbol: symbol + "_TT_DESC"
+		};
+		inventory.bootstrap( { refItemSnapshot: [ reference ] } );
+		const item = inventory.present( { slot: 13, refObjId, typeFlags: 0xeec, quantity: 10, magic: [] } );
+		const rows = itemTooltip( item, { masteries: [] }, s => published[s] ?? text( s ) );
+		assert.equal( rows[0].value, ITEM_TEXT_COMPLETIONS[symbol] );
+		assert.ok( rows[0].heading );
+		assert.ok( rows.some( r => r.value === ITEM_TEXT_COMPLETIONS[symbol + "_TT_DESC"] ) );
+		assert.ok( rows.some( r => r.value === text( "UIIT_STT_AMOUNT" ) + " 10" ) );
+	}
+} );
+
+test("item completions replace only catalogued blank or dash cells and preserve record bytes", () => {
+	const symbol = "SN_ITEM_ETC_MP_POTION_05", expected = "MP recovery potion (X-large)";
+	for ( const value of [ "", "  ", "-", " - ", "0", "xxx", "NULL" ] ) {
+		assert.equal( completeItemText( { [symbol]: value } )[symbol], expected );
+	}
+	const untouched = { [symbol]: "Official translation", SN_UNLISTED: "-", SN_ITEM_ETC_HP_POTION_05: undefined };
+	const completed = completeItemText( { ...untouched } );
+	for ( const [key, value] of Object.entries( untouched ) ) assert.equal( completed[key], value );
+	const added = completeItemText( {} );
+	assert.equal( added[symbol], undefined );
+	assert.deepEqual(
+		Object.keys( added ).sort(),
+		[
+			...Object.entries( nameCompletions ).filter( ( [, r] ) => r.absent ).map( ( [s] ) => s ),
+			...Object.keys( PORT_ITEM_TEXT )
+		].sort()
+	);
+	const row = value =>
+		[ "1", symbol, "Korean\ncontinued", "", "", "Chinese", "", "Japanese", value, "Other" ].join( "\t" );
+	const tail = `\r\n//${row( "-" )}\r\n1\t${symbol}\tshort\r\n1\tSN_UNLISTED\t0\t0\t0\t0\t0\t0\t-\r\n${
+		row( "Official translation" )
+	}\r\n`;
+	for ( const encoding of [ "utf8", "utf16le" ] ) {
+		const before = Buffer.from( "\ufeff" + row( " - " ) + tail, encoding );
+		const after = completeItemTextProjection( before );
+		const prefix = Buffer.from( "\ufeff" + row( expected ) + tail, encoding );
+		assert.deepEqual( after.subarray( 0, prefix.length ), prefix );
+		assert.deepEqual( completeItemTextProjection( after ), after );
+	}
+});
+
+test("all catalog completions carry readable English and source labels; currency repairs change only the name key", () => {
+	for ( const [symbol, entry] of Object.entries( nameCompletions ) ) {
+		assert.match( symbol, /^SN_ITEM_/ );
+		assert.ok( entry.source && entry.basis, symbol );
+		assert.match( entry.english, /^[\x20-\x7e]+$/ );
+		assert.ok( !/undefined|^[-0]$/.test( entry.english ), symbol );
+	}
+	const row = "1\t1\tITEM_ETC_GOLD_01\tGold\txxx\txxx\txxx_TT_DESC\t0\t0";
+	const untouched = "1\t42\tITEM_UNKNOWN\tUnknown\txxx\txxx\txxx_TT_DESC\t0\t0";
+	for ( const encoding of [ "utf8", "utf16le" ] ) {
+		const source = Buffer.from( "\ufeff" + row + "\r\n" + untouched + "\r\n//" + row + "\r\n", encoding );
+		const result = completeItemReferenceProjection( source );
+		assert.deepEqual(
+			result,
+			Buffer.from(
+				"\ufeff" + row.replace( "\txxx\txxx\t", "\txxx\tSN_ITEM_ETC_GOLD\t" ) + "\r\n" + untouched + "\r\n//" +
+					row + "\r\n",
+				encoding
+			)
+		);
+		assert.deepEqual( completeItemReferenceProjection( result ), result );
+	}
+});
+
+test("X-large potions and all purification pills retain their title, ornament and stack rows", () => {
+	const projected = readFileSync( path.join( serverGameDataRoot, "textdata", "textdataname.txt" ), "utf16le" );
+	const names = Object.fromEntries(
+		projected.split( /\r\n?/ ).map( r => r.split( "\t" ) ).map( r => [ r[1], r[8]?.trim() ] )
+	);
+	const inventory = createInventory( () => {} );
+	for (
+		const [refObjId, suffix, expected] of [
+			[ 8, "HP_POTION_05", "HP recovery potion (X-large)" ],
+			[ 15, "MP_POTION_05", "MP recovery potion (X-large)" ],
+			[ 10368, "CURE_RANDOM_01", "Purification pill (small)" ],
+			[ 10369, "CURE_RANDOM_02", "Purification pill (medium)" ],
+			[ 10370, "CURE_RANDOM_03", "Purification pill (large)" ],
+			[ 10371, "CURE_RANDOM_04", "Purification pill (X-large)" ]
+		]
+	) {
+		const symbol = "SN_ITEM_ETC_" + suffix, typeFlags = suffix.startsWith( "CURE" ) ? 0x96c : 0x8ec;
+		assert.equal( names[symbol], expected );
+		assert.equal( text( symbol ), expected );
+		inventory.bootstrap( {
+			refItemSnapshot: [ { refObjId, name: names[symbol], typeFlags, nativeFields: { maxStack: 50 } } ]
+		} );
+		const item = inventory.present( { slot: 13, refObjId, typeFlags, quantity: 3, magic: [] } );
+		const rows = itemTooltip( item, { masteries: [] }, text );
+		assert.equal( rows[0].value, expected );
+		assert.equal( rows[0].heading, true );
+		assert.equal( rows[0].ornament, "item" );
+		assert.ok( rows.some( r => r.value === text( "PARAM_MAX_CONTAIN" ) + " 50" ) );
+		assert.ok( rows.some( r => r.value === text( "UIIT_STT_AMOUNT" ) + " 3" ) );
+		const bubble = tooltipBubble( rows, [ 300, 100, 32, 32 ], [ 0, 0, 1200, 900 ], s => s.length * 7 );
+		assert.equal( bubble.lines.filter( r => r.heading ).map( r => r.value.trim() ).join( " " ), expected );
+		assert.ok( bubble.quads.some( q => q.texture.endsWith( "com_itemsign.png" ) ) );
+	}
+});
+
+// ASM 84C900/84C911/84C9BA: argument words must never become instructions.
+test("native tooltip parameter cursor consumes complete setv saps and stns blocks", () => {
+	for (
+		const [tail, offset, values] of [
+			[ [ 0x73657476, 0x45325341, 20, 0x64757261, 0x64757261, 123 ], null, null ],
+			[ [ 0x73617073, 11, 22, 0x64757261, 123 ], 0x30, [ 11, 22 ] ],
+			[ [ 0x73746e73, 11, 22, 33, 0x64757261, 123 ], 0x70, [ 11, 22, 33 ] ]
+		]
+	) {
+		const cells = source.rows[0].split( "\t" );
+		for ( let i = 69; i < 118; i++ ) cells[source.columns.indexOf( i )] = String( defined( tail )[i - 69] ?? 0 );
+		cells[source.columns.indexOf( 9 )] = "0";
+		const row = [ ...decodeTooltipSkills( { ...source, rows: [ cells.join( "\t" ) ] } ).values() ][0];
+		assert.equal( row.directTooltipParams.durationMs, 123 );
+		if ( offset !== null ) {
+			assert.deepEqual(
+				row.directTooltipParams.nativeParamBlocks.find( b => b.offset === offset )?.values,
+				values
+			);
+		} else assert.deepEqual( row.directTooltipParams.setValues, [ { code: 0x45325341, value: 20 } ] );
+	}
+});
+/*
+================
+paramRow
+
+A synthetic tooltip row carrying exactly the native parameter blocks a
+test names, in the row view's shape.
+================
+*/
+function paramRow( blocks ) {
+	return {
+		nameSymbol: "SN_SKILL_TEST",
+		directTooltipParams: {
+			nativeParamBlocks: blocks.map( ( [offset, values] ) => ({ offset, tag: 0, values }) ),
+			durationMs: null,
+			multiCount: null,
+			downAttackRatio: null,
+			criticalFlat: 0,
+			criticalRatio: 0,
+			tauntFlat: 0,
+			tauntRatio: 0,
+			knockout: null,
+			rangeIncreaseDeci: null,
+			knockback: null,
+			defense: null,
+			recovery: null,
+			setValues: [],
+			area: null,
+			areas: []
+		}
+	};
+}
+
+// #2273 ASM 0x803b5e..0x803c03 (stns), 0x7faa83..0x7fab03 (hwir),
+// 0x7ff48f..0x7ff546 (saps), 0x7ffe70..0x7fff2d (dmgt), 0x7f9f7d..0x7fa039 (da+reqc).
+test("native tooltip lines the port dropped render from their parameters (#2273)", () => {
+	const direct = skillParameterFormatters( text ).direct;
+	// stns: a start delay prints _01; the periodic shape prints _02 with the
+	// interval in seconds and the damage percent. The two are independent
+	// (0x803bb5 falls through to 0x803bba): with both set, both print.
+	assert.deepEqual( direct( paramRow( [ [ 0x70, [ 5000, 25, 3000 ] ] ] ) ), [
+		"Damage starts [5] second(s) after petrification",
+		"Every [3] second(s): [25]% damage"
+	] );
+	assert.deepEqual( direct( paramRow( [ [ 0x70, [ 5000, 0, 3000 ] ] ] ) ), [
+		"Damage starts [5] second(s) after petrification"
+	] );
+	assert.deepEqual( direct( paramRow( [ [ 0x70, [ 0, 25, 3000 ] ] ] ) ), [
+		"Every [3] second(s): [25]% damage"
+	] );
+	assert.deepEqual( direct( paramRow( [ [ 0x70, [ 0, 0, 3000 ] ] ] ) ), [] );
+	// hwir: the berserk-gauge chance at values[0]. The native gate
+	// is cmp/jbe (unsigned), so a negative chance prints too (#2628).
+	assert.deepEqual( direct( paramRow( [ [ 0x1e0, [ 30 ] ] ] ) ), [
+		"Chance of Obtaining Berserk Gage 30% Increase"
+	] );
+	assert.deepEqual( direct( paramRow( [ [ 0x1e0, [ -5 ] ] ] ) ), [
+		"Chance of Obtaining Berserk Gage -5% Increase"
+	] );
+	assert.deepEqual( direct( paramRow( [ [ 0x1e0, [ 0 ] ] ] ) ), [] );
+	// saps: flag bits 4 and 8 print the physical and magical resonance lines.
+	assert.deepEqual( direct( paramRow( [ [ 0x30, [ 12, 25 ] ] ] ) ), [
+		"Phy. skill resonance 25%",
+		"Mag. skill resonance 25%"
+	] );
+	assert.deepEqual( direct( paramRow( [ [ 0x30, [ 4, 25 ] ] ] ) ), [ "Phy. skill resonance 25%" ] );
+	// dmgt: two absorb-rate lines, not the damage-pair text.
+	assert.deepEqual( direct( paramRow( [ [ 0x1a0, [ 30, 40 ] ] ] ) ), [
+		"Absorb Rate 30%",
+		"Absorb Rate 40%"
+	] );
+	// odar {kind, percent}: Guard Tambour (4) absorbs physical damage only,
+	// Mana Tambour (8) magical only; 12 and the basic/skill-only kinds both.
+	assert.deepEqual( direct( paramRow( [ [ 0x44, [ 4, 23 ] ] ] ) ), [ "Physical damage 23% Absorption" ] );
+	assert.deepEqual( direct( paramRow( [ [ 0x44, [ 8, 41 ] ] ] ) ), [ "Magical damage 41% Absorption" ] );
+	assert.deepEqual( direct( paramRow( [ [ 0x44, [ 6, 10 ] ] ] ) ), [ "Physical damage 10% Absorption" ] );
+	assert.deepEqual( direct( paramRow( [ [ 0x44, [ 15, 20 ] ] ] ) ), [
+		"Physical damage 20% Absorption",
+		"Magical damage 20% Absorption"
+	] );
+	assert.deepEqual( direct( paramRow( [ [ 0x44, [ 3, 5 ] ] ] ) ), [
+		"Physical damage 5% Absorption",
+		"Magical damage 5% Absorption"
+	] );
+	assert.deepEqual( direct( paramRow( [ [ 0x44, [ 4, 0 ] ] ] ) ), [] );
+	// reqc glues its note onto the down-attack row with no separator, and
+	// only when that row prints.
+	assert.deepEqual( direct( paramRow( [ [ 0x14, [ 130 ] ], [ 0x170, [ 1 ] ] ] ) ), [
+		"Down-attack damage 30% Increase(Exclusively use)"
+	] );
+	assert.deepEqual( direct( paramRow( [ [ 0x14, [ 100 ] ], [ 0x170, [ 1 ] ] ] ) ), [] );
+	assert.deepEqual( direct( paramRow( [ [ 0x170, [ 1 ] ] ] ) ), [] );
+});
+test("Guard Tambour absorbs physical damage only and Mana Tambour magical only", () => {
+	// SKILL_EU_BARD_BATTLAA_GUARD_A_02 is odar 4 23, GUARD_B_07 odar 8 41.
+	for (
+		const [id, line] of [ [ 9747, "Physical damage 23% Absorption" ], [ 9763, "Magical damage 41% Absorption" ] ]
+	) {
+		const rows = skillTooltip(
+			{ id, catalog, learned: [ id ], progression: { level: 90, skillPoints: 0, masteries: [] } },
+			text,
+			String
+		);
+		const absorb = rows.filter( row =>
+			typeof row.value === "string" && row.value.endsWith( text( "PARAM_ABSORB" ) )
+		)
+			.map( row => row.value );
+		assert.deepEqual( absorb, [ line ], `skill ${id}` );
+	}
+});
+test("Ghost Walk shows its travel distance, the second tele argument, like the original", () => {
+	// Client 7FC6CE..7FC731 prints [edi+4] / 10 under the tele row; the first
+	// argument (500 on every rank) only gates it. Phantom 1 travels 100, Shadow 4 travels 230.
+	const label = text( "PARAM_TELE" );
+	for ( const [id, metres] of [ [ 114, "10.0" ], [ 1297, "21.0" ], [ 19636, "21.5" ], [ 19639, "23.0" ] ] ) {
+		const rows = skillTooltip(
+			{ id, catalog, learned: [ id ], progression: { level: 90, skillPoints: 0, masteries: [] } },
+			text,
+			String
+		);
+		const tele = rows.filter( row => typeof row.value === "string" && row.value.startsWith( label + " " ) ).map(
+			row => row.value
+		);
+		assert.deepEqual( tele, [ `${label} ${metres}m` ], `skill ${id}` );
+	}
+});

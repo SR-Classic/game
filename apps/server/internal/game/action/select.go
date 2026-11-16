@@ -1,0 +1,549 @@
+/*
+===========================================================================
+
+select.go - The 0x745A object select/interact request. It lives on the item plane
+because the plane already owns every gid the request can legally name:
+the shared WorldStore, the division ground registry (the other
+target-shaped request, 0x72CD, lives here too), the shared monster
+population and, through deps, the division character roster. Static
+CITeleportGate records share the roster interest/liveness owner, but use
+the native structure grant (capabilities without the CICNPC mask). Guard
+and AT structures still require their own authored spawn authorities.
+
+Wire contract: internal/game/item/wire/objectselect.go (dual-use send sites and
+the 0xB45A twin's encoder). The browser client folded CPSMission_OnNpcSelectResponse0xB45A's
+live-CICNPC arm REAL (npcTalkPlane.ts consumes it), retiring the old
+"0xB45A is unconsumable" ruling from server-wave seq 51: the GRANT for
+a live roster NPC now answers a real 0xB45A - result 1, the gid, the
+capability flags its service set projects (simulation.ResolveNpcTalkFlags) -
+and the NPC talk window opens from live play. A live in-scope monster
+answers the same opcode with current HP and flags zero, updating the
+target HUD without opening the talk window. Player and ground-drop grants
+record without a frame: neither grant has a proven server response
+payload, while the now-complete client fold can consume the local-player
+and non-character result arms when an authority legitimately emits one.
+Refusals send nothing in either direction (the historical native 0xB45A
+probe crashed the retail client on uninitialized interaction scratch),
+except the native out-of-range refusal [2, 4] for an NPC beyond its
+class range (npcrange.go), which the browser client consumes silently.
+
+===========================================================================
+*/
+
+package action
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+
+	log "github.com/sirupsen/logrus"
+	"opensro.online/server/internal/game/enterworld"
+	"opensro.online/server/internal/game/item/wire"
+	"opensro.online/server/internal/game/world/monster"
+	"opensro.online/server/internal/game/world/simulation"
+	"opensro.online/server/internal/transport"
+)
+
+/*
+================
+SelectionStore
+
+SelectionStore is the per-character object-selection plane: the last gid
+each character validly selected (division-scoped key, the PendingTracker
+key convention), and the NPC function the selection opened. Runtime-only
+state, like the fixture's in-memory selection - nothing persists, a reboot
+simply forgets selections.
+It locks itself so cross-lane readers never need the item-operation lane.
+================
+*/
+type SelectionStore struct {
+	mu          sync.Mutex
+	byCharacter map[string]selection
+}
+
+/*
+================
+selection
+
+selection is one character's selected gid and its open NPC function.
+Natively the player's +0xC+6 is set to 5 when an in-range request opens a shop;
+trades check that state, not distance. A new selection or a release ends
+it, so every path that clears the selection also closes the function.
+The division and name are the key's parts, kept for the readers that walk
+every selection (holders).
+================
+*/
+type selection struct {
+	division     string
+	name         string
+	gid          uint32
+	functionOpen bool
+}
+
+/*
+================
+NewSelectionStore
+
+NewSelectionStore builds an empty selection plane.
+================
+*/
+func NewSelectionStore() *SelectionStore {
+	return &SelectionStore{byCharacter: make(map[string]selection)}
+}
+
+/*
+================
+Set
+
+Set records a character's selected object gid. Any open NPC function ends.
+================
+*/
+func (s *SelectionStore) Set(divisionID, characterName string, gid uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.byCharacter[selectionKey(divisionID, characterName)] = selection{division: divisionID, name: characterName, gid: gid}
+}
+
+/*
+================
+Get
+
+Get answers a character's selected object gid, if any.
+================
+*/
+func (s *SelectionStore) Get(divisionID, characterName string) (uint32, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.byCharacter[selectionKey(divisionID, characterName)]
+	return row.gid, ok
+}
+
+/*
+================
+Clear
+
+Clear forgets a character's selection and closes its NPC function.
+================
+*/
+func (s *SelectionStore) Clear(divisionID, characterName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.byCharacter, selectionKey(divisionID, characterName))
+}
+
+/*
+================
+release
+
+Forget a character's selection if it is still gid. A reader acting on a
+holders copy uses it, so a selection made since the copy stays.
+================
+*/
+func (s *SelectionStore) release(divisionID, characterName string, gid uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := selectionKey(divisionID, characterName)
+	if row, ok := s.byCharacter[key]; ok && row.gid == gid {
+		delete(s.byCharacter, key)
+	}
+}
+
+/*
+================
+OpenFunction
+
+OpenFunction marks the NPC function of the selected gid open. It does
+nothing unless gid is still the selection.
+================
+*/
+func (s *SelectionStore) OpenFunction(divisionID, characterName string, gid uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := selectionKey(divisionID, characterName)
+	if row, ok := s.byCharacter[key]; ok && row.gid == gid {
+		row.functionOpen = true
+		s.byCharacter[key] = row
+	}
+}
+
+/*
+================
+FunctionOpen
+
+FunctionOpen answers whether gid is selected with its NPC function open.
+================
+*/
+func (s *SelectionStore) FunctionOpen(divisionID, characterName string, gid uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.byCharacter[selectionKey(divisionID, characterName)]
+	return ok && row.gid == gid && row.functionOpen
+}
+
+/*
+================
+selectionHolder
+
+One character holding a selection: its division, name and selected gid.
+================
+*/
+type selectionHolder struct {
+	division string
+	name     string
+	gid      uint32
+}
+
+/*
+================
+holders
+
+Append every character's selection to dst, in no particular order. The
+copy is taken under the lock, so a reader acts on it without holding it.
+================
+*/
+func (s *SelectionStore) holders(dst []selectionHolder) []selectionHolder {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, row := range s.byCharacter {
+		if row.gid != 0 {
+			dst = append(dst, selectionHolder{division: row.division, name: row.name, gid: row.gid})
+		}
+	}
+	return dst
+}
+
+/*
+================
+selectionKey
+================
+*/
+func selectionKey(divisionID, characterName string) string {
+	return divisionID + ":" + strings.ToLower(characterName)
+}
+
+/*
+================
+SelectOutcome
+
+SelectOutcome is one handled 0x745A: the recorded gid on a grant, or the
+refusal reason. Frames carries the typed live NPC or monster 0xB45A for
+the acting session, or the out-of-range refusal; player and ground grants
+and every other refusal leave it empty (see the package comment).
+================
+*/
+type SelectOutcome struct {
+	// Selected is the recorded gid; meaningful only when Refusal is empty.
+	Selected uint32
+	Frames   []wire.Frame
+	Refusal  string
+}
+
+/*
+================
+refusedSelect
+================
+*/
+func refusedSelect(reason string) SelectOutcome {
+	return SelectOutcome{Refusal: reason}
+}
+
+/*
+================
+registerObjectSelect
+
+registerObjectSelect wires the 0x745A handler onto the hub. The 0xB45A
+answer rides live roster-NPC and monster grants (outcome.Frames); this
+plane still has no typed refusal channel, so an unbound session
+discards silently - answering it with a B06D item error would invent a
+conversation, the progression posture.
+================
+*/
+func (rt *Runtime) registerObjectSelect(hub *transport.Hub) {
+	hub.Handle(wire.OpObjectSelectRequest, func(s *transport.Session, opcode uint16, payload []byte) {
+		character, divisionID, bound := enterworld.SessionCharacter(rt.deps, s)
+		if !bound {
+			log.Debugf("action: 0x%04X from unbound session %d discarded", opcode, s.ID)
+			return
+		}
+		outcome := rt.HandleObjectSelect(divisionID, character, payload)
+		if outcome.Refusal != "" {
+			// A typed refusal (out of range, no such object) answers the
+			// client; a malformed or delete-pending request stays silent.
+			log.Debugf("action: 0x745A refused for %s: %s", character.Name, outcome.Refusal)
+			sendFrames(s, outcome.Frames)
+			return
+		}
+		sendFrames(s, outcome.Frames)
+		log.Debugf("action: 0x745A %s selected gid %d", character.Name, outcome.Selected)
+	})
+}
+
+/*
+================
+HandleObjectSelect
+
+HandleObjectSelect answers a C->S 0x745A object select/interact: strict
+decode (exactly [u32le gid]), then a LIVENESS gate - the gid must resolve
+to an object this division's world actually contains:
+
+  - a division character's player entity (self included: the native
+    self-click and clear-marker send sites both name the local player's
+    own band; peers are world objects on the peer-visibility plane);
+  - a roster NPC spawned for the ACTING character (gids are derived
+    per-character, simulation.NpcObjectID), only while the NPC roster is
+    enabled - with spawns off those gids exist on no client and accepting
+    them would widen the domain;
+  - a live monster from the shared division registry, only while the
+    region it stands in now (its mover's live pose; the generated home
+    point only for a monster without a mover) is inside the acting
+    character's current visibility ring;
+  - a live ground drop in the division registry.
+
+Anything else refuses: an object-interaction acceptor on a live server
+that records arbitrary gids would hand later consumers (attack/talk
+lanes) attacker-chosen targets (coordinator ruling, seq 51). Every
+grant records the selection on the runtime store. The roster-NPC grant
+answers with the 0xB45A talk flags; the monster grant answers with its
+per-instance current HP and zero flags. Player and ground grants stay
+frameless (no native response bytes are proven for those outcomes).
+================
+*/
+func (rt *Runtime) HandleObjectSelect(divisionID string, character *enterworld.Character, payload []byte) SelectOutcome {
+	if character == nil {
+		return refusedSelect("characterNotFound")
+	}
+
+	unlock := rt.lockDivision(divisionID)
+	defer unlock()
+
+	gid, err := wire.DecodeObjectSelectRequest(payload)
+	if err != nil {
+		return refusedSelect(err.Error())
+	}
+
+	// Capture the Flag arena objects (flagwar_arena.go) live outside
+	// every roster; the match owner answers their selects itself.
+	if outcome, handled := rt.flagWarSelect(divisionID, character, gid); handled {
+		return outcome
+	}
+	// A quest instance's exit gate (questgate.go) stands outside the
+	// static roster too.
+	if outcome, handled := rt.questGateSelect(divisionID, character, gid); handled {
+		return outcome
+	}
+
+	// Capture the pointer list before entering the read door. The source
+	// returns an owned slice; peer fields are inspected only while the door
+	// is held, without recursively acquiring the store read lock.
+	peers := rt.deps.CharactersForDivision(divisionID)
+	var target selectedObject
+	var live, deletePending, tooFar bool
+	rt.deps.Read(divisionID, func() {
+		deletePending = character.DeletePending
+		if !deletePending {
+			world := rt.Worlds.Snapshot(
+				simulation.WorldKey(divisionID, character.Name),
+				func() simulation.WorldState { return simulation.SeedWorldState(character) },
+			)
+			viewerRegion := world.LiveSpawnAt(rt.Now().UnixMilli()).RegionID
+			target, live = rt.resolveLiveObject(
+				divisionID,
+				character,
+				peers,
+				gid,
+				viewerRegion,
+			)
+			// The native select runs the hit-range test on every select: an NPC beyond its class
+			// range is refused with code 4 and no selection is recorded.
+			tooFar = live && target.npc != nil && !rt.npcWithinHitRange(divisionID, character, *target.npc)
+		}
+	})
+	if deletePending {
+		return refusedSelect("deletePending")
+	}
+	if !live {
+		// Natively an object the server cannot resolve still gets an answer,
+		// an error response (0xB045, 3); a silent refusal left the client's
+		// selection pending until its reply timeout, its window closed.
+		return SelectOutcome{
+			Refusal: fmt.Sprintf("gid %d resolves to no live object in division %s", gid, divisionID),
+			Frames: []wire.Frame{{
+				Opcode:  wire.OpObjectSelectResult,
+				Payload: wire.EncodeObjectSelectRefusal(selectObjectNotFound),
+			}},
+		}
+	}
+	if tooFar {
+		return SelectOutcome{
+			Refusal: fmt.Sprintf("NPC gid %d is beyond its interaction range", gid),
+			Frames: []wire.Frame{{
+				Opcode:  wire.OpObjectSelectResult,
+				Payload: wire.EncodeObjectSelectRefusal(hitRangeTooFar),
+			}},
+		}
+	}
+	rt.Selected.Set(divisionID, character.Name, gid)
+	rt.NpcDialogs.Clear(divisionID, character.Name)
+	outcome := SelectOutcome{Selected: gid}
+	var flags uint32
+	if target.npc != nil {
+		flags = target.npc.TalkFlags | rt.reverseReturnCapability(*target.npc, character)
+	}
+	if target.npc != nil {
+		// npcExtra is the native event byte (the reference server's event writer): only the Capture
+		// the Flag registration NPC carries it, and only while sign-up is
+		// open - 1 invites registration, 2 offers its cancel (flagwar.go).
+		// Every live authored NPC receives a typed result, including a
+		// legitimate zero-capability row; silence used to leave the
+		// client's previous NPC binding alive.
+		outcome.Frames = []wire.Frame{{
+			Opcode:  wire.OpObjectSelectResult,
+			Payload: wire.EncodeNpcObjectSelectResult(gid, flags, rt.flagWarSelectByte(divisionID, character, *target.npc)),
+		}}
+	}
+	if target.npc != nil && target.npc.Teleport != nil {
+		w := wire.NewWriter(11).U8(1).U32(gid).U32(flags)
+		if target.npc.Teleport.FortressID != 0 {
+			tax := rt.commerceTax(divisionID, *target.npc, character)
+			rate := tax.Percent
+			if rate > 0 && tax.Exempt {
+				rate = 0
+			}
+			w.U16(uint16(rate))
+		}
+		outcome.Frames = []wire.Frame{{Opcode: wire.OpObjectSelectResult, Payload: w.Payload()}}
+	}
+	if target.monster != nil {
+		outcome.Frames = []wire.Frame{{
+			Opcode:  wire.OpObjectSelectResult,
+			Payload: wire.EncodeMonsterObjectSelectResult(gid, target.monster.CurrentHP),
+		}}
+		// Port-only, not native (#3349): a Muhan change NPC is a nest
+		// entity that offers Talk (muhan_change.go).
+		if change := rt.muhanChangeSelect(divisionID, character, gid); change != nil {
+			outcome.Frames = change
+		}
+	}
+	if target.cos {
+		outcome.Frames = []wire.Frame{{
+			Opcode:  wire.OpObjectSelectResult,
+			Payload: wire.EncodeMonsterObjectSelectResult(gid, target.cosHP),
+		}}
+	}
+	if rt.AttackPetExpansion {
+		outcome.Frames = append(outcome.Frames, rt.petRecipientBuffFrames(divisionID, gid, rt.Now().UnixMilli())...)
+	}
+	return outcome
+}
+
+/*
+================
+selectedObject
+================
+*/
+type selectedObject struct {
+	npc     *simulation.NpcDef
+	monster *monster.Instance
+	// cosHP is a selected companion's current HP. Natively a COS inherits
+	// the NPC select-info writer, the monster's writer, and the
+	// client reads CICCos through the same non-user arm (7651F1).
+	cosHP uint32
+	cos   bool
+}
+
+/*
+================
+resolveLiveObject
+
+resolveLiveObject answers whether a gid names an object the division's
+world contains right now and returns the typed server authority needed
+to encode NPC or monster selection state. Callers hold the division
+operation lock and character read door. No transitive call may reacquire
+the store lock, including a guild or other authority facet.
+================
+*/
+func (rt *Runtime) resolveLiveObject(
+	divisionID string,
+	character *enterworld.Character,
+	peers []*enterworld.Character,
+	gid uint32,
+	viewerRegion uint16,
+) (selectedObject, bool) {
+	// Division characters (self and peers) - the player entity band.
+	for _, peer := range peers {
+		if peer != nil && !peer.DeletePending && enterworld.ObjectIDForCharacter(peer) == gid {
+			return selectedObject{}, true
+		}
+	}
+	// Selection uses the same live message-block predicate as NPC publication.
+	if rt.NpcSpawn.Enabled {
+		viewer := rt.liveSpawn(simulation.WorldKey(divisionID, character.Name), character, rt.Now().UnixMilli())
+		for index := range rt.NpcRoster {
+			npc := &rt.NpcRoster[index]
+			if npc.ObjectID == gid &&
+				simulation.NpcVisibleAt(*npc, viewer) {
+				return selectedObject{npc: &rt.NpcRoster[index]}, true
+			}
+		}
+	}
+	// Shared monsters are selectable only while they are live and inside
+	// the same ring that made them visible to this character: where the
+	// monster stands now, as the interest scan sees it. Its generated home
+	// point (Spawn) is only its position while it has no mover; a roaming
+	// or chasing monster left it behind.
+	if rt.Monsters != nil {
+		if instance, ok := rt.characterMonster(divisionID, character, gid); ok {
+			region := instance.Spawn.RegionID
+			if live := rt.monsterSpawn(divisionID, gid, rt.Now().UnixMilli()); live.RegionID != 0 {
+				region = live.RegionID
+			}
+			if regionInScope(region, simulation.RegionScopeRing(viewerRegion)) {
+				return selectedObject{monster: &instance}, true
+			}
+		}
+	}
+	// Summoned companions, every owner's (the native select takes any character in
+	// hit range): the presented pose decides the same visibility ring.
+	for _, peer := range peers {
+		if peer == nil || peer.DeletePending {
+			continue
+		}
+		record := peer.CompanionByGID(gid)
+		if record == nil {
+			continue
+		}
+		// The caller holds the read door (HandleObjectSelect).
+		pets, _ := rt.companionPresentationsInDoor(divisionID, peer.Name)
+		for _, pet := range pets {
+			if pet.Row.Gid != gid || pet.LifeState == wire.LifeStateDead {
+				continue
+			}
+			pose := pet.World.LiveSpawnAt(rt.Now().UnixMilli())
+			if regionInScope(pose.RegionID, simulation.RegionScopeRing(viewerRegion)) {
+				return selectedObject{cos: true, cosHP: record.CurrentHP}, true
+			}
+		}
+	}
+	// Live ground drops.
+	if rt.Ground != nil {
+		if _, ok := rt.characterGround(divisionID, character, gid); ok {
+			return selectedObject{}, true
+		}
+	}
+	return selectedObject{}, false
+}
+
+/*
+================
+regionInScope
+================
+*/
+func regionInScope(regionID uint16, scope []uint16) bool {
+	for _, candidate := range scope {
+		if candidate == regionID {
+			return true
+		}
+	}
+	return false
+}

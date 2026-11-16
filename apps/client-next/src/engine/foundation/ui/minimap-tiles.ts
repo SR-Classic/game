@@ -1,0 +1,131 @@
+import type { Pose } from "@/engine/contracts/gameplay";
+import { featuresAt } from "@/engine/foundation/world/plane";
+import { REGION_SIZE, sectorX, sectorY } from "@/engine/foundation/world/world-space";
+export interface MinimapFloor {
+	readonly floorIndex: number;
+	readonly floorLabel: string;
+	readonly directory: string;
+	readonly prefix: string;
+	readonly tiles: readonly string[];
+}
+export function minimapDungeons( value: unknown ): ReadonlyMap<number, readonly MinimapFloor[]> {
+	const data = value as {
+		format: string;
+		version: number;
+		dungeons: { sectorId: number; floors: MinimapFloor[]; }[];
+	};
+	if (
+		data?.format !== "sro-mission-dungeon-minimap-manifest" || data.version !== 1 ||
+		!Array.isArray( data.dungeons ) || data.dungeons.length > 32768
+	) throw Error( "Invalid dungeon minimap catalog" );
+	const result = new Map<number, readonly MinimapFloor[]>();
+	for ( const d of data.dungeons ) {
+		if (
+			!Number.isInteger( d.sectorId ) || d.sectorId < 32768 || d.sectorId > 65535 || !Array.isArray( d.floors ) ||
+			d.floors.length > 256 || result.has( d.sectorId )
+		) throw Error( "Invalid dungeon minimap region" );
+		const ids = new Set<number>();
+		for ( const f of d.floors ) {
+			if (
+				!Number.isInteger( f.floorIndex ) || f.floorIndex < 0 || ids.has( f.floorIndex ) ||
+				typeof f.floorLabel !== "string" || f.floorLabel.length > 256 || ![ f.directory, f.prefix ].every( s =>
+					typeof s === "string" && /^[a-z0-9_]+$/i.test( s )
+				) || !Array.isArray( f.tiles ) || f.tiles.length > 65536 || f.tiles.some( t =>
+					typeof t !== "string" || !/^\d+x\d+$/.test( t )
+				)
+			) throw Error( "Invalid dungeon minimap floor" );
+			ids.add( f.floorIndex );
+		}
+		result.set( d.sectorId, d.floors );
+	}
+	return result;
+}
+export function minimapDungeonRooms( value: unknown ): ReadonlyMap<number, readonly string[]> {
+	const data = value as {
+		format: string;
+		version: number;
+		dungeons: { sectorId: number; rooms?: string[]; }[];
+	};
+	if (
+		data?.format !== "sro-mission-dungeon-minimap-manifest" || data.version !== 1 ||
+		!Array.isArray( data.dungeons ) || data.dungeons.length > 32768
+	) throw Error( "Invalid dungeon minimap catalog" );
+	const result = new Map<number, readonly string[]>();
+	for ( const d of data.dungeons ) {
+		if (
+			!Number.isInteger( d.sectorId ) || d.sectorId < 32768 || d.sectorId > 65535 || result.has( d.sectorId ) ||
+			d.rooms !== undefined &&
+				(!Array.isArray( d.rooms ) || d.rooms.length > 4096 ||
+					d.rooms.some( r => typeof r !== "string" || r.length > 256 ))
+		) throw Error( "Invalid dungeon minimap region" );
+		result.set( d.sectorId, d.rooms ?? [] );
+	}
+	return result;
+}
+// The retail art list names each tile's published file: a .texture where the
+// retail DDJ is block compressed, a .png otherwise. Keyed by the path without
+// its extension, lowercase, so a tile resolves whatever it shipped as.
+export function minimapArt( value: unknown ): ReadonlyMap<string, string> {
+	const data = value as { format?: unknown; version?: unknown; tilePaths?: unknown; };
+	if (
+		data?.format !== "sro-mission-dungeon-minimap-manifest" || data.version !== 1 ||
+		!Array.isArray( data.tilePaths ) || data.tilePaths.length === 0 || data.tilePaths.length > 65536
+	) throw Error( "Invalid retail minimap artwork catalog" );
+	const paths = new Map<string, string>();
+	for ( const path of data.tilePaths ) {
+		if (
+			typeof path !== "string" ||
+			!/^\/assets\/images\/Media_extracted\/(?:minimap\/\d+x\d+|minimap_d\/[a-z0-9_]+\/[a-z0-9_]+_-?\d+x-?\d+)\.(?:png|texture)$/i
+				.test( path )
+		) throw Error( "Invalid retail minimap artwork path" );
+		const key = path.replace( /\.[a-z]+$/i, "" ).toLowerCase();
+		if ( paths.has( key ) ) throw Error( "Invalid retail minimap artwork path" );
+		paths.set( key, path );
+	}
+	return paths;
+}
+/*
+================
+minimapWithLaterFloors
+
+Fills the dungeons v1.150 art leaves without floors from the later catalogue.
+A dungeon with retail floors keeps them, so later art never replaces it.
+================
+*/
+export function minimapWithLaterFloors(
+	retail: ReadonlyMap<number, readonly MinimapFloor[]>,
+	later: ReadonlyMap<number, readonly MinimapFloor[]>
+): ReadonlyMap<number, readonly MinimapFloor[]> {
+	const merged = new Map( retail );
+	for ( const [sector, floors] of later ) {
+		if ( !merged.get( sector )?.length ) merged.set( sector, floors );
+	}
+	return merged;
+}
+export function minimapTiles( pose: Pose, zoom: number, floor?: MinimapFloor, art?: ReadonlyMap<string, string> ) {
+	if ( !art ) return [];
+	const dungeon = featuresAt( pose.regionId ).floorMinimap;
+	if ( dungeon && !floor ) return [];
+	const gx = dungeon ? Math.floor( pose.x / REGION_SIZE ) : 0,
+		gz = dungeon ? Math.floor( pose.z / REGION_SIZE ) : 0,
+		rx = dungeon ? gx + 128 : sectorX( pose.regionId ),
+		rz = dungeon ? gz + 128 : sectorY( pose.regionId ),
+		x = pose.x - gx * REGION_SIZE,
+		z = pose.z - gz * REGION_SIZE,
+		scale = zoom / REGION_SIZE,
+		result = [];
+	for ( let dz = -1; dz <= 1; dz++ ) {
+		for ( let dx = -1; dx <= 1; dx++ ) {
+			const key = (rx + dx) + "x" + (rz + dz);
+			if ( dungeon && !floor!.tiles.includes( key ) ) continue;
+			const path = art.get(
+				("/assets/images/Media_extracted/" +
+					(dungeon ? "minimap_d/" + floor!.directory + "/" + floor!.prefix + "_" : "minimap/") + key)
+					.toLowerCase()
+			);
+			if ( !path ) continue;
+			result.push( { x: (dx * REGION_SIZE - x) * scale, y: -((dz + 1) * REGION_SIZE - z) * scale, path } );
+		}
+	}
+	return result;
+}
